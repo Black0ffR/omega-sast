@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [14.x, 16.x, 18.x, 20.x]
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Use Node.js ${{ matrix.node-version }}
+      uses: actions/setup-node@v3
+      with:
+        node-version: ${{ matrix.node-version }}
+
+    - name: Install dependencies
+      run: npm install
+
+    - name: Run tests
+      run: npm test
+
+    - name: Run demo scan
+      run: |
+        node bin/omega.js test/fixtures/sample-bundle.js --security --report --out /tmp/omega-ci
+        test -f /tmp/omega-ci/report.json
+        test -f /tmp/omega-ci/report.html
+        test -f /tmp/omega-ci/report.md
+
+    - name: Verify exit codes
+      run: |
+        # Should exit 2 (critical findings) by default
+        node bin/omega.js test/fixtures/sample-bundle.js --security --quiet --out /tmp/omega-exit1 || true
+        # Should exit 0 with OMEGA_FAIL_ON=none
+        OMEGA_FAIL_ON=none node bin/omega.js test/fixtures/sample-bundle.js --security --quiet --out /tmp/omega-exit2

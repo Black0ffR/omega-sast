@@ -1,0 +1,56 @@
+{
+  "name": "omega-sast",
+  "version": "5.0.0",
+  "description": "Zero-dependency JavaScript SAST engine for analyzing minified, framework-heavy bundles. Hand-rolled tokenizer + structural walker + inter-procedural taint tracking + obfuscator fingerprinting.",
+  "main": "lib/index.js",
+  "bin": {
+    "omega": "bin/omega.js"
+  },
+  "scripts": {
+    "test": "node test/run-all.js",
+    "test:ast": "node test/test-harness.js",
+    "test:tokenizer": "node test/test-tokenizer.js",
+    "test:beautifier": "node test/test-beautifier.js",
+    "test:summaries": "node test/test-summaries.js",
+    "test:obfuscator": "node test/test-obfuscator.js",
+    "test:stage7": "node test/test-stage7.js",
+    "test:regex": "node test/test-regex-audit.js",
+    "test:sourcemap": "node test/test-sourcemap.js",
+    "test:charcode": "node test/test-charcode.js",
+    "test:redos": "node test/test-redos.js",
+    "test:arrow": "node test/test-arrow-functions.js",
+    "scan": "bin/omega.js",
+    "demo": "bin/omega.js test/fixtures/sample-bundle.js --security --report --out /tmp/omega-demo"
+  },
+  "keywords": [
+    "sast",
+    "static-analysis",
+    "security",
+    "javascript",
+    "deobfuscation",
+    "taint-analysis",
+    "webpack",
+    "angular",
+    "react",
+    "vue",
+    "reverse-engineering",
+    "bundle-analysis",
+    "cwe-79",
+    "cwe-95",
+    "xss"
+  ],
+  "author": "Black0ffR",
+  "license": "MIT",
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "files": [
+    "lib/",
+    "bin/",
+    "src/",
+    "docs/",
+    "README.md",
+    "LICENSE"
+  ],
+  "devDependencies": {}
+}
