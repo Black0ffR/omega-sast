@@ -1150,7 +1150,7 @@ function resolveWebpack5Modules(src) {
 
 function detectBundler(src) {
   const hints = {
-    webpack5:    /self\.webpackChunk_|self\["webpackChunk|webpackChunk_[A-Za-z0-9_$]+/,
+    webpack5:    /self\.webpackChunk_|self\["webpackChunk|webpackChunk_[A-Za-z0-9_$]+|__webpack_require__|__webpack_modules__/,
     webpack4:    /\bwebpackJsonp\b/,
     viteLegacy:  /__vitePreload\s*\(|__vite__mapDeps/,
     // FIX (Stage 4 audit): added negative lookahead `(?!https?:)` to reject

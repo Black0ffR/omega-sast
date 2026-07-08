@@ -842,10 +842,10 @@ const SECURITY_PATTERNS = [
     re:/(?:jQuery|\$)\([^)]*\)\.(?:append|prepend|after|before|wrap)\s*\([^)]+\)/g, ctx: null },
   { id:'xss-set-attr-on',cat:'XSS',        sev:'critical',
     re:/\.setAttribute\s*\(\s*['"]on\w+['"]\s*,/g, ctx: null },
-  { id:'xss-location-href',cat:'XSS',      sev:'high',
+  { id:'redirect-location-href',cat:'Open Redirect', sev:'high', cwe:'CWE-601',
     re:/(?:location|window\.location)\.href\s*=/g,
     ctx: m => !/https?:\/\//.test(m) },
-  { id:'xss-loc-replace', cat:'XSS',       sev:'high',
+  { id:'redirect-loc-replace', cat:'Open Redirect',  sev:'high', cwe:'CWE-601',
     re:/location\.(?:replace|assign)\s*\(/g, ctx: null },
   { id:'xss-window-open', cat:'XSS',       sev:'medium',
     re:/window\.open\s*\(/g, ctx: null },
@@ -3494,7 +3494,7 @@ function scanTaintFlow(src) {
     { re:/document\.write\s*\(/g, name:'document.write', sev:'critical', cwe:'CWE-79' },
     { re:/\beval\s*\(/g, name:'eval()', sev:'critical', cwe:'CWE-95' },
     { re:/new\s+Function\s*\(/g, name:'Function()', sev:'critical', cwe:'CWE-95' },
-    { re:/location\.(?:href|replace|assign)\s*=/g, name:'location navigation', sev:'high', cwe:'CWE-79' },
+    { re:/location\.(?:href|replace|assign)\s*=/g, name:'location navigation', sev:'high', cwe:'CWE-601' },
     { re:/\.setAttribute\s*\(\s*['"]on\w+['"]/g, name:'setAttribute(on*)', sev:'critical', cwe:'CWE-79' },
   ];
 
@@ -5060,11 +5060,14 @@ async function main() {
       console.log(info(`Attack Surface Score: ${riskCol}${C.bold}${attackScore.score} [${attackScore.risk}]${C.reset}`));
       console.log(info(`Top categories: ${attackScore.topCategories.join(' · ')}`));
     }
-    const top = allSec.filter(f => ['critical','high'].includes(f.severity||f.sev)).slice(0,12);
+    const top = allSec.filter(f => {
+      const s = f.severity || f.sev || '';
+      return s === 'critical' || s === 'high';
+    }).slice(0,12);
     for (const f of top) {
-      const sev = f.severity || f.sev;
-      const col = sev==='critical'?C.red:sev==='high'?C.yellow:C.white;
-      console.log(`  ${col}[${sev.toUpperCase()}]${C.reset} ${f.name||f.category||f.id}: ${C.dim}${(f.value||'').slice(0,70)}${C.reset}`);
+      const sev = (f.severity || f.sev || 'info').toUpperCase();
+      const col = sev==='CRITICAL'?C.red:sev==='HIGH'?C.yellow:C.white;
+      console.log(`  ${col}[${sev}]${C.reset} ${f.name||f.category||f.id}: ${C.dim}${(f.value||'').slice(0,70)}${C.reset}`);
     }
   }
 
