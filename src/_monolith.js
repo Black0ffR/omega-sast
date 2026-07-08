@@ -773,7 +773,7 @@ const CREDENTIAL_PATTERNS = [
     re:/xox[baprs]-[0-9a-zA-Z]{10,48}/g, fpGuard: null },
   { name:'Base64 secret candidate', severity:'low',
     re:/["'][A-Za-z0-9+/]{40,}={0,2}["']/g,
-    fpGuard: v => v.length > 200 },
+    fpGuard: v => v.length > 200 || !/[+/]/.test(v) },
   { name:'Hex secret candidate', severity:'low',
     re:/["'][0-9a-fA-F]{40,}["']/g,
     fpGuard: v => v.length > 80 },
@@ -2884,8 +2884,8 @@ function scanDynamicCodeExecution(src) {
   const ctx = (i, r=150) => src.slice(Math.max(0,i-r/2), i+r/2).replace(/\n/g,' ');
 
   const patterns = [
-    // setTimeout/setInterval with string arg (not function)
-    { re:/(?:setTimeout|setInterval)\s*\(\s*(["'`][^"'`]{0,200}["'`]|[A-Za-z_$][A-Za-z0-9_$.]*(?!\s*=>|\s*function|\s*\())\s*,/g,
+    // setTimeout/setInterval with string literal arg (not function reference)
+    { re:/(?:setTimeout|setInterval)\s*\(\s*["'`][^"'`]{0,200}["'`]\s*,/g,
       type:'setTimeout/Interval-string', sev:'critical',
       desc:'String argument evaluated as code — use function reference instead' },
     // new Function(...)

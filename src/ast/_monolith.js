@@ -2207,15 +2207,28 @@ function fingerprintObfuscator(src) {
   }
 
   // Signature 4: hex-number identifier mangling (e.g. _0x1a2b)
-  // Count: if more than 20 _0xHEX identifiers, likely obfuscator.io
+  // Count: if more than 5 _0xHEX identifiers, likely obfuscator.io
   const hexIdents = src.match(/\b_0x[0-9a-fA-F]{4,8}\b/g) || [];
-  if (hexIdents.length > 20) {
-    obfuscatorIoScore += 0.2;
+  if (hexIdents.length > 5) {
+    obfuscatorIoScore += 0.15;
     obfuscatorIoSigs.push({
       signature: 'hex-identifier-mangling',
       pos: src.indexOf('_0x'),
       evidence: `${hexIdents.length} _0xHEX identifiers`,
       hint: 'identifiers are mangled — do not reason about name semantics',
+    });
+  }
+
+  // Signature 5: simple array-indexing decoder (no charCodeAt/fromCharCode)
+  // Pattern: function NAME(a, b) { var c = ARRAY[a]; ... return c; }
+  const simpleDecoderRe = /function\s+([A-Za-z_$][\w$]*)\s*\(\s*[A-Za-z_$][\w$]*\s*,\s*[A-Za-z_$][\w$]*\s*\)\s*\{\s*var\s+[A-Za-z_$][\w$]*\s*=\s*([A-Za-z_$][\w$]*)\s*\[[A-Za-z_$][\w$]*\s*(?:\]\s*[;=]|\s*\+\s*[A-Za-z_$][\w$]*\s*\])[^}]{0,400}?\breturn\s+\2\b/g;
+  while ((m = simpleDecoderRe.exec(src)) !== null) {
+    obfuscatorIoScore += 0.2;
+    obfuscatorIoSigs.push({
+      signature: 'decoder-function-plain',
+      pos: m.index,
+      evidence: m[0].slice(0, 80),
+      hint: 'extract decoder function + evaluate calls with constant args',
     });
   }
 
