@@ -776,7 +776,7 @@ const CREDENTIAL_PATTERNS = [
     fpGuard: v => v.length > 200 || !/[+/]/.test(v) },
   { name:'Hex secret candidate', severity:'low',
     re:/["'][0-9a-fA-F]{40,}["']/g,
-    fpGuard: v => v.length > 80 },
+    fpGuard: v => v.length > 80 || /^(?:[0-9a-f]{6,8})+$/.test(v) },
 ];
 
 // ═══════════════════════════════════════════════════════════════════════════

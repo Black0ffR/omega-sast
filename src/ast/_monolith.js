@@ -2182,7 +2182,8 @@ function fingerprintObfuscator(src) {
   // Pattern: function NAME(a, b) { var c = NAME2[a]; ... return c; }
   //   where NAME2 is referenced as a string array, and the body contains
   //   charCodeAt / fromCharCode / parseInt patterns typical of RC4
-  const decoderFnRe = /function\s+([A-Za-z_$][\w$]*)\s*\(\s*[A-Za-z_$][\w$]*\s*,\s*[A-Za-z_$][\w$]*\s*\)\s*\{\s*var\s+[A-Za-z_$][\w$]*\s*=\s*([A-Za-z_$][\w$]*)\s*\[[^}]{0,400}?(?:charCodeAt|fromCharCode|parseInt|atob)/g;
+  //   Also matches: var NAME = function(a, b) { ... } (function expression form)
+  const decoderFnRe = /(?:var\s+[A-Za-z_$][\w$]*\s*=\s*)?function\s*(?:[A-Za-z_$][\w$]*)?\s*\(\s*[A-Za-z_$][\w$]*\s*,\s*[A-Za-z_$][\w$]*\s*\)\s*\{\s*var\s+[A-Za-z_$][\w$]*\s*=\s*[A-Za-z_$][\w$]*\s*\[[^}]{0,400}?(?:charCodeAt|fromCharCode|parseInt|atob)/g;
   while ((m = decoderFnRe.exec(src)) !== null) {
     obfuscatorIoScore += 0.25;
     obfuscatorIoSigs.push({
@@ -2207,10 +2208,12 @@ function fingerprintObfuscator(src) {
   }
 
   // Signature 4: hex-number identifier mangling (e.g. _0x1a2b)
-  // Count: if more than 5 _0xHEX identifiers, likely obfuscator.io
+  // Count scales with density — a few suggest light obfuscation,
+  // hundreds are a near-certain sign of obfuscator.io / similar
   const hexIdents = src.match(/\b_0x[0-9a-fA-F]{4,8}\b/g) || [];
   if (hexIdents.length > 5) {
-    obfuscatorIoScore += 0.15;
+    const weight = hexIdents.length > 100 ? 0.5 : hexIdents.length > 50 ? 0.35 : 0.15;
+    obfuscatorIoScore += weight;
     obfuscatorIoSigs.push({
       signature: 'hex-identifier-mangling',
       pos: src.indexOf('_0x'),
@@ -2220,16 +2223,25 @@ function fingerprintObfuscator(src) {
   }
 
   // Signature 5: simple array-indexing decoder (no charCodeAt/fromCharCode)
-  // Pattern: function NAME(a, b) { var c = ARRAY[a]; ... return c; }
-  const simpleDecoderRe = /function\s+([A-Za-z_$][\w$]*)\s*\(\s*[A-Za-z_$][\w$]*\s*,\s*[A-Za-z_$][\w$]*\s*\)\s*\{\s*var\s+[A-Za-z_$][\w$]*\s*=\s*([A-Za-z_$][\w$]*)\s*\[[A-Za-z_$][\w$]*\s*(?:\]\s*[;=]|\s*\+\s*[A-Za-z_$][\w$]*\s*\])[^}]{0,400}?\breturn\s+\2\b/g;
-  while ((m = simpleDecoderRe.exec(src)) !== null) {
-    obfuscatorIoScore += 0.2;
-    obfuscatorIoSigs.push({
-      signature: 'decoder-function-plain',
-      pos: m.index,
-      evidence: m[0].slice(0, 80),
-      hint: 'extract decoder function + evaluate calls with constant args',
-    });
+  // Patterns:
+  //   function NAME(a, b) { var c = ARRAY[a]; ... return ARRAY; }
+  //   var NAME = function(a, b) { var c = ARRAY[a]; ... return ARRAY; }
+  const decoderBodyRe = /\{\s*var\s+[A-Za-z_$][\w$]*\s*=\s*([A-Za-z_$][\w$]*)\s*\[[A-Za-z_$][\w$]*\s*(?:\]\s*[;=]|\s*\+\s*[A-Za-z_$][\w$]*\s*\])[^}]{0,400}?\breturn\s+\1\b/;
+  const simpleDecoderDeclRe = /function\s+([A-Za-z_$][\w$]*)\s*\(\s*[A-Za-z_$][\w$]*\s*,\s*[A-Za-z_$][\w$]*\s*\)/g;
+  const simpleDecoderExprRe = /var\s+[A-Za-z_$][\w$]*\s*=\s*function\s*\(\s*[A-Za-z_$][\w$]*\s*,\s*[A-Za-z_$][\w$]*\s*\)/g;
+  for (const re of [simpleDecoderDeclRe, simpleDecoderExprRe]) {
+    while ((m = re.exec(src)) !== null) {
+      const rest = src.slice(m.index + m[0].length);
+      if (decoderBodyRe.test(rest)) {
+        obfuscatorIoScore += 0.2;
+        obfuscatorIoSigs.push({
+          signature: 'decoder-function-plain',
+          pos: m.index,
+          evidence: m[0].slice(0, 80),
+          hint: 'extract decoder function + evaluate calls with constant args',
+        });
+      }
+    }
   }
 
   if (obfuscatorIoScore >= 0.3) {
