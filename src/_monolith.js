@@ -936,7 +936,7 @@ const FRAMEWORKS = [
     // Unique angular markers — must have at least one to count as Angular
     uniqueMarkers: [/@Component\s*\(/, /@NgModule\s*\(/, /@Injectable\s*\(/, /from\s*['"]@angular\/core['"]/, /ɵɵdefineComponent/],
   },
-  { name:'Webpack 5', re:/webpackChunk[a-zA-Z]|__webpack_require__|self\.webpackChunk/,
+  { name:'Webpack 5', re:/webpackChunk[a-zA-Z]|__webpack_require__|self\.webpackChunk|performance\.mark\(\s*["']js-parse-end/,
     score: s => (s.match(/webpackChunk|__webpack_require__|__webpack_modules__/g)||[]).length,
   },
   { name:'Socket.io', re:/socket\.io|io\.connect|io\(\)|\\.emit\(|\\.on\("connect"\)/,
@@ -1906,7 +1906,7 @@ function detectFrameworkHits(src) {
     react:   /React\.createElement|__reactFiber|jsx-runtime|react-dom/.test(src),
     svelte:  /SvelteComponent|mount_component|create_fragment|svelte\/internal/.test(src),
     nextjs:  /__NEXT_DATA__|next\/dist|_next\/static|usePathname/.test(src),
-    webpack: /__webpack_require__|webpackChunk|webpackJsonp/.test(src),
+    webpack: /__webpack_require__|webpackChunk|webpackJsonp|performance\.mark\(\s*["']js-parse-end/.test(src),
     vite:    /__vitePreload|import\.meta\.hot|__vite__mapDeps/.test(src),
     lodash:  /import\s+_\s+from|lodash-es|_\.map\(|_\.filter\(/.test(src),
     dateFns: /date-fns|parseISO|formatISO|differenceInDays/.test(src),
@@ -4023,7 +4023,7 @@ function generateReports(data, outDir) {
       (astTaint||[]).length
         ? astTaint.slice(0,20).map(f => {
             const chain = (f.chain || []).map(c => `\`${c.name || c.expr}\``).join(' → ');
-            return `- **[${f.severity.toUpperCase()}]** ${f.cwe || ''}  ${chain}  — _${(f.description || '').slice(0,140)}_`;
+            return `- **[${(f.severity||'info').toUpperCase()}]** ${f.cwe || ''}  ${chain}  — _${(f.description || '').slice(0,140)}_`;
           }).join('\n')
         : '_No cross-statement taint flows detected_',
       ``,
@@ -4031,7 +4031,7 @@ function generateReports(data, outDir) {
       ``,
       (modernCrypto||[]).length
         ? modernCrypto.slice(0,20).map(f => {
-            let line = `- **[${f.severity.toUpperCase()}]** [${f.id}] \`${f.value ? f.value.slice(0,100) : ''}\`\n  ${f.description}`;
+            let line = `- **[${(f.severity||'info').toUpperCase()}]** [${f.id}] \`${f.value ? f.value.slice(0,100) : ''}\`\n  ${f.description}`;
             if (f.jwtPayload) line += `\n  JWT payload: \`${f.jwtPayload}\``;
             return line;
           }).join('\n\n')
@@ -4046,7 +4046,7 @@ function generateReports(data, outDir) {
               ? `- Top hosts:\n${networkSurface.hostClusters.slice(0,10).map(h => `  - \`${h.host}\` × ${h.count}`).join('\n')}`
               : '',
             networkSurface.findings.length
-              ? `- **Cloud metadata / RFC1918 / public IP findings:**\n${networkSurface.findings.slice(0,15).map(f => `  - **[${f.severity.toUpperCase()}]** \`${f.value}\` — ${f.description}`).join('\n')}`
+              ? `- **Cloud metadata / RFC1918 / public IP findings:**\n${networkSurface.findings.slice(0,15).map(f => `  - **[${(f.severity||'info').toUpperCase()}]** \`${f.value}\` — ${f.description}`).join('\n')}`
               : '',
           ].filter(Boolean).join('\n')
         : '_no network surface extracted_',
