@@ -389,8 +389,6 @@ function buildStructuralIndex(src) {
           staticFields, bodyTokStart: bodyStart, bodyTokEnd: bodyEnd,
         });
       }
-      // Skip past the class body
-      k = bodyEnd;
     }
   }
 
@@ -476,6 +474,7 @@ function buildStructuralIndex(src) {
         }
         if (bodyDepth > 0) k2++;
       }
+      if (k2 >= M) continue;
       functions.push({
         name: nameTok ? nameTok.value : '<anonymous>',
         start: t.start, end: T[k2].end,
@@ -483,7 +482,6 @@ function buildStructuralIndex(src) {
         bodyTokStart: bodyStart, bodyTokEnd: k2,
         isArrow: false,
       });
-      k = k2;
     }
   }
 
@@ -631,7 +629,83 @@ function buildStructuralIndex(src) {
       isArrow: true,
       isExprBody,
     });
-    k = bodyEnd;
+  }
+
+  // ── Method shorthand: { foo() {} } and class method: class { foo() {} } ──
+  // These have no `function` keyword and no `=>`, so they're missed by the
+  // previous two passes. Pattern: `ident ( params ) { body }` in object/class
+  // context — preceded by `{`, `,`, `;`, or `static` keyword (not `:`).
+  for (let k = 0; k < M - 3; k++) {
+    const t = T[k];
+    // Accept ident (method name) or keyword get/set (getter/setter)
+    const isGetSet = t.type === 'keyword' && (t.value === 'get' || t.value === 'set');
+    if (t.type !== 'ident' && !isGetSet) continue;
+    // For getter/setter, after `get`/`set` must be `ident (`
+    const scanStart = isGetSet ? k + 1 : k;
+    if (scanStart + 1 >= M || T[scanStart].type !== 'ident' || T[scanStart+1].type !== 'punct' || T[scanStart+1].value !== '(') {
+      // For regular method, just need `ident (`
+      if (t.type !== 'ident') continue;
+      if (T[k+1].type !== 'punct' || T[k+1].value !== '(') continue;
+    }
+    // Exclude property access: `foo:` followed by expression
+    // Exclude calls in non-method context
+    let preamble = k - 1;
+    while (preamble >= 0 && T[preamble].type === 'comment') preamble--;
+    if (preamble < 0) continue;
+    const pre = T[preamble];
+    const isMethodCtx = pre.type === 'punct' && (pre.value === '{' || pre.value === ',' || pre.value === ';' || pre.value === '}');
+    const isStatic = pre.type === 'keyword' && pre.value === 'static';
+    if (!isMethodCtx && !isStatic) continue;
+    // Handle getter/setter: `get foo() {}` / `set foo(v) {}`
+    let name = t.value;
+    let nameTok = k;
+    if (isGetSet && scanStart + 1 < M &&
+        T[scanStart].type === 'ident' && T[scanStart+1].type === 'punct' && T[scanStart+1].value === '(') {
+      name = T[scanStart].value;
+      nameTok = scanStart;
+    }
+    // Walk params
+    let k2 = nameTok + 1; // at `(`
+    let depth = 1; k2++;
+    while (k2 < M && depth > 0) {
+      const tt = T[k2];
+      if (tt && tt.type === 'punct') {
+        if (tt.value === '(' || tt.value === '[' || tt.value === '{') depth++;
+        else if (tt.value === ')' || tt.value === ']' || tt.value === '}') {
+          depth--; if (depth === 0) break;
+        }
+      }
+      k2++;
+    }
+    if (k2 >= M) continue;
+    const paramsEnd = k2;
+    // Method shorthand must have `{` immediately after `)` — distinguishes
+    // `foo() {}` (method) from `eval(src)` (function call).
+    if (k2 + 1 >= M || !T[k2 + 1] || T[k2 + 1].type !== 'punct' || T[k2 + 1].value !== '{') continue;
+    // Find body
+    k2++;
+    if (k2 >= M) continue;
+    const bodyStart = k2;
+    let bodyDepth = 1; k2++;
+    while (k2 < M && bodyDepth > 0) {
+      const tt = T[k2];
+      if (tt && tt.type === 'punct') {
+        if (tt.value === '{') bodyDepth++;
+        else if (tt.value === '}') bodyDepth--;
+      }
+      if (bodyDepth > 0) k2++;
+    }
+    if (k2 >= M) continue;
+    functions.push({
+      name,
+      start: T[nameTok].start,
+      end: T[k2].end,
+      paramsTokStart: nameTok + 2,
+      paramsTokEnd: paramsEnd,
+      bodyTokStart: bodyStart,
+      bodyTokEnd: k2,
+      isArrow: false,
+    });
   }
 
   // Identifier frequency + positions (only idents that look like source code,

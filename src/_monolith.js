@@ -1296,7 +1296,10 @@ function decodeStrings(src) {
 
     src = src.replace(/String\.fromCharCode\s*\(([^)]+)\)/g, (_, args) => {
       try {
-        const codes = args.split(',').map(x => parseInt(x.trim(), 10)).filter(n => !isNaN(n));
+        const codes = args.split(',').map(x => {
+          const t = x.trim();
+          return parseInt(t, t.startsWith('0x') ? 16 : 10);
+        }).filter(n => !isNaN(n));
         if (!codes.length) return _;
         totals.charCode++; changed = true;
         return JSON.stringify(codes.map(c => String.fromCharCode(c)).join(''));
@@ -1578,13 +1581,10 @@ function decodeObfuscatorIo(src) {
         `\\b${decName}\\s*\\(\\s*(0x[0-9a-fA-F]+|\\d+)\\s*,\\s*["']([^"']*)["']\\s*\\)`,
         'g'
       );
-      let cm;
       let replacedCount = 0;
-      while ((cm = callRe.exec(src)) !== null) {
-        const idx = parseInt(cm[1], cm[1].startsWith('0x') ? 16 : 10);
-        const key = cm[2];
-
-        if (idx < 0 || idx >= sa.strings.length) continue;
+      src = src.replace(callRe, (full, idxStr, key) => {
+        const idx = parseInt(idxStr, idxStr.startsWith('0x') ? 16 : 10);
+        if (idx < 0 || idx >= sa.strings.length) return full;
 
         let decoded;
         try {
@@ -1597,28 +1597,24 @@ function decodeObfuscatorIo(src) {
             decoded = rc4Decrypt(raw, key);
           }
         } catch (_) {
-          continue;
+          return full;
         }
 
-        if (typeof decoded !== 'string') continue;
-        // Sanity: only replace if decoded is printable or contains common chars
-        if (!/^[\x20-\x7e\s]*$/.test(decoded)) continue;
+        if (typeof decoded !== 'string') return full;
+        if (!/^[\x20-\x7e\s]*$/.test(decoded)) return full;
 
-        // Replace the call with the decoded string literal
         const escaped = decoded.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n').replace(/\r/g, '\\r');
-        const replacement = `'${escaped}'`;
-        src = src.slice(0, cm.index) + replacement + src.slice(cm.index + cm[0].length);
-        // Adjust callRe.lastIndex for the replacement length change
-        callRe.lastIndex = cm.index + replacement.length;
         replacedCount++;
 
         decodedStrings.push({
-          call: cm[0],
+          call: full,
           decoded,
           idx,
           key: isRC4 ? key : null,
         });
-      }
+
+        return `'${escaped}'`;
+      });
 
       if (replacedCount > 0) {
         findings.push({
@@ -1691,6 +1687,11 @@ function rc4Decrypt(ciphertext, key) {
 //  deeply-nested expressions. Max nesting depth: 20.
 // ═══════════════════════════════════════════════════════════════════════════
 function evaluateConstantExpressions(src) {
+  // Size guard: constant evaluation involves multi-pass string replacement;
+  // skip for large bundles where it's unlikely to add value.
+  const MAX_SIZE = 1024 * 1024; // 1 MB
+  if (src.length > MAX_SIZE) return { src, findings: [] };
+
   const findings = [];
   let changed = true;
   let passes = 0;
@@ -1700,122 +1701,110 @@ function evaluateConstantExpressions(src) {
     changed = false;
     passes++;
 
+    // Each pass uses `src.replace(re, callback)` — the JS engine builds the
+    // result string in a single O(N) pass regardless of match count, avoiding
+    // the O(N×M) quadratic allocation of the old `while(exec){slice+repl+slice}` pattern.
+
     // ── String.fromCharCode(N1, N2, ...) ──────────────────────────────
-    // Args must be: numeric literals or hex literals (possibly with arithmetic)
-    const fromCharCodeRe = /String\.fromCharCode\s*\(\s*((?:0x[0-9a-fA-F]+|\d+)(?:\s*[+\-*/]\s*(?:0x[0-9a-fA-F]+|\d+))*(?:\s*,\s*(?:0x[0-9a-fA-F]+|\d+)(?:\s*[+\-*/]\s*(?:0x[0-9a-fA-F]+|\d+))*)*)\s*\)/g;
-    let m;
-    while ((m = fromCharCodeRe.exec(src)) !== null) {
-      const argsStr = m[1];
+    src = src.replace(/String\.fromCharCode\s*\(\s*([^)]+)\s*\)/g, (full, argsStr) => {
       const args = argsStr.split(',').map(a => {
         try { return evalConstantArith(a.trim()); } catch (_) { return null; }
       });
-      if (args.some(a => a === null)) continue;
+      if (args.some(a => a === null)) return full;
       const decoded = args.map(c => String.fromCharCode(c)).join('');
       const escaped = decoded.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-      src = src.slice(0, m.index) + `'${escaped}'` + src.slice(m.index + m[0].length);
-      fromCharCodeRe.lastIndex = m.index + escaped.length + 2;
       changed = true;
       findings.push({
         id: 'const-expr-fromcharcode',
         category: 'Constant Evaluator',
         severity: 'info',
-        value: `String.fromCharCode(${args.join(',')}) → "${decoded.slice(0, 40)}"`,
+        value: `String.fromCharCode → "${decoded.slice(0, 40)}"`,
         context: '',
         description: 'Evaluated constant String.fromCharCode expression',
       });
-    }
+      return `'${escaped}'`;
+    });
 
     // ── atob("...") on constant string ────────────────────────────────
-    const atobRe = /\batob\s*\(\s*["']([A-Za-z0-9+/=]{4,}?)["']\s*\)/g;
-    while ((m = atobRe.exec(src)) !== null) {
+    src = src.replace(/\batob\s*\(\s*["']([A-Za-z0-9+/=]{4,100})["']\s*\)/g, (full, b64) => {
       try {
-        const decoded = Buffer.from(m[1], 'base64').toString('utf8');
-        if (!/^[\x20-\x7e\s]*$/.test(decoded)) continue;
+        const decoded = Buffer.from(b64, 'base64').toString('utf8');
+        if (!/^[\x20-\x7e\s]*$/.test(decoded)) return full;
         const escaped = decoded.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-        src = src.slice(0, m.index) + `'${escaped}'` + src.slice(m.index + m[0].length);
-        atobRe.lastIndex = m.index + escaped.length + 2;
         changed = true;
         findings.push({
           id: 'const-expr-atob',
           category: 'Constant Evaluator',
           severity: 'info',
-          value: `atob("${m[1].slice(0,20)}…") → "${decoded.slice(0, 40)}"`,
+          value: `atob → "${decoded.slice(0, 40)}"`,
           context: '',
           description: 'Evaluated constant atob() expression',
         });
-      } catch (_) { /* skip */ }
-    }
+        return `'${escaped}'`;
+      } catch (_) { return full; }
+    });
 
     // ── "str".charCodeAt(N) on known string ───────────────────────────
-    const charCodeAtRe = /["']([^"']{1,100})["']\s*\.charCodeAt\s*\(\s*(\d+|0x[0-9a-fA-F]+)\s*\)/g;
-    while ((m = charCodeAtRe.exec(src)) !== null) {
-      const str = m[1];
-      const idx = parseInt(m[2], m[2].startsWith('0x') ? 16 : 10);
-      if (idx < 0 || idx >= str.length) continue;
+    src = src.replace(/["']([^"']{1,100})["']\s*\.charCodeAt\s*\(\s*(\d+|0x[0-9a-fA-F]+)\s*\)/g, (full, str, idxStr) => {
+      const idx = parseInt(idxStr, idxStr.startsWith('0x') ? 16 : 10);
+      if (idx < 0 || idx >= str.length) return full;
       const code = str.charCodeAt(idx);
-      src = src.slice(0, m.index) + String(code) + src.slice(m.index + m[0].length);
-      charCodeAtRe.lastIndex = m.index + String(code).length;
       changed = true;
       findings.push({
         id: 'const-expr-charcodeat',
         category: 'Constant Evaluator',
         severity: 'info',
-        value: `"${str.slice(0,10)}".charCodeAt(${idx}) → ${code}`,
+        value: `charCodeAt → ${code}`,
         context: '',
         description: 'Evaluated constant charCodeAt expression',
       });
-    }
+      return String(code);
+    });
 
     // ── parseInt("0xNN", 16) / parseInt("NN", 10) ─────────────────────
-    const parseIntRe = /parseInt\s*\(\s*["'](0x[0-9a-fA-F]+|\d+)["']\s*,\s*(16|10|8|2)\s*\)/g;
-    while ((m = parseIntRe.exec(src)) !== null) {
-      const val = parseInt(m[1], parseInt(m[2]));
-      src = src.slice(0, m.index) + String(val) + src.slice(m.index + m[0].length);
-      parseIntRe.lastIndex = m.index + String(val).length;
+    src = src.replace(/parseInt\s*\(\s*["'](0x[0-9a-fA-F]+|\d+)["']\s*,\s*(16|10|8|2)\s*\)/g, (full, valStr, radixStr) => {
+      const val = parseInt(valStr, parseInt(radixStr));
       changed = true;
       findings.push({
         id: 'const-expr-parseint',
         category: 'Constant Evaluator',
         severity: 'info',
-        value: `parseInt("${m[1]}", ${m[2]}) → ${val}`,
+        value: `parseInt → ${val}`,
         context: '',
         description: 'Evaluated constant parseInt expression',
       });
-    }
+      return String(val);
+    });
 
     // ── String literal concatenation: "a" + "b" → "ab" ────────────────
-    // Only single-level (not nested). The existing Phase 2 pass already
-    // handles multi-level, but we run it here too in case new strings
-    // appeared from the evaluators above.
-    const concatRe = /(["'])((?:\\.|(?!\1).)*)\1\s*\+\s*(["'])((?:\\.|(?!\3).)*)\3/g;
-    while ((m = concatRe.exec(src)) !== null) {
-      const combined = m[2] + m[4];
-      const escaped = combined.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"');
-      const replacement = `'${escaped}'`;
-      src = src.slice(0, m.index) + replacement + src.slice(m.index + m[0].length);
-      concatRe.lastIndex = m.index + replacement.length;
-      changed = true;
+    // Multi-pass: a single replacement may expose new concatenations.
+    const concatRe = /(["'])((?:[^\\'"]|\\.)*)\1\s*\+\s*(["'])((?:[^\\'"]|\\.)*)\3/g;
+    for (let j = 0; j < 4; j++) {
+      src = src.replace(concatRe, (full, q1, a, q2, b) => {
+        const combined = a + b;
+        const escaped = combined.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n').replace(/\r/g, '\\r');
+        changed = true;
+        return `'${escaped}'`;
+      });
     }
 
     // ── N.toString(R) on numeric literal ──────────────────────────────
-    const toStringRe = /\b(\d+|0x[0-9a-fA-F]+)\.toString\s*\(\s*(\d+|0x[0-9a-fA-F]+)\s*\)/g;
-    while ((m = toStringRe.exec(src)) !== null) {
-      const num = parseInt(m[1], m[1].startsWith('0x') ? 16 : 10);
-      const radix = parseInt(m[2], m[2].startsWith('0x') ? 16 : 10);
-      if (radix < 2 || radix > 36) continue;
+    src = src.replace(/\b(\d+|0x[0-9a-fA-F]+)\.toString\s*\(\s*(\d+|0x[0-9a-fA-F]+)\s*\)/g, (full, numStr, radStr) => {
+      const num = parseInt(numStr, numStr.startsWith('0x') ? 16 : 10);
+      const radix = parseInt(radStr, radStr.startsWith('0x') ? 16 : 10);
+      if (radix < 2 || radix > 36) return full;
       const result = num.toString(radix);
-      src = src.slice(0, m.index) + `'${result}'` + src.slice(m.index + m[0].length);
-      toStringRe.lastIndex = m.index + result.length + 2;
       changed = true;
       findings.push({
         id: 'const-expr-tostring',
         category: 'Constant Evaluator',
         severity: 'info',
-        value: `${m[1]}.toString(${radix}) → "${result}"`,
+        value: `toString → "${result}"`,
         context: '',
         description: 'Evaluated constant toString expression',
       });
-    }
+      return `'${result}'`;
+    });
   }
 
   return { src, findings };
@@ -3750,19 +3739,41 @@ function scoreAttackSurface(allFindings, authSurface, routes, astContext) {
       score += 25;
       breakdown['Hardcoded Password Hash'] = 25;
     }
-    // Socket event explosion — flag if many unique events
-    if (astContext.callGraph && astContext.callGraph.stats && astContext.callGraph.stats.callSites > 50) {
-      score += Math.floor(astContext.callGraph.stats.callSites / 10);
-      breakdown['Complex Call Graph'] = Math.floor(astContext.callGraph.stats.callSites / 10);
-    }
-    // Bundle complexity tier
-    if (astContext.structuralIndex) {
-      const funcs = astContext.structuralIndex.functions.length;
-      if (funcs > 1000) {
-        const pts = Math.floor(funcs / 200);
-        score += pts;
-        breakdown['High Function Count'] = pts;
+    // Dangerous API calls — count unique callee names matching known sinks
+    // (Option B: score by actual risk, not call-graph size)
+    const DANGEROUS_SINKS = new Set([
+      'eval', 'Function', 'setTimeout', 'setInterval',
+      'execScript', 'execScript',
+    ]);
+    if (astContext.callGraph && astContext.callGraph.incoming) {
+      const dangerousCallees = [];
+      for (const callee of astContext.callGraph.incoming.keys()) {
+        if (DANGEROUS_SINKS.has(callee)) {
+          dangerousCallees.push(callee);
+          continue;
+        }
+        // Property-qualified sinks: x.write(), x.writeln(), x.innerHTML, etc.
+        if (callee.includes('.')) {
+          const base = callee.split('.');
+          const prop = base[base.length - 1];
+          if (prop === 'write' || prop === 'writeln' ||
+              prop === 'innerHTML' || prop === 'outerHTML' ||
+              prop === 'insertAdjacentHTML' || prop === 'postMessage') {
+            dangerousCallees.push(callee);
+          }
+        }
       }
+      if (dangerousCallees.length > 0) {
+        const pts = dangerousCallees.length * 15;
+        score += pts;
+        breakdown['Dangerous API Calls'] = pts;
+      }
+    }
+    // Code complexity — purely informational, low weight
+    if (astContext.callGraph && astContext.callGraph.stats && astContext.callGraph.stats.callSites > 100) {
+      const pts = Math.floor(astContext.callGraph.stats.callSites / 200);
+      score += pts;
+      breakdown['Code Complexity'] = pts;
     }
   }
 
