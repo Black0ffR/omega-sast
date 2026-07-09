@@ -226,7 +226,8 @@ console.log(y);
 // ═══════════════════════════════════════════════════════════════════════
 section('7. Generic obfuscation heuristic');
 {
-  // Some hex identifiers + eval density, but no specific obfuscator signature
+  // Some hex identifiers + eval density + concat chains, but no specific obfuscator
+  // signature. Must exceed generic threshold (0.5) to be detected.
   const src = `
 var _0x1a2b = 1;
 var _0x2b3c = 2;
@@ -238,6 +239,9 @@ eval("console.log('a')");
 eval("console.log('b')");
 eval("console.log('c')");
 eval("console.log('d')");
+var s = "a" + "b" + "c" + "d" + "e";
+var t = "f" + "g" + "h" + "i" + "j";
+var u = "k" + "l" + "m" + "n" + "o";
   `;
   const result = ast.fingerprintObfuscator(src);
   assert('generic obfuscation detected',

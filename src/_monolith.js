@@ -792,7 +792,8 @@ const SECURITY_PATTERNS = [
   { id:'xss-eval',       cat:'XSS',        sev:'critical',
     re:/\beval\s*\(/g,        ctx: null },
   { id:'xss-new-func',   cat:'XSS',        sev:'critical',
-    re:/new\s+Function\s*\(/g, ctx: null },
+    re:/new\s+Function\s*\(/g,
+    ctx: m => !/openBlock|createElementVNode|_createBlock|withDirectives|createVNode|_ hoisted|renderList|renderSlot|resolveComponent/.test(m) },
   { id:'sqli-concat',    cat:'Injection',  sev:'high',
     re:/(?:query|sql|exec)\s*=\s*["'][^"']*["']\s*\+/gi,
     ctx: m => !/placeholder|label|aria/.test(m) },
@@ -813,7 +814,7 @@ const SECURITY_PATTERNS = [
     ctx: m => /\.(?:emit|send|post)\s*\(\s*["'](?:message|data|event|request|response|ping|pong|auth|frame|payload)["']/i.test(m) },
   { id:'network-http-open', cat:'Network', sev:'info',
     re:/https?:\/\/[^\s"']+/g,
-    ctx: m => !/accounts\.google|cdnjs\.cloudflare|openstreetmap/.test(m) },
+    ctx: m => !/(?:accounts\.google|cdnjs\.cloudflare|openstreetmap|github\.com|developer\.mozilla\.org|w3\.org|npmjs\.com|angular\.io|vuejs\.org|reactjs\.org|typescriptlang\.org|babeljs\.io|webpack\.js|nodejs\.org|mit\.edu|apache\.org|opensource\.org|creativecommons\.org|unlicense\.org)/.test(m) },
   { id:'storage-local',  cat:'Storage',    sev:'medium',
     re:/localStorage\./g,      ctx: null },
   { id:'storage-session',cat:'Storage',    sev:'medium',
@@ -834,7 +835,8 @@ const SECURITY_PATTERNS = [
   { id:'xss-insertadj',  cat:'XSS',        sev:'critical',
     re:/\.insertAdjacentHTML\s*\(/g, ctx: null },
   { id:'xss-srcdoc',     cat:'XSS',        sev:'critical',
-    re:/\.srcdoc\s*=/g, ctx: null },
+    re:/\.srcdoc\s*=/g,
+    ctx: m => !/ɵɵ|@angular\//.test(m) },
   { id:'xss-createfrag', cat:'XSS',        sev:'high',
     re:/createContextualFragment\s*\(/g, ctx: null },
   { id:'xss-jquery-html',cat:'XSS',        sev:'critical',
@@ -867,7 +869,7 @@ const SECURITY_PATTERNS = [
     re:/Object\.setPrototypeOf\s*\(/g, ctx: null },
   { id:'proto-jsonparse',  cat:'Prototype Pollution', sev:'medium',
     re:/JSON\.parse\s*\([^)]+\)/g,
-    ctx: m => /user|request|input|body|data|param|__proto__|constructor/i.test(m) },
+    ctx: m => /user|request|input|param|__proto__|constructor/i.test(m) },
 
   // ── B5: PostMessage ─────────────────────────────────────────────────────
   { id:'postmsg-wildcard', cat:'PostMessage',  sev:'high',
@@ -879,7 +881,7 @@ const SECURITY_PATTERNS = [
   // ── B6: Insufficient Randomness ─────────────────────────────────────────
   { id:'rand-date-token',  cat:'Broken Crypto', sev:'high',
     re:/(?:Date\.now\(\)|new\s+Date\(\)\.getTime\(\))/g,
-    ctx: m => /token|nonce|csrf|session|secret|key|id|ref/i.test(m) },
+    ctx: m => /token|nonce|csrf|session|secret|key|nonce/i.test(m) },
 
   // ── B7: Complete bypassSecurityTrust* ───────────────────────────────────
   { id:'bypass-style',   cat:'Angular Security', sev:'high',

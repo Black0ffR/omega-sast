@@ -2455,7 +2455,10 @@ function fingerprintObfuscator(src) {
       });
     }
 
-    if (genericScore >= 0.3) {
+    // Threshold 0.5 prevents "unknown/generic" from firing on clean minified bundles
+    // that happen to have scattered hex numbers + string concatenation.
+    // Real obfuscation requires at least two strong signals to cross 0.5.
+    if (genericScore >= 0.5) {
       signatures.push({
         obfuscator: 'unknown/generic',
         confidence: Math.min(genericScore, 1.0),
