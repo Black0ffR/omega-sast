@@ -4755,7 +4755,21 @@ async function main() {
   const routes = (opts.routes || opts.report) ? extractRoutes(src, charCodeFindings, srcPreBeautify) : [];
 
   // Phase 11
-  const credentials = (opts.secrets || opts.report) ? scanCredentials(src) : [];
+  // Dedup credentials by value: same string matched by multiple patterns
+  // (e.g. Stripe Key + Hardcoded API Key) should appear only once.
+  const credentials = (() => {
+    const raw = (opts.secrets || opts.report) ? scanCredentials(src) : [];
+    const rank = { critical:0, high:1, medium:2, low:3, info:4 };
+    const seen = new Map();
+    for (const f of raw) {
+      const key = f.value.slice(0, 64);
+      const existing = seen.get(key);
+      if (!existing || (rank[f.severity] ?? 4) < (rank[existing.severity] ?? 4)) {
+        seen.set(key, f);
+      }
+    }
+    return [...seen.values()];
+  })();
 
   // Phase 12
   const security = (opts.security || opts.report) ? analyseSecurity(src) : [];
@@ -4841,7 +4855,21 @@ async function main() {
     const astSrc = srcPreBeautify;
 
     if (opts.verbose) console.log(info('  Phase 9b: AST foundation (tokenizer + walker)…'));
-    structuralIndex = ast.buildStructuralIndex(astSrc);
+    try {
+      structuralIndex = ast.buildStructuralIndex(astSrc);
+    } catch (e) {
+      console.warn(warn(`  AST parse threw: ${e.message}`));
+      structuralIndex = { classes:[], functions:[], callSites:[], memberAccess:[], identifiers:[], assignments:[], tokens:[], lex:{ errors:[{msg:e.message, pos:0}] } };
+    }
+    // Warn if the file has content but AST found nothing (likely syntax error)
+    // Detect likely parse failure: `function` keyword tokens exist but no
+    // functions were parsed (e.g. malformed param list `function broken( {`)
+    if (astSrc.length > 10 && structuralIndex.functions.length === 0) {
+      const fnKeywords = (structuralIndex.lex?.tokens || []).filter(t => t.type === 'keyword' && t.value === 'function').length;
+      if (fnKeywords > 0) {
+        console.warn(warn(`  AST found ${fnKeywords} function keyword(s) but parsed 0 functions — possible syntax error`));
+      }
+    }
     if (opts.verbose) {
       console.log(info(`  AST: classes=${structuralIndex.classes.length}  functions=${structuralIndex.functions.length}  callsites=${structuralIndex.callSites.length}  members=${structuralIndex.memberAccess.length}  idents=${structuralIndex.identifiers.length}`));
     }

@@ -2222,27 +2222,10 @@ function fingerprintObfuscator(src) {
     });
   }
 
-  // Signature 5: simple array-indexing decoder (no charCodeAt/fromCharCode)
-  // Patterns:
-  //   function NAME(a, b) { var c = ARRAY[a]; ... return ARRAY; }
-  //   var NAME = function(a, b) { var c = ARRAY[a]; ... return ARRAY; }
-  const decoderBodyRe = /\{\s*var\s+[A-Za-z_$][\w$]*\s*=\s*([A-Za-z_$][\w$]*)\s*\[[A-Za-z_$][\w$]*\s*(?:\]\s*[;=]|\s*\+\s*[A-Za-z_$][\w$]*\s*\])[^}]{0,400}?\breturn\s+\1\b/;
-  const simpleDecoderDeclRe = /function\s+([A-Za-z_$][\w$]*)\s*\(\s*[A-Za-z_$][\w$]*\s*,\s*[A-Za-z_$][\w$]*\s*\)/g;
-  const simpleDecoderExprRe = /var\s+[A-Za-z_$][\w$]*\s*=\s*function\s*\(\s*[A-Za-z_$][\w$]*\s*,\s*[A-Za-z_$][\w$]*\s*\)/g;
-  for (const re of [simpleDecoderDeclRe, simpleDecoderExprRe]) {
-    while ((m = re.exec(src)) !== null) {
-      const rest = src.slice(m.index + m[0].length);
-      if (decoderBodyRe.test(rest)) {
-        obfuscatorIoScore += 0.2;
-        obfuscatorIoSigs.push({
-          signature: 'decoder-function-plain',
-          pos: m.index,
-          evidence: m[0].slice(0, 80),
-          hint: 'extract decoder function + evaluate calls with constant args',
-        });
-      }
-    }
-  }
+  // Signature 5: (removed — decoder-function-plain caused false positives on every
+  // minified library. A two-argument function with array-indexing body is
+  // structurally indistinguishable from thousands of minified helpers.
+  // Real obfuscator.io is caught by Signatures 1-4 + 6 instead.)
 
   if (obfuscatorIoScore >= 0.3) {
     signatures.push({

@@ -382,6 +382,18 @@ section('12. Punctuation combos');
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+section('13. Syntax error detection');
+{
+  const malformed = 'function broken( { return ; }';
+  const si = ast.buildStructuralIndex(malformed);
+  const fnKeywords = (si.lex?.tokens || []).filter(t => t.type === 'keyword' && t.value === 'function').length;
+  assert('malformed file has function keyword tokens', fnKeywords > 0);
+  assert('malformed file parsed 0 functions', si.functions.length === 0);
+  assert('malformed file lex exists', !!si.lex);
+  assert('malformed file tokens non-empty', si.lex.tokens.length > 0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 console.log(`\n${'═'.repeat(60)}`);
 console.log(`  TOTAL: ${total}   PASSED: ${passed}   FAILED: ${failed}`);
 console.log(`${'═'.repeat(60)}`);
