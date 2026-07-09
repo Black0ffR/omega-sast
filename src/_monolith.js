@@ -793,7 +793,16 @@ const SECURITY_PATTERNS = [
     re:/\beval\s*\(/g,        ctx: null },
   { id:'xss-new-func',   cat:'XSS',        sev:'critical',
     re:/new\s+Function\s*\(/g,
-    ctx: m => !/openBlock|createElementVNode|_createBlock|withDirectives|createVNode|_ hoisted|renderList|renderSlot|resolveComponent/.test(m) },
+    ctx: (snippet, src) => {
+      // Fast path: check context window for Vue template compiler markers
+      if (/openBlock|createElementVNode|_createBlock|withDirectives|createVNode|_ hoisted|renderList|renderSlot|resolveComponent/.test(snippet)) return false;
+      // Slow path: check if the ENTIRE source contains Vue compile markers.
+      // Catches cases like `u = new Function(a)()` where the compiled template
+      // function body (containing openBlock etc.) is in variable `a`, defined
+      // far from the new Function call site.
+      if (/openBlock|createElementVNode|_createBlock|resolveComponent/.test(src)) return false;
+      return true;
+    } },
   { id:'sqli-concat',    cat:'Injection',  sev:'high',
     re:/(?:query|sql|exec)\s*=\s*["'][^"']*["']\s*\+/gi,
     ctx: m => !/placeholder|label|aria/.test(m) },
@@ -836,7 +845,7 @@ const SECURITY_PATTERNS = [
     re:/\.insertAdjacentHTML\s*\(/g, ctx: null },
   { id:'xss-srcdoc',     cat:'XSS',        sev:'critical',
     re:/\.srcdoc\s*=/g,
-    ctx: m => !/ɵɵ|@angular\//.test(m) },
+    ctx: m => !/ɵɵ|@angular\/|trustedHTML/.test(m) },
   { id:'xss-createfrag', cat:'XSS',        sev:'high',
     re:/createContextualFragment\s*\(/g, ctx: null },
   { id:'xss-jquery-html',cat:'XSS',        sev:'critical',
@@ -2851,7 +2860,7 @@ function analyseSecurity(src) {
     safeRegexIter(re, src,
       (m) => {
         const snippet = src.slice(Math.max(0, m.index-100), m.index+120);
-        if (pat.ctx && !pat.ctx(snippet)) return;
+        if (pat.ctx && !pat.ctx(snippet, src)) return;
         const value = (m[1] || m[0]).slice(0,100);
         const key = `${pat.id}::${value}`;
         if (seen.has(key)) return;
