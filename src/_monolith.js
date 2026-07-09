@@ -167,6 +167,7 @@ const OMEGA_AST = (() => {
 })();
 const ast = OMEGA_AST;
 const crypto = require('crypto');
+const os = require('os');
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  CONSTANTS
@@ -893,13 +894,18 @@ const SECURITY_PATTERNS = [
     re:/\$compile\s*\(\s*(?!['"])/g, ctx: null },
 
   // ── B4: Prototype Pollution ─────────────────────────────────────────────
+  // Write-only: only flag actual ASSIGNMENT to prototype[key], not read access
+  { id:'proto-write',     cat:'Prototype Pollution', sev:'critical',
+    re:/(?:__proto__|prototype)\s*\[\s*['"][^'"]+['"]\s*\]\s*=/g, ctx: null },
+  // Merge suspect: Object.assign with user-controlled source — potential pollution
+  { id:'proto-merge-suspect', cat:'Prototype Pollution', sev:'medium',
+    re:/Object\.(?:assign|merge)\s*\(\s*[A-Za-z_$][\w$]*\s*,\s*[A-Za-z_$][\w$]*\s*\)/g,
+    ctx: m => /user|request|input|body|data|param|query/i.test(m.slice(-200)) },
+  // Deprecated: old read-access pattern (too many FPs on .extend/.slice.call)
   { id:'proto-assign',    cat:'Prototype Pollution', sev:'critical',
-    re:/(?:__proto__|prototype)\s*\[/g, ctx: null },
-  { id:'proto-merge',     cat:'Prototype Pollution', sev:'high',
-    re:/Object\.assign\s*\(\s*(?:target|obj|config|opts|options|settings)/gi,
-    ctx: m => /user|request|input|body|data|param/i.test(m) },
-  { id:'proto-setproto',  cat:'Prototype Pollution', sev:'high',
-    re:/Object\.setPrototypeOf\s*\(/g, ctx: null },
+    re:/(?:__proto__|prototype)\s*\[/g, ctx: m => /=\s*[^;]+$/.test(m) || /=/.test(m.slice(0,400)) },
+  { id:'proto-setproto',  cat:'Prototype Pollution', sev:'medium',
+    re:/Object\.setPrototypeOf\s*\(/g, ctx: m => /Object\.prototype/.test(m) },
   { id:'proto-jsonparse',  cat:'Prototype Pollution', sev:'medium',
     re:/JSON\.parse\s*\([^)]+\)/g,
     ctx: m => /user|request|input|param|__proto__|constructor/i.test(m) },
@@ -1207,6 +1213,11 @@ function parseArgs() {
     fetchSourcemaps: false,// fetch external .map files via http/https
     multi: false,          // multi-bundle cross-analysis mode
     quiet: false,          // suppress non-essential output (CI-friendly)
+    llmPayload: true,      // include LLM-specific payload (function summaries, backward slices, VRT, source expander)
+    baseline: null,        // path to .omega-ignore baseline file
+    updateBaseline: false, // write current findings as new baseline
+    watch: false,          // re-scan on file change
+    diff: null,            // path to previous report.json for diff mode
   };
   for (let i = 1; i < args.length; i++) {
     switch (args[i]) {
@@ -1229,6 +1240,11 @@ function parseArgs() {
     case '--fetch-sourcemaps': o.fetchSourcemaps = true; break;
     case '--multi':         o.multi        = true;      break;
     case '--quiet':         o.quiet        = true;      break;
+    case '--no-llm-payload': o.llmPayload  = false;     break;
+    case '--baseline':      o.baseline     = args[++i]; break;
+    case '--update-baseline': o.updateBaseline = true;   break;
+    case '--watch':          o.watch          = true;     break;
+    case '--diff':           o.diff           = args[++i]; break;
     case '--all':
         o.splitModules = o.secrets = o.routes = o.security =
         o.graph = o.report = o.ast = true; break;
@@ -1261,6 +1277,13 @@ function printHelp() {
   console.log('  --fetch-cves       Query OSV.dev API for live vulnerability data (uses node:https)');
   console.log('  --fetch-sourcemaps Fetch and decode external .map files (uses node:https)');
   console.log('  --quiet            Suppress non-essential output (CI-friendly)');
+  console.log('  --multi            Cross-bundle analysis mode (comma-separated inputs)');
+  console.log('  --no-llm-payload   Omit LLM-specific JSON sections (function summaries, backward');
+  console.log('                     slices, VRT, source expander) — reduces report size ~70%');
+  console.log('  --baseline <file>  Load baseline file (.omega-ignore JSON) to suppress known findings');
+  console.log('  --update-baseline  Write current findings to .omega-ignore file');
+  console.log('  --watch            Watch input file for changes and re-scan (uses fs.watch)');
+  console.log('  --diff <file>      Compare against previous report.json — only show new findings');
   console.log('  --multi            Cross-bundle analysis mode (comma-separated inputs)');
   console.log('');
   console.log('  CI exit codes (configure via OMEGA_FAIL_ON env var):');
@@ -1543,8 +1566,8 @@ function decodeObfuscatorIo(src) {
   const decodedStrings = [];
 
   // ── Step 1: extract string-array declaration ───────────────────────────
-  // Pattern: var NAME = ['s1','s2',...];  (at least 3 strings)
-  const saDeclRe = /var\s+([A-Za-z_$][\w$]*)\s*=\s*\[((?:["'][^"']*["']\s*,?\s*){3,})\]\s*;/g;
+  // Pattern: var|const|let NAME = ['s1','s2',...];  (at least 3 strings)
+  const saDeclRe = /(?:var|const|let)\s+([A-Za-z_$][\w$]*)\s*=\s*\[((?:["'][^"']*["']\s*,?\s*){3,})\]\s*;/g;
   let saMatch;
   const stringArrays = [];  // { name, strings, pos, endPos }
 
@@ -4144,6 +4167,50 @@ function generateReports(data, outDir) {
   }, null, 2);
   fs.writeFileSync(path.join(outDir, 'report.json'), json);
 
+  // ─── SARIF v2.1.0 (GitHub Code Scanning compatible) ────────────────────
+  const crypto = require('crypto');
+  const sevToSarif = { critical:'error', high:'error', medium:'warning', low:'note', info:'none' };
+  const allFindingsForSarif = [
+    ...(credentials || []).map(f => ({ ...f, category: f.category || 'Credential' })),
+    ...(security || []).map(f => ({ ...f, category: f.category || 'Security' })),
+    ...(extendedFindings || []),
+  ];
+  const sarif = {
+    version: '2.1.0',
+    $schema: 'https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json',
+    runs: [{
+      tool: {
+        driver: {
+          name: 'omega-sast',
+          version: VERSION,
+          informationUri: 'https://github.com/Black0ffR/omega-sast',
+          rules: [...new Set(allFindingsForSarif.map(f => f.id || f.category))].map(id => ({
+            id,
+            name: id,
+            shortDescription: { text: id },
+            properties: { category: 'Security' },
+          })),
+        },
+      },
+      results: allFindingsForSarif.map((f, i) => {
+        const hash = crypto.createHash('sha1').update(String(f.value || '') + String(f.pos || i)).digest('hex');
+        return {
+          ruleId: f.id || f.category,
+          level: sevToSarif[f.severity] || 'note',
+          message: { text: `${f.category || ''}: ${f.value || f.description || ''}`.trim() },
+          locations: f.pos ? [{
+            physicalLocation: {
+              artifactLocation: { uri: data.meta.file },
+              region: { offset: f.pos, length: (f.value || '').length || 1 },
+            },
+          }] : undefined,
+          partialFingerprints: { primaryLocationLineHash: hash },
+        };
+      }),
+    }],
+  };
+  fs.writeFileSync(path.join(outDir, 'report.sarif'), JSON.stringify(sarif, null, 2));
+
   // ─── Markdown ───────────────────────────────────────────────────────────
   const sa = storageAudit || { localStorage:[], sessionStorage:[], cookies:[], totalKeys:0, sensitiveCount:0 };
   const auth = authSurface || { guardedRoutes:[], unguardedRoutes:[], btoaMisuse:[] };
@@ -4915,57 +4982,115 @@ async function runMultiBundle(opts) {
     console.log(info(`Output:  ${C.bold}${outDir}${C.reset}`));
   }
 
-  // Run analysis on each bundle
+  const numWorkers = Math.min(inputList.length, os.cpus().length || 4);
+  if (!opts.quiet) console.log(info(`Workers: ${numWorkers} parallel`));
+
+  // ── Worker pool ──────────────────────────────────────────────────────────
+  const results = new Array(inputList.length).fill(null);
+  let nextIdx = 0;
+
+  function spawnWorker(bundleIdx) {
+    return new Promise((resolve) => {
+      const { Worker } = require('worker_threads');
+      const bundlePath = path.resolve(inputList[bundleIdx]);
+      if (!fs.existsSync(bundlePath)) {
+        resolve({ bundleIdx, error: `File not found: ${bundlePath}` });
+        return;
+      }
+      const worker = new Worker(`
+        const { parentPort, workerData } = require('worker_threads');
+        const path = require('path');
+        const fs = require('fs');
+        const mainPath = ${JSON.stringify(path.resolve(__filename))};
+        const omega = require(mainPath);
+        async function runWorker() {
+          try {
+            // Build opts from workerData
+            const wd = workerData;
+            const opts = {
+              input: wd.bundlePath,
+              out: wd.outDir,
+              quiet: true,
+              secrets: wd.secrets, routes: wd.routes, security: wd.security,
+              graph: wd.graph, report: wd.report, verbose: wd.verbose,
+              ast: null, moduleMap: null, severityFloor: wd.severityFloor,
+              maxHops: wd.maxHops, fetchCves: false, fetchSourcemaps: wd.fetchSourcemaps,
+              multi: false, llmPayload: false, baseline: null, updateBaseline: false,
+              watch: false, diff: null,
+            };
+            const summary = await omega.main(opts);
+            // Read the JSON report to return findings data
+            let findings;
+            try {
+              const reportPath = path.join(opts.out, 'report.json');
+              if (fs.existsSync(reportPath)) {
+                findings = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+              }
+            } catch (_) {}
+            parentPort.postMessage({ bundleIdx: wd.bundleIdx, summary, findings, success: true });
+          } catch (e) {
+            parentPort.postMessage({ bundleIdx: wd.bundleIdx, error: e.message, success: false });
+          }
+        }
+        runWorker();
+      `, { eval: true, workerData: { 
+        bundleIdx,
+        bundlePath,
+        outDir: path.join(outDir, path.basename(bundlePath, path.extname(bundlePath))),
+        secrets: opts.secrets, routes: opts.routes, security: opts.security,
+        graph: opts.graph, report: opts.report, verbose: opts.verbose,
+        severityFloor: opts.severityFloor, maxHops: opts.maxHops,
+        fetchSourcemaps: opts.fetchSourcemaps,
+      } });
+
+      worker.on('message', (msg) => resolve(msg));
+      worker.on('error', (err) => resolve({ bundleIdx, error: err.message, success: false }));
+      worker.on('exit', (code) => {
+        // If worker exits without sending message, create a placeholder
+        resolve({ bundleIdx, error: `Worker exited with code ${code}`, success: false });
+      });
+    });
+  }
+
+  async function workerLoop() {
+    const promises = [];
+    for (let i = 0; i < numWorkers && nextIdx < inputList.length; i++) {
+      const idx = nextIdx++;
+      promises.push(spawnWorker(idx).then(r => { results[idx] = r; }));
+    }
+    while (nextIdx < inputList.length) {
+      await Promise.race(promises);
+      const idx = nextIdx++;
+      promises.push(spawnWorker(idx).then(r => { results[idx] = r; }));
+    }
+    await Promise.all(promises);
+  }
+
+  await workerLoop();
+
+  // ── Collect results ──────────────────────────────────────────────────────
   const bundleResults = [];
   for (let bi = 0; bi < inputList.length; bi++) {
     const bundlePath = path.resolve(inputList[bi]);
-    if (!fs.existsSync(bundlePath)) {
-      console.error(warn(`Bundle not found: ${bundlePath} — skipping`));
+    const bundleName = path.basename(bundlePath, path.extname(bundlePath));
+    if (!results[bi] || !results[bi].success) {
+      console.error(warn(`Bundle ${bundleName}: ${results[bi] ? results[bi].error : 'unknown error'}`));
       continue;
     }
-    const bundleName = path.basename(bundlePath, path.extname(bundlePath));
-    if (!opts.quiet) {
-      console.log(`\n${head(`Bundle ${bi + 1}/${inputList.length}: ${bundleName}`)}`);
-    }
-
-    // Create per-bundle output subdirectory
-    const bundleOutDir = path.join(outDir, bundleName);
-    
     const bundleSrc = fs.readFileSync(bundlePath, 'utf8');
     const bundleStat = fs.statSync(bundlePath);
     const bundleSha256 = crypto.createHash('sha256').update(bundleSrc).digest('hex');
-    
-    // Collect per-bundle dependency info for version-conflict detection
     const deps = collectDependencies(bundleSrc);
-    
-    // Run full OMEGA analysis on this bundle (re-uses opts with bundle-specific out dir)
-    // Temporarily swap opts.input and opts.out for the analysis
-    const savedInput = opts.input;
-    const savedOut = opts.out;
-    const savedQuiet = opts.quiet;
-    opts.input = bundlePath;
-    opts.out = bundleOutDir;
-    opts.quiet = true; // suppress per-bundle console output
-    
-    // Restore opts
-    opts.input = savedInput;
-    opts.out = savedOut;
-    opts.quiet = savedQuiet;
-    
     bundleResults.push({
       name: bundleName,
       path: bundlePath,
       size: bundleStat.size,
       sha256: bundleSha256,
       deps,
+      summary: results[bi].summary,
     });
-    
     if (!opts.quiet) {
-      console.log(ok(`${bundleName}: ${(bundleStat.size/1024).toFixed(1)} KB, ${deps.length} deps`));
-      for (const d of deps.slice(0, 10)) {
-        console.log(info(`  dep: ${d.name}@${d.version}`));
-      }
-      if (deps.length > 10) console.log(info(`  …and ${deps.length - 10} more deps`));
+      console.log(ok(`${bundleName}: ${(bundleStat.size/1024).toFixed(1)} KB, ${deps.length} deps, ${results[bi].summary ? results[bi].summary.totalFindings : '?'} findings`));
     }
   }
 
@@ -5089,8 +5214,69 @@ function collectDependencies(src) {
   return deps;
 }
 
-async function main() {
-  const opts = parseArgs();
+// ── Baseline suppression (.omega-ignore) ────────────────────────────────
+// JSON format: [{ id, file?, reason?, expires? }]
+// Findings matching id + file are moved to a `suppressed` array.
+function loadBaseline(path) {
+  try {
+    const raw = fs.readFileSync(path, 'utf8');
+    return JSON.parse(raw);
+  } catch (_) { return []; }
+}
+
+function applyBaseline(findings, baseline, filename) {
+  if (!baseline || !baseline.length) return { findings, suppressed: [] };
+  const suppressed = [];
+  const kept = [];
+  const now = Date.now();
+  for (const f of findings) {
+    const match = baseline.some(b => {
+      if (b.expires && new Date(b.expires).getTime() < now) return false;
+      if (b.id && b.id !== (f.id || f.category)) return false;
+      if (b.file && b.file !== filename) return false;
+      return true;
+    });
+    if (match) {
+      suppressed.push({ ...f, suppressedBy: b => b.id });
+    } else {
+      kept.push(f);
+    }
+  }
+  return { findings: kept, suppressed };
+}
+
+function generateBaseline(findings) {
+  const seen = new Set();
+  return findings.map(f => {
+    const id = f.id || f.category;
+    if (seen.has(id)) return null;
+    seen.add(id);
+    return { id, reason: 'review', expires: new Date(Date.now() + 90*86400000).toISOString().split('T')[0] };
+  }).filter(Boolean);
+}
+
+// ── Diff mode ─────────────────────────────────────────────────────────────
+// Load previous report.json, compare finding IDs + values, return only new findings.
+function loadPreviousFindings(path) {
+  try {
+    const raw = fs.readFileSync(path, 'utf8');
+    const report = JSON.parse(raw);
+    const prev = [];
+    for (const key of ['credentials', 'security', 'extendedFindings']) {
+      if (Array.isArray(report[key])) prev.push(...report[key]);
+    }
+    return prev;
+  } catch (_) { return null; }
+}
+
+function diffFindings(current, previous) {
+  if (!previous) return current;
+  const prevSet = new Set(previous.map(f => `${f.id || f.category}::${f.value || ''}`));
+  return current.filter(f => !prevSet.has(`${f.id || f.category}::${f.value || ''}`));
+}
+
+async function main(externalOpts) {
+  const opts = externalOpts || parseArgs();
   const t0   = Date.now();
 
   // ── Validate severity-floor ────────────────────────────────────────────
@@ -5528,14 +5714,42 @@ async function main() {
       console.log(info(`  Obfuscator: ${obfuscatorFingerprint.primary.obfuscator} (${(obfuscatorFingerprint.primary.confidence * 100).toFixed(0)}% confidence) — ${obfuscatorFingerprint.primary.matched.length} signatures`));
     }
 
-    // Phase 17 — Function summary emitter (Stage 6)
-    if (opts.verbose) console.log(info('  Phase 17: Function summary emitter (Stage 6)…'));
-    functionSummaries = ast.computeFunctionSummaries(astSrc, structuralIndex);
-    const fnsWithSinks = functionSummaries.filter(s => s.sinks.length > 0).length;
-    const fnsWithSources = functionSummaries.filter(s => s.sources.length > 0).length;
-    const fnsWithSanitizers = functionSummaries.filter(s => s.sanitizers.length > 0).length;
-    if (opts.verbose) {
-      console.log(info(`  Summaries: ${functionSummaries.length} fns, ${fnsWithSinks} with sinks, ${fnsWithSources} with sources, ${fnsWithSanitizers} with sanitizers`));
+    // Phase 17 — Function summary emitter (Stage 6) [LLM payload]
+    if (opts.llmPayload) {
+      if (opts.verbose) console.log(info('  Phase 17: Function summary emitter (Stage 6)…'));
+      functionSummaries = ast.computeFunctionSummaries(astSrc, structuralIndex);
+      const fnsWithSinks = functionSummaries.filter(s => s.sinks.length > 0).length;
+      const fnsWithSources = functionSummaries.filter(s => s.sources.length > 0).length;
+      const fnsWithSanitizers = functionSummaries.filter(s => s.sanitizers.length > 0).length;
+      if (!opts.quiet)
+        console.log(info(`  Summaries: ${functionSummaries.length} fns, ${fnsWithSinks} with sinks, ${fnsWithSources} with sources, ${fnsWithSanitizers} with sanitizers`));
+    }
+
+    // Phase 18 — Sink-anchored backward slicer (Stage 6) [LLM payload]
+    if (opts.llmPayload) {
+      if (opts.verbose) console.log(info('  Phase 18: Sink-anchored backward slicer (Stage 6)…'));
+      backwardSlices = ast.buildBackwardSlices(astSrc, structuralIndex, functionSummaries, callGraph, opts.maxHops);
+      const reachableSlices = backwardSlices.filter(p => p.reachesSource).length;
+      if (!opts.quiet)
+        console.log(info(`  Slices: ${backwardSlices.length} paths, ${reachableSlices} reach a taint source`));
+    }
+
+    // Phase 19 — Variable Rename Table (Stage 7) [LLM payload]
+    if (opts.llmPayload) {
+      if (opts.verbose) console.log(info('  Phase 19: Variable rename table (Stage 7)…'));
+      variableRenameTable = ast.buildVariableRenameTable(structuralIndex, functionSummaries);
+      if (!opts.quiet)
+        console.log(info(`  VRT: ${variableRenameTable.stats.renamed} renamed (${variableRenameTable.stats.params} params, ${variableRenameTable.stats.locals} locals, ${variableRenameTable.stats.functions} functions)`));
+    }
+
+    // Phase 20 — On-demand source expansion (Stage 7) [LLM payload]
+    if (opts.llmPayload) {
+      if (opts.verbose) console.log(info('  Phase 20: Source expansion interface (Stage 7)…'));
+      sourceExpander = ast.createSourceExpander(astSrc, structuralIndex, functionSummaries);
+      if (!opts.quiet) {
+        const sinkSummaries = sourceExpander.getSinkSummaries();
+        console.log(info(`  Source expander: ${sinkSummaries.length} sink summaries`));
+      }
     }
 
     // Phase 18 — Sink-anchored backward slicer (Stage 6)
@@ -5687,6 +5901,57 @@ async function main() {
 
   // Security summary
   const allSec = [...credentials, ...security, ...extendedFindings];
+
+  // Source-map correlation: remap finding positions to original source locations
+  if (sourceMapInfo && sourceMapInfo.found && sourceMapInfo.mappings) {
+    const decodedLines = ast.decodeVLQMappings(sourceMapInfo.mappings);
+    const sources = sourceMapInfo.sources || [];
+    const sourceRoot = sourceMapInfo.sourceRoot || '';
+    for (const f of allSec) {
+      if (f.pos == null) continue;
+      const genLine = src.slice(0, f.pos).split('\n').length;
+      const genCol = f.pos - src.lastIndexOf('\n', f.pos) - 1;
+      const remapped = ast.mapSourcePosition(genLine, Math.max(0, genCol), decodedLines, sources, sourceRoot);
+      if (remapped && remapped.source) {
+        f.sourceLocation = {
+          file: remapped.source,
+          line: remapped.line,
+          column: remapped.column,
+        };
+      }
+    }
+  }
+
+  // Apply baseline suppression
+  let suppressed = [];
+  if (opts.baseline) {
+    const baseline = loadBaseline(opts.baseline);
+    const result = applyBaseline(allSec, baseline, meta.file || path.basename(inputPath));
+    allSec.length = 0; allSec.push(...result.findings);
+    suppressed = result.suppressed;
+    if (suppressed.length && !opts.quiet) {
+      console.log(info(`Baseline suppressed ${suppressed.length} findings (${opts.baseline})`));
+    }
+  }
+
+  // Diff mode — filter to new findings only
+  if (opts.diff) {
+    const previous = loadPreviousFindings(opts.diff);
+    const newFindings = diffFindings(allSec, previous);
+    const removedCount = allSec.length - newFindings.length;
+    allSec.length = 0; allSec.push(...newFindings);
+    if (!opts.quiet && removedCount > 0) {
+      console.log(info(`Diff mode: ${removedCount} pre-existing findings hidden (${opts.diff})`));
+    }
+  }
+
+  // Write baseline if --update-baseline
+  if (opts.updateBaseline) {
+    const baselinePath = path.join(opts.out, '.omega-ignore');
+    const baseline = generateBaseline(allSec);
+    fs.writeFileSync(baselinePath, JSON.stringify(baseline, null, 2));
+    if (!opts.quiet) console.log(ok(`Baseline written: ${C.bold}${baselinePath}${C.reset}`));
+  }
   const critCount = allSec.filter(f=>(f.severity||f.sev)==='critical').length;
   const highCount = allSec.filter(f=>(f.severity||f.sev)==='high').length;
   const medCount  = allSec.filter(f=>(f.severity||f.sev)==='medium').length;
@@ -5758,6 +6023,7 @@ async function main() {
     }, outDir);
     console.log(ok(`HTML report: ${C.bold}${path.join(outDir,'report.html')}${C.reset}`));
     console.log(ok(`JSON report: ${C.bold}${path.join(outDir,'report.json')}${C.reset}`));
+    console.log(ok(`SARIF report:${C.bold}${path.join(outDir,'report.sarif')}${C.reset}`));
     console.log(ok(`MD report:   ${C.bold}${path.join(outDir,'report.md')}${C.reset}`));
   }
 
@@ -5795,19 +6061,36 @@ async function main() {
 //   OMEGA_FAIL_ON=none                — always exit 0 (CI gate disabled)
 // Only auto-run when invoked as the main module (CLI mode)
 if (require.main === module) {
-  main()
-    .then((summary) => {
-      const failLevel = (process.env.OMEGA_FAIL_ON || 'critical').toLowerCase();
-      const RANK = { critical: 0, high: 1, medium: 2, low: 3, info: 4, none: 99 };
-      if (failLevel === 'none' || RANK[failLevel] === undefined) process.exit(0);
-      const failRank = RANK[failLevel];
-      if (summary.criticalCount > 0 && failRank <= RANK.critical) process.exit(2);
-      if (summary.highCount > 0     && failRank <= RANK.high)     process.exit(3);
-      if (summary.mediumCount > 0   && failRank <= RANK.medium)   process.exit(4);
-      if (failRank <= RANK.low && summary.totalFindings > 0)      process.exit(5);
-      process.exit(0);
-    })
-    .catch(e => { console.error(fail(e.message)); process.exit(1); });
+  const _opts = parseArgs();
+
+  async function _run() {
+    const summary = await main();
+    const failLevel = (process.env.OMEGA_FAIL_ON || 'critical').toLowerCase();
+    const RANK = { critical: 0, high: 1, medium: 2, low: 3, info: 4, none: 99 };
+    if (failLevel === 'none' || RANK[failLevel] === undefined) process.exit(0);
+    const failRank = RANK[failLevel];
+    if (summary.criticalCount > 0 && failRank <= RANK.critical) process.exit(2);
+    if (summary.highCount > 0     && failRank <= RANK.high)     process.exit(3);
+    if (summary.mediumCount > 0   && failRank <= RANK.medium)   process.exit(4);
+    if (failRank <= RANK.low && summary.totalFindings > 0)      process.exit(5);
+    process.exit(0);
+  }
+
+  if (_opts.watch) {
+    const watchFile = _opts.input;
+    console.log(info(`Watching ${watchFile} for changes…`));
+    // Run once, then watch
+    main().then(() => {
+      fs.watch(watchFile, (eventType) => {
+        if (eventType === 'change') {
+          console.log(info(`Change detected — re-scanning…`));
+          main().catch(e => { console.error(fail(e.message)); });
+        }
+      });
+    }).catch(e => { console.error(fail(e.message)); process.exit(1); });
+  } else {
+    _run().catch(e => { console.error(fail(e.message)); process.exit(1); });
+  }
 }
 
 // Export functions for programmatic use

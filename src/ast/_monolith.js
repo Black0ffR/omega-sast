@@ -1149,9 +1149,11 @@ function resolveWebpack5Modules(src) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 function detectBundler(src) {
+  const PRIORITY = ['nextAppRouter','webpack5','webpack4','viteRelChunks','viteLegacy','viteModern','rollup','esbuild','parcel','browserify','umdNamed','umdGeneric','iifeGlobal'];
   const hints = {
     webpack5:    /self\.webpackChunk_|self\["webpackChunk|webpackChunk_[A-Za-z0-9_$]+|__webpack_require__|__webpack_modules__|__webpack_module_cache__|performance\.mark\(\s*["']js-parse-end/,
     webpack4:    /\bwebpackJsonp\b/,
+    viteRelChunks:/__vitePreload|__vite__mapDeps|import\.meta\.env/,
     viteLegacy:  /__vitePreload\s*\(|__vite__mapDeps/,
     // FIX (Stage 4 audit): added negative lookahead `(?!https?:)` to reject
     // absolute URLs like `https://cdn.com/foo.js` which are NOT Vite relative
@@ -1162,16 +1164,26 @@ function detectBundler(src) {
     esbuild:     /__require\s*=\s*typeof\s+require|__markAsModule|var\s+__defProp\s*=\s*Object\.defineProperty.*__getOwnPropDesc|var\s+__commonJS\s*=\s*\(/,
     parcel:      /parcelRequire\s*=\s*this\["parcel|bundle\(\)\{.*parcelRequire/,
     browserify:  /\(function\s*[ef]\s*\{if\(typeof\s+exports\s*===\s*['"]object['"]&&typeof\s+module\s*!==/,
+    nextAppRouter:/\$_appRouterManifest|__next_root_layout/,
+    umdGeneric:  /\(function\s*\([a-z]\s*,\s*[a-z]\s*,\s*[a-z]\s*\)\s*\{\s*(?:typeof\s+define\s*===\s*['"]function['"]|"object"==typeof\s+(?:exports|module))/,
+    umdNamed:    /\(function\s*\(\s*[a-z]\s*,\s*[a-z]\s*,\s*[a-z]\s*\)\s*\{[\s\S]{0,200}typeof\s+define/i,
+    iifeGlobal:  /^!\s*function\s*\([^)]*\)\s*\{/,
   };
   const detected = [];
   for (const [name, re] of Object.entries(hints)) {
     if (re.test(src)) detected.push(name);
   }
+  // Sort by priority: most specific match wins
+  detected.sort((a, b) => PRIORITY.indexOf(a) - PRIORITY.indexOf(b));
+  // Minified heuristic: count single-letter identifiers
+  const singleLetterIdents = (src.match(/\b[a-z]\s*[,=;:)\]}]/g) || []).length;
+  const isMinified = singleLetterIdents > 50;
   return {
     detected,
-    primary: detected[0] || null,
-    isEsm: detected.includes('viteModern') || detected.includes('esMBuild'),
-    isIife: detected.includes('webpack5') || detected.includes('webpack4') || detected.includes('rollup'),
+    primary: detected[0] || (isMinified ? 'minified-global' : null),
+    isEsm: detected.includes('viteModern') || detected.includes('viteRelChunks'),
+    isIife: detected.includes('webpack5') || detected.includes('webpack4') || detected.includes('rollup') || detected.includes('iifeGlobal'),
+    isMinified,
   };
 }
 
