@@ -2401,6 +2401,7 @@ function fingerprintObfuscator(src) {
   // ── Generic obfuscation heuristic ───────────────────────────────────────
   // If no specific obfuscator detected, check for general signs:
   //   · High density of hex identifiers (>5 but <20)
+  //   · High diversity of short (2-3 char) identifiers (mangled names)
   //   · Multiple eval(new Function(...)) calls
   //   · String concatenation chains (>5 consecutive "str" + "str")
   if (signatures.length === 0) {
@@ -2414,6 +2415,21 @@ function fingerprintObfuscator(src) {
         pos: src.indexOf('_0x'),
         evidence: `${hexIdents.length} _0xHEX identifiers`,
         hint: 'some identifier mangling',
+      });
+    }
+
+    // Mangling signature: high diversity of short (2-3 char) lowercase identifiers.
+    // Obfuscator.io with --identifier-names-generator mangled produces identifiers
+    // like a/b/c/aa/ab/ac — hundreds of unique 2-3 char names vs 20-50 in normal code.
+    const shortIdents = src.match(/\b[a-z]{2,3}\b/g) || [];
+    const uniqueShortCount = new Set(shortIdents).size;
+    if (uniqueShortCount > 80) {
+      genericScore += 0.3;
+      genericSigs.push({
+        signature: 'mangled-identifiers',
+        pos: src.search(/\b[a-z]{2,3}\b/),
+        evidence: `${uniqueShortCount} unique short (2-3 char) identifiers`,
+        hint: 'identifiers appear mangled — do not reason about name semantics',
       });
     }
 
@@ -3115,11 +3131,16 @@ function buildBackwardSlices(src, structuralIndex, functionSummaries, callGraph,
         }
       }
 
+      // Demote unproven taint paths: without source evidence, severity is misleading.
+      if (!path.reachesSource) {
+        const demote = { critical: 'medium', high: 'low', medium: 'info' };
+        path.sink.severity = demote[path.sink.severity] || path.sink.severity;
+      }
       paths.push(path);
     }
   }
 
-  // Sort paths: reachesSource first, then by severity
+  // Sort paths: reachesSource first, then by severity (post-demotion)
   const sevRank = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
   paths.sort((a, b) => {
     if (a.reachesSource !== b.reachesSource) return a.reachesSource ? -1 : 1;

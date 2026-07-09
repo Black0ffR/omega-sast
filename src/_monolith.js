@@ -776,7 +776,7 @@ const CREDENTIAL_PATTERNS = [
     fpGuard: v => v.length > 200 || !/[+/]/.test(v) },
   { name:'Hex secret candidate', severity:'low',
     re:/["'][0-9a-fA-F]{40,}["']/g,
-    fpGuard: v => v.length > 80 || /^(?:[0-9a-f]{6,8})+$/.test(v) },
+    fpGuard: v => v.length > 80 || /^(?:[0-9a-f]{6,8})+$/.test(v) || !/[A-Z]/.test(v) || !/[a-z]/.test(v) },
 ];
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3700,10 +3700,19 @@ function scoreAttackSurface(allFindings, authSurface, routes, astContext) {
   let score = 0;
   const breakdown = {};
 
+  // Cap low-severity hex-secret candidates at 20 pts to prevent lookup tables
+  // (e.g., D3 color tables generating 100+ false hits) from inflating scores.
+  let hexCandidates = 0;
+  const HEX_LOW_CAP = 20;
+
   for (const f of allFindings) {
     const sev = f.severity || f.sev || 'info';
     const cat = f.category || f.name || 'Unknown';
     const w = weights[sev] || 0;
+    // Cap hex-secret contribution
+    if ((f.name || '').includes('Hex secret') && sev === 'low') {
+      if (++hexCandidates > HEX_LOW_CAP) continue;
+    }
     score += w;
     breakdown[cat] = (breakdown[cat] || 0) + w;
   }
@@ -4739,8 +4748,15 @@ async function main() {
   // Phase 9
   if (opts.verbose && !opts.quiet) console.log(info('  Phase 9: Framework detection…'));
   const frameworks = detectFrameworks(src);
+  const fwNames = frameworks.join(', ');
+  // Zero-out component estimates when framework not detected — prevents jQuery
+  // function patterns (return <HTML>, createElement, etc.) from falsely inflating
+  // React/Vue component counts in minified non-React/Vue bundles.
+  if (!fwNames.includes('React')) analysis.reactComponents = 0;
+  if (!fwNames.includes('Vue')) analysis.vueComponents = 0;
+  if (!fwNames.includes('Svelte')) analysis.svelteComponents = 0;
   if (!opts.quiet) {
-    console.log(info(`Frameworks: ${C.bold}${frameworks.join(', ')}${C.reset}`));
+    console.log(info(`Frameworks: ${C.bold}${fwNames}${C.reset}`));
     console.log(info(`Angular: ${analysis.components} components, ${analysis.services} services, ${analysis.pipes} pipes`));
     console.log(info(`React (est.): ${analysis.reactComponents}  Vue (est.): ${analysis.vueComponents}  Svelte (est.): ${analysis.svelteComponents}`));
     console.log(info(`Functions: ${analysis.functions}  Classes: ${analysis.classes}  Cyclomatic: ${analysis.cyclomatic}  MaxNest: ${analysis.maxNesting}`));
@@ -4830,6 +4846,13 @@ async function main() {
   const useAst = opts.ast !== null
     ? opts.ast
     : (opts.security || opts.report);
+
+  // Warn on --no-ast + --security: AST-derived features (fingerprint, backward
+  // slices, network surface, structural scoring) are unavailable. Print to
+  // stderr so it's visible even with --quiet.
+  if (!useAst && (opts.security || opts.report)) {
+    console.error(warn('--no-ast: AST structural analysis disabled. Obfuscator fingerprinting, backward slicing, network surface analysis, and AST-driven scoring will be skipped.'));
+  }
 
   let structuralIndex = null;
   let astFwFindings   = null;
