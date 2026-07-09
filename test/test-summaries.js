@@ -242,8 +242,10 @@ function caller() {
     assert('slice has sanitizer on path (DOMPurify.sanitize)',
       p.sanitizersOnPath.some(s => s.name === 'DOMPurify.sanitize'),
       `sanitizers=${p.sanitizersOnPath.map(s=>s.name).join(',')}`);
-    assert('slice still reaches source (sanitizer present but flow recorded)',
-      p.reachesSource === true);
+    assert('slice is marked as sanitized (suppressed for effective DOMPurify)',
+      p.sanitized === true, `sanitized=${p.sanitized}`);
+    assert('slice does NOT reach source (sanitizer neutralized taint)',
+      p.reachesSource === false);
   }
 }
 

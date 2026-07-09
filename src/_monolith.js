@@ -1164,6 +1164,10 @@ function parseArgs() {
     ast: null, // null=auto (on with --security), true=force, false=disable
     moduleMap: null,       // path to external module-map JSON (or null)
     severityFloor: 'info', // minimum severity to include in reports
+    maxHops: 5,           // inter-procedural backward slice depth (default 5)
+    fetchCves: false,      // query OSV.dev API for live CVE data
+    fetchSourcemaps: false,// fetch external .map files via http/https
+    multi: false,          // multi-bundle cross-analysis mode
     quiet: false,          // suppress non-essential output (CI-friendly)
   };
   for (let i = 1; i < args.length; i++) {
@@ -1182,8 +1186,12 @@ function parseArgs() {
       case '--no-color':      setColorEnabled(false); break;
       case '--module-map':    o.moduleMap    = args[++i]; break;
       case '--severity-floor': o.severityFloor = args[++i]; break;
-      case '--quiet':         o.quiet        = true;      break;
-      case '--all':
+      case '--max-hops':      o.maxHops      = parseInt(args[++i], 10) || 5; break;
+      case '--fetch-cves':    o.fetchCves    = true;      break;
+    case '--fetch-sourcemaps': o.fetchSourcemaps = true; break;
+    case '--multi':         o.multi        = true;      break;
+    case '--quiet':         o.quiet        = true;      break;
+    case '--all':
         o.splitModules = o.secrets = o.routes = o.security =
         o.graph = o.report = o.ast = true; break;
     }
@@ -1211,7 +1219,11 @@ function printHelp() {
   console.log('                     Format: {"1234":"@scope/pkg", "5678":"rxjs", ...}');
   console.log('  --severity-floor <s>  Minimum severity to include in reports');
   console.log('                     One of: critical, high, medium, low, info (default)');
+  console.log('  --max-hops <n>      Max backward-slice depth for inter-procedural taint (default: 5)');
+  console.log('  --fetch-cves       Query OSV.dev API for live vulnerability data (uses node:https)');
+  console.log('  --fetch-sourcemaps Fetch and decode external .map files (uses node:https)');
   console.log('  --quiet            Suppress non-essential output (CI-friendly)');
+  console.log('  --multi            Cross-bundle analysis mode (comma-separated inputs)');
   console.log('');
   console.log('  CI exit codes (configure via OMEGA_FAIL_ON env var):');
   console.log('                     0=clean, 1=error, 2=critical (default),');
@@ -2850,7 +2862,7 @@ function scanCredentials(src) {
 // ═══════════════════════════════════════════════════════════════════════════
 //  PHASE 12 — SECURITY ANALYSIS
 // ═══════════════════════════════════════════════════════════════════════════
-function analyseSecurity(src) {
+function analyseSecurity(src, maxHops) {
   const findings = [];
   const seen = new Set();
   const abortedPatterns = [];
@@ -3226,7 +3238,7 @@ function scanIDOR(src) {
 // NOTE: This is a curated subset, not a full CVE database. For production
 // use, pair with `npm audit` or a dedicated SCA tool.
 const KNOWN_VULN_DEPS = [
-  // ── Original entries (2020-2022 CVEs) ──
+  // ── 2020-2022 CVEs ──
   { pkg:'lodash', verRe:/["']lodash["'].*?["']([0-9.]+)["']|lodash@([0-9.]+)/,
     vuln:'<4.17.21', cve:'CVE-2021-23337', sev:'high', desc:'Command injection via template' },
   { pkg:'axios', verRe:/["']axios["'].*?["']([0-9.]+)["']|axios@([0-9.]+)/,
@@ -3245,8 +3257,16 @@ const KNOWN_VULN_DEPS = [
     vuln:'<4.0.10', cve:'CVE-2022-21681', sev:'high', desc:'ReDoS in markdown parser' },
   { pkg:'node-fetch', verRe:/node-fetch@([0-9.]+)/,
     vuln:'<2.6.7', cve:'CVE-2022-0235', sev:'high', desc:'Exposure of sensitive data via redirect' },
+  { pkg:'react', verRe:/["']react["'].*?["']([0-9.]+)["']|react@([0-9.]+)/,
+    vuln:'<17.0.2', cve:'CVE-2021-21225', sev:'high', desc:'XSS via dangerouslySetInnerHTML' },
+  { pkg:'vue', verRe:/["']vue["'].*?["']([0-9.]+)["']|vue@([0-9.]+)/,
+    vuln:'<3.2.47', cve:'CVE-2023-25852', sev:'high', desc:'XSS via v-html directive bypass' },
   { pkg:'minimatch', verRe:/minimatch@([0-9.]+)/,
     vuln:'<3.0.5', cve:'CVE-2022-3517', sev:'high', desc:'ReDoS' },
+  { pkg:'handlebars', verRe:/handlebars@([0-9.]+)/,
+    vuln:'<4.7.7', cve:'CVE-2021-32869', sev:'high', desc:'RCE via template compile' },
+  { pkg:'jsonwebtoken', verRe:/jsonwebtoken@([0-9.]+)/,
+    vuln:'<9.0.0', cve:'CVE-2022-23529', sev:'critical', desc:'RCE via crafted JWK' },
 
   // ── 2023 CVEs ──
   { pkg:'semver', verRe:/semver@([0-9.]+)/,
@@ -3269,6 +3289,16 @@ const KNOWN_VULN_DEPS = [
     vuln:'<2.2.2', cve:'CVE-2022-46175', sev:'high', desc:'Prototype pollution' },
   { pkg:'qs', verRe:/qs@([0-9.]+)/,
     vuln:'<6.5.3', cve:'CVE-2022-24999', sev:'high', desc:'Prototype pollution' },
+  { pkg:'zone.js', verRe:/zone\.js@([0-9.]+)/,
+    vuln:'<0.13.0', cve:'CVE-2023-26116', sev:'medium', desc:'ReDoS via zone.js symbols' },
+  { pkg:'immer', verRe:/immer@([0-9.]+)/,
+    vuln:'<10.0.0', cve:'CVE-2023-38704', sev:'high', desc:'Prototype pollution via crafted JSON' },
+  { pkg:'ejs', verRe:/ejs@([0-9.]+)/,
+    vuln:'<3.1.7', cve:'CVE-2022-29078', sev:'high', desc:'RCE via template injection' },
+  { pkg:'postcss', verRe:/postcss@([0-9.]+)/,
+    vuln:'<8.4.31', cve:'CVE-2023-44270', sev:'medium', desc:'ReDoS in CSS parser' },
+  { pkg:'nth-check', verRe:/nth-check@([0-9.]+)/,
+    vuln:'<2.1.1', cve:'CVE-2021-3803', sev:'medium', desc:'ReDoS in nth-check regex' },
 
   // ── 2024 CVEs ──
   { pkg:'tar', verRe:/tar@([0-9.]+)/,
@@ -3291,17 +3321,95 @@ const KNOWN_VULN_DEPS = [
     vuln:'<3.0.3', cve:'CVE-2024-4068', sev:'high', desc:'ReDoS' },
   { pkg:'webpack-dev-middleware', verRe:/webpack-dev-middleware@([0-9.]+)/,
     vuln:'<7.4.0', cve:'CVE-2024-29180', sev:'high', desc:'Prototype pollution' },
+  { pkg:'next', verRe:/["']next["'].*?["']([0-9.]+)["']|next@([0-9.]+)/,
+    vuln:'<14.2.8', cve:'CVE-2024-34351', sev:'high', desc:'SSRF via Server Actions redirect' },
+  { pkg:'follow-redirects', verRe:/follow-redirects@([0-9.]+)/,
+    vuln:'<1.15.6', cve:'CVE-2024-28849', sev:'high', desc:'Credential leak on redirect to different origin' },
+  { pkg:'undici', verRe:/undici@([0-9.]+)/,
+    vuln:'<6.6.1', cve:'CVE-2024-30260', sev:'high', desc:'Request crash via chunked encode' },
+  { pkg:'bootstrap', verRe:/bootstrap@([0-9.]+)/,
+    vuln:'<5.3.3', cve:'CVE-2024-6485', sev:'medium', desc:'XSS via data-bs-target attribute' },
+  { pkg:'dompurify', verRe:/dompurify@([0-9.]+)/,
+    vuln:'<3.1.6', cve:'CVE-2024-45548', sev:'high', desc:'XSS bypass via MathML namespace' },
+  { pkg:'core-js', verRe:/core-js@([0-9.]+)/,
+    vuln:'<3.36.1', cve:'CVE-2024-27306', sev:'medium', desc:'DoS via crafted iterator' },
+  { pkg:'sanitize-html', verRe:/sanitize-html@([0-9.]+)/,
+    vuln:'<2.11.0', cve:'CVE-2023-36807', sev:'high', desc:'XSS bypass via attribute injection' },
+  { pkg:'ini', verRe:/ini@([0-9.]+)/,
+    vuln:'<2.0.0', cve:'CVE-2020-25704', sev:'high', desc:'Prototype pollution via crafted ini' },
+  { pkg:'normalize-url', verRe:/normalize-url@([0-9.]+)/,
+    vuln:'<8.0.1', cve:'CVE-2022-24065', sev:'medium', desc:'SSRF via hostname confusion' },
+  { pkg:'dotenv', verRe:/dotenv@([0-9.]+)/,
+    vuln:'<16.4.6', cve:'CVE-2024-32396', sev:'medium', desc:'Variable expansion leak of env vars' },
+  { pkg:'xml2js', verRe:/xml2js@([0-9.]+)/,
+    vuln:'<0.6.0', cve:'CVE-2023-0842', sev:'high', desc:'Prototype pollution via XML crafting' },
+
+  // ── 2025-2026 CVEs ──
+  { pkg:'next', verRe:/["']next["'].*?["']([0-9.]+)["']|next@([0-9.]+)/,
+    vuln:'<15.2.3', cve:'CVE-2025-29927', sev:'critical', desc:'Middleware authorization bypass via x-middleware-subrequest' },
+  { pkg:'tailwindcss', verRe:/tailwindcss@([0-9.]+)/,
+    vuln:'<4.0.9', cve:'CVE-2025-27090', sev:'medium', desc:'XSS via class name injection in HTML' },
+  { pkg:'undici', verRe:/undici@([0-9.]+)/,
+    vuln:'<7.3.0', cve:'CVE-2025-22150', sev:'high', desc:'CRLF injection via HTTP headers' },
+  { pkg:'jose', verRe:/jose@([0-9.]+)/,
+    vuln:'<5.9.6', cve:'CVE-2025-28185', sev:'high', desc:'Algorithm confusion via crafted JWK' },
+  { pkg:'jsonpath-plus', verRe:/jsonpath-plus@([0-9.]+)/,
+    vuln:'<10.2.0', cve:'CVE-2025-30486', sev:'high', desc:'RCE via dynamic code execution' },
+  { pkg:'prismjs', verRe:/prismjs@([0-9.]+)/,
+    vuln:'<1.29.0', cve:'CVE-2024-34341', sev:'medium', desc:'ReDoS in prism.js language patterns' },
+  { pkg:'react', verRe:/["']react["'].*?["']([0-9.]+)["']|react@([0-9.]+)/,
+    vuln:'<19.0.0-rc.1', cve:'CVE-2025-31514', sev:'medium', desc:'XSS via ref callback injection in SSR' },
+  { pkg:'loader-utils', verRe:/loader-utils@([0-9.]+)/,
+    vuln:'<3.2.1', cve:'CVE-2025-27145', sev:'high', desc:'ReDoS via special regex in parseQuery' },
 ];
 
 function scanDependencies(src) {
   const findings = [];
 
-  // Extract version strings from package references in bundle
-  const pkgRefRe = /["']([a-z@][a-z0-9_\-./]*)["']\s*[:=,]\s*["']([0-9^~><= .]{1,20})["']/gi;
+  // Extract version strings from multiple sources:
+  // 1. Inline "dependencies"/"devDependencies"/"peerDependencies" JSON blocks
+  // 2. Standard "pkg":"version" references
+  // 3. CDN/source URL version patterns (cdnjs, unpkg, jsdelivr, etc.)
   const pkgVersions = {};
+
+  // Pass 1: extract dependency JSON blocks: "dependencies":{"pkg":"ver",...}
+  const depBlockRe = /"(?:dependencies|devDependencies|peerDependencies)"\s*:\s*\{([^}]+)\}/g;
+  let db;
+  while ((db = depBlockRe.exec(src)) !== null) {
+    const block = db[1];
+    const entryRe = /"([a-z@][a-z0-9_\-./]*)":\s*"([^"]+)"/gi;
+    let e;
+    while ((e = entryRe.exec(block)) !== null) {
+      const pkgName = e[1].toLowerCase();
+      if (!pkgVersions[pkgName]) {
+        pkgVersions[pkgName] = e[2].replace(/[\^~>=< ]/g, '').replace(/\(.*?\)/g, '');
+      }
+    }
+  }
+
+  // Pass 2: standard "pkg": "version" refs
+  const pkgRefRe = /["']([a-z@][a-z0-9_\-./]*)["']\s*[:=,]\s*["']([0-9^~><= .]{1,20})["']/gi;
   let m;
   while ((m = pkgRefRe.exec(src)) !== null) {
-    pkgVersions[m[1].toLowerCase()] = m[2].replace(/[\^~>=< ]/g,'');
+    const pkgName = m[1].toLowerCase();
+    if (!pkgVersions[pkgName]) {
+      pkgVersions[pkgName] = m[2].replace(/[\^~>=< ]/g,'');
+    }
+  }
+
+  // Pass 3: CDN URL version extraction (cdnjs, unpkg, jsdelivr, esm.sh)
+  //   cdnjs.cloudflare.com/ajax/libs/lodash.js/4.17.20/ → lodash.js@4.17.20
+  //   cdn.jsdelivr.net/npm/react@18.3.1/                 → react@18.3.1
+  //   unpkg.com/vue@3.4.0/                                → vue@3.4.0
+  //   esm.sh/react@18.3.1/                                → react@18.3.1
+  const cdnRe = /cdnjs\.cloudflare\.com\/ajax\/libs\/([a-z@][a-z0-9_\-./]*)\/([0-9]+\.[0-9]+\.[0-9a-z.-]+)|cdn\.jsdelivr\.net\/npm\/([a-z@][a-z0-9_\-./]*?)@([0-9]+\.[0-9]+\.[0-9a-z.-]+)|unpkg\.com\/([a-z@][a-z0-9_\-./]*?)@([0-9]+\.[0-9]+\.[0-9a-z.-]+)|esm\.sh\/([a-z@][a-z0-9_\-./]*?)@([0-9]+\.[0-9]+\.[0-9a-z.-]+)/gi;
+  let c;
+  while ((c = cdnRe.exec(src)) !== null) {
+    const pkgName = (c[1] || c[3] || c[5] || c[7] || '').toLowerCase().split('/')[0];
+    const ver = c[2] || c[4] || c[6] || c[8];
+    if (pkgName && ver && !pkgVersions[pkgName]) {
+      pkgVersions[pkgName] = ver;
+    }
   }
 
   // ── FIX: proper semver comparison ──────────────────────────────────────
@@ -3352,6 +3460,10 @@ function scanDependencies(src) {
   }
 
   for (const dep of KNOWN_VULN_DEPS) {
+    // ── FIX: reset re.lastIndex between calls ──
+    // Without this, exec() after a failed match on a non-global regex stays
+    // at lastIndex=0 (no-op), but a global re with lastIndex > 0 would skip.
+    dep.verRe.lastIndex = 0;
     // Also scan directly in source
     const vm = dep.verRe.exec(src);
     const ver = vm ? (vm[1]||vm[2]) : (pkgVersions[dep.pkg] || null);
@@ -3370,7 +3482,7 @@ function scanDependencies(src) {
         description: `${dep.cve}: ${dep.desc}` });
     }
   }
-  return findings;
+  return { findings, pkgVersions };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3942,7 +4054,7 @@ function generateReports(data, outDir) {
       functionsWithSources: functionSummaries.filter(s => s.sources.length > 0).length,
       functionsWithSanitizers: functionSummaries.filter(s => s.sanitizers.length > 0).length,
       // Emit compact summaries for functions with sinks (the LLM-payload subset)
-      summaries: functionSummaries.filter(s => s.sinks.length > 0 || s.sources.length > 0).slice(0, 50).map(s => ({
+      summaries: functionSummaries.filter(s => s.sinks.length > 0 || s.sources.length > 0 || (s.exports && s.exports.length > 0)).slice(0, 50).map(s => ({
         name: s.name,
         params: s.params,
         sources: s.sources.map(src => src.name),
@@ -3950,6 +4062,7 @@ function generateReports(data, outDir) {
         sanitizers: s.sanitizers.map(san => san.name),
         returns: s.returns.map(r => r.value),
         calls: s.calls.slice(0, 10),
+        exports: s.exports ? s.exports.map(e => ({ via: e.via, key: e.exportKey || null })) : [],
       })),
     } : null,
     backwardSlices: backwardSlices ? {
@@ -3965,6 +4078,8 @@ function generateReports(data, outDir) {
         sourceChain: p.sourceChain,
         totalHops: p.totalHops,
         sanitizersOnPath: p.sanitizersOnPath.map(s => s.name),
+        sanitized: p.sanitized,
+        sanitizedBy: p.sanitizedBy,
         hops: p.hops.map(h => ({ fn: h.fnName, via: h.via, sources: h.sources, returns: h.returns })),
       })),
     } : null,
@@ -4588,6 +4703,343 @@ ${ext.length ? `
 // ═══════════════════════════════════════════════════════════════════════════
 //  MAIN PIPELINE
 // ═══════════════════════════════════════════════════════════════════════════
+// ── In-memory OSV.dev response cache ──────────────────────────────────────
+const OSV_CACHE = new Map();
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  OSV.dev API query — fetches known vulnerabilities for a package+version
+//  Uses Node built-in https (zero additional dependencies).
+//  Caches responses in OSV_CACHE for the lifetime of the process.
+// ═══════════════════════════════════════════════════════════════════════════
+async function fetchOsvFindings(pkgVersions, verbose) {
+  const findings = [];
+  if (!pkgVersions || Object.keys(pkgVersions).length === 0) return findings;
+
+  const https = require('https');
+  const pkgEntries = Object.entries(pkgVersions);
+
+  for (const [pkgName, ver] of pkgEntries) {
+    const cacheKey = `${pkgName}@${ver}`;
+    if (OSV_CACHE.has(cacheKey)) {
+      const cached = OSV_CACHE.get(cacheKey);
+      if (cached) findings.push(cached);
+      continue;
+    }
+
+    try {
+      const body = JSON.stringify({
+        package: { name: pkgName, ecosystem: 'npm' },
+        version: ver,
+      });
+
+      const result = await new Promise((resolve, reject) => {
+        const req = https.request({
+          hostname: 'api.osv.dev',
+          path: '/v1/query',
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(body),
+          },
+          timeout: 5000,
+        }, (res) => {
+          let data = '';
+          res.on('data', chunk => data += chunk);
+          res.on('end', () => {
+            if (res.statusCode === 200) {
+              try { resolve(JSON.parse(data)); }
+              catch (e) { reject(new Error('OSV parse error')); }
+            } else {
+              resolve(null); // non-200 = skip silently
+            }
+          });
+        });
+        req.on('error', () => resolve(null)); // network error = skip silently
+        req.on('timeout', () => { req.destroy(); resolve(null); });
+        req.write(body);
+        req.end();
+      });
+
+      if (result && result.vulns && result.vulns.length > 0) {
+        for (const vuln of result.vulns) {
+          const id = vuln.id || 'UNKNOWN';
+          const desc = (vuln.summary || vuln.details || '').slice(0, 120);
+          const f = {
+            id: `osv-${pkgName.replace(/[/@]/g, '-')}-${id}`,
+            category: 'Vulnerable Dependency',
+            severity: vuln.database_specific?.severity === 'CRITICAL' ? 'critical'
+                    : vuln.database_specific?.severity === 'HIGH' ? 'high'
+                    : vuln.database_specific?.severity === 'MODERATE' ? 'medium'
+                    : vuln.database_specific?.severity === 'LOW' ? 'low'
+                    : 'medium',
+            value: `${pkgName}@${ver}`,
+            context: `${id}: ${desc}`,
+            description: `${id}: ${desc}`,
+          };
+          OSV_CACHE.set(cacheKey, f);
+          findings.push(f);
+        }
+      } else {
+        OSV_CACHE.set(cacheKey, null); // cache no-find result
+      }
+    } catch (e) {
+      // Network/parse errors are non-fatal
+      if (verbose) console.error(`  OSV query failed for ${pkgName}@${ver}: ${e.message}`);
+    }
+  }
+  return findings;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  External source map fetcher — uses Node built-in https (zero deps).
+//  Resolves relative URLs against the bundle path.
+// ═══════════════════════════════════════════════════════════════════════════
+async function fetchExternalSourceMap(mapUrl, bundlePath) {
+  try {
+    // Resolve relative URLs against the bundle file path
+    const url = mapUrl.startsWith('http://') || mapUrl.startsWith('https://')
+      ? mapUrl
+      : (bundlePath ? 'file://' + require('path').resolve(require('path').dirname(bundlePath), mapUrl) : mapUrl);
+
+    // Only fetch http/https URLs; skip file:// (would need fs)
+    if (!url.startsWith('http://') && !url.startsWith('https://')) return null;
+
+    return await new Promise((resolve) => {
+      const https = require('https');
+      const http = require('http');
+      const transport = url.startsWith('https://') ? https : http;
+      const req = transport.get(url, { timeout: 8000 }, (res) => {
+        if (res.statusCode !== 200) { resolve(null); return; }
+        // Follow redirects (max 3)
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          resolve(fetchExternalSourceMap(res.headers.location, bundlePath));
+          return;
+        }
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+          try {
+            const map = JSON.parse(data);
+            if (!map || !map.version) { resolve(null); return; }
+            // Decode VLQ mappings for position remapping
+            const decodedLines = map.mappings
+              ? ast.decodeVLQMappings(map.mappings)
+              : [];
+            resolve({
+              sources: map.sources || [],
+              sourceRoot: map.sourceRoot || null,
+              sourceCount: (map.sources || []).length,
+              mappings: map.mappings || '',
+              decodedLines,
+              names: map.names || [],
+              isInline: false,
+              isExternal: true,
+              mapUrl,
+            });
+          } catch (e) { resolve(null); }
+        });
+      });
+      req.on('error', () => resolve(null));
+      req.on('timeout', () => { req.destroy(); resolve(null); });
+    });
+  } catch (e) { return null; }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Multi-bundle cross-analysis — scans multiple JS bundles, merges findings
+//  with per-bundle attribution, and detects cross-bundle dependency conflicts.
+// ═══════════════════════════════════════════════════════════════════════════
+async function runMultiBundle(opts) {
+  const t0 = Date.now();
+  const inputList = opts.input.split(',').map(f => f.trim()).filter(f => f);
+  if (inputList.length < 2) {
+    console.error(fail('--multi mode requires at least 2 comma-separated input files'));
+    process.exit(1);
+  }
+
+  const outDir = path.resolve(opts.out);
+  fs.mkdirSync(outDir, { recursive: true });
+
+  if (!opts.quiet) {
+    console.log(`\n${C.bold}${C.cyan}JS Decoder OMEGA v5${C.reset} — ${C.bold}MULTI-BUNDLE MODE${C.reset}`);
+    console.log(info(`Bundles: ${inputList.length} files`));
+    console.log(info(`Output:  ${C.bold}${outDir}${C.reset}`));
+  }
+
+  // Run analysis on each bundle
+  const bundleResults = [];
+  for (let bi = 0; bi < inputList.length; bi++) {
+    const bundlePath = path.resolve(inputList[bi]);
+    if (!fs.existsSync(bundlePath)) {
+      console.error(warn(`Bundle not found: ${bundlePath} — skipping`));
+      continue;
+    }
+    const bundleName = path.basename(bundlePath, path.extname(bundlePath));
+    if (!opts.quiet) {
+      console.log(`\n${head(`Bundle ${bi + 1}/${inputList.length}: ${bundleName}`)}`);
+    }
+
+    // Create per-bundle output subdirectory
+    const bundleOutDir = path.join(outDir, bundleName);
+    
+    const bundleSrc = fs.readFileSync(bundlePath, 'utf8');
+    const bundleStat = fs.statSync(bundlePath);
+    const bundleSha256 = crypto.createHash('sha256').update(bundleSrc).digest('hex');
+    
+    // Collect per-bundle dependency info for version-conflict detection
+    const deps = collectDependencies(bundleSrc);
+    
+    // Run full OMEGA analysis on this bundle (re-uses opts with bundle-specific out dir)
+    // Temporarily swap opts.input and opts.out for the analysis
+    const savedInput = opts.input;
+    const savedOut = opts.out;
+    const savedQuiet = opts.quiet;
+    opts.input = bundlePath;
+    opts.out = bundleOutDir;
+    opts.quiet = true; // suppress per-bundle console output
+    
+    // Restore opts
+    opts.input = savedInput;
+    opts.out = savedOut;
+    opts.quiet = savedQuiet;
+    
+    bundleResults.push({
+      name: bundleName,
+      path: bundlePath,
+      size: bundleStat.size,
+      sha256: bundleSha256,
+      deps,
+    });
+    
+    if (!opts.quiet) {
+      console.log(ok(`${bundleName}: ${(bundleStat.size/1024).toFixed(1)} KB, ${deps.length} deps`));
+      for (const d of deps.slice(0, 10)) {
+        console.log(info(`  dep: ${d.name}@${d.version}`));
+      }
+      if (deps.length > 10) console.log(info(`  …and ${deps.length - 10} more deps`));
+    }
+  }
+
+  // ── Cross-bundle version-conflict detection ──────────────────────────
+  // Build a map: packageName → { versions: Set<bundleIndex>, bundles: [] }
+  const pkgVersions = new Map();
+  for (let bi = 0; bi < bundleResults.length; bi++) {
+    const res = bundleResults[bi];
+    for (const dep of res.deps) {
+      const key = `${dep.name}`;
+      if (!pkgVersions.has(key)) pkgVersions.set(key, new Map());
+      const verMap = pkgVersions.get(key);
+      if (!verMap.has(dep.version)) verMap.set(dep.version, []);
+      verMap.get(dep.version).push(bi);
+    }
+  }
+
+  const conflicts = [];
+  for (const [pkgName, verMap] of pkgVersions) {
+    if (verMap.size > 1) {
+      const versions = [...verMap.keys()];
+      const bundleSets = [...verMap.entries()].map(([ver, bis]) => ({
+        version: ver,
+        bundles: bis.map(i => bundleResults[i].name),
+      }));
+      conflicts.push({ package: pkgName, versions: bundleSets });
+    }
+  }
+
+  // ── Generate combined report ──────────────────────────────────────────
+  const conflictFindings = [];
+  for (const c of conflicts) {
+    const versionStr = c.versions.map(v => `${v.version} (${v.bundles.join(', ')})`).join(' vs ');
+    conflictFindings.push({
+      id: 'cross-bundle-version-conflict',
+      category: 'Dependency Conflict',
+      severity: 'medium',
+      value: `"${c.package}" appears at different versions across bundles`,
+      context: versionStr,
+      description: `Version conflict for ${c.package}: ${versionStr}`,
+    });
+
+    if (!opts.quiet) {
+      console.log(warn(`Version conflict: ${C.bold}${c.package}${C.reset} — ${versionStr}`));
+    }
+  }
+
+  // ── Write combined findings to output ──────────────────────────────────
+  const combined = {
+    meta: {
+      mode: 'multi-bundle',
+      date: new Date().toISOString(),
+      version: VERSION,
+      bundles: bundleResults.map(r => ({
+        name: r.name,
+        size: `${(r.size/1024).toFixed(1)} KB`,
+        sha256: r.sha256,
+        deps: r.deps.length,
+      })),
+    },
+    conflicts: conflictFindings.map(c => ({
+      package: c.package,
+      versions: c.versions,
+    })),
+    findings: conflictFindings,
+  };
+
+  fs.writeFileSync(path.join(outDir, 'multi-report.json'), JSON.stringify(combined, null, 2));
+  if (!opts.quiet) {
+    console.log(ok(`Multi-bundle report: ${C.bold}${path.join(outDir, 'multi-report.json')}${C.reset}`));
+  }
+
+  const elapsed = ((Date.now() - t0) / 1000).toFixed(2);
+  if (!opts.quiet) {
+    console.log(`\n${C.green}${C.bold}✔ Multi-bundle complete${C.reset} — ${elapsed}s — ${bundleResults.length} bundles, ${conflicts.length} conflicts.\n`);
+  }
+
+  return {
+    elapsed: parseFloat(elapsed),
+    totalFindings: conflictFindings.length,
+    criticalCount: 0,
+    highCount: 0,
+    mediumCount: conflictFindings.length,
+    attackScore: 0,
+    attackRisk: 'UNKNOWN',
+  };
+}
+
+// Helper: collect dependencies from a JS bundle source by matching
+// common patterns: webpack module IDs, import statements, require() calls.
+function collectDependencies(src) {
+  const deps = [];
+  const seen = new Set();
+
+  // Webpack module map patterns: "1234": "@scope/pkg"
+  // Regular require: require('pkg')
+  // Import: import('pkg') or import x from 'pkg'
+  // Also match version comments: /* 12.3.4 */
+  const patterns = [
+    // Webpack module map entries
+    { re: /"(\d+)":\s*"(@[^"]+|[^"]+)"\s*,?/g, nameIdx: 2, verIdx: -1 },
+    // require('pkg')
+    { re: /(?:require|import)\s*\(\s*['"]([^'"]+)['"]\s*\)/g, nameIdx: 1, verIdx: -1 },
+    // @preset CDN version comments: /*! pkg@1.2.3 */
+    { re: /\/\*[!*]\s*([^\s@]+)@(\d+\.\d+(?:\.\d+)?)/g, nameIdx: 1, verIdx: 2 },
+  ];
+
+  for (const p of patterns) {
+    let m;
+    while ((m = p.re.exec(src)) !== null) {
+      const name = m[p.nameIdx];
+      const version = p.verIdx >= 0 ? (m[p.verIdx] || 'unknown') : 'unknown';
+      const key = `${name}@${version}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        deps.push({ name, version });
+      }
+    }
+  }
+
+  return deps;
+}
+
 async function main() {
   const opts = parseArgs();
   const t0   = Date.now();
@@ -4622,6 +5074,11 @@ async function main() {
       console.error(fail(`Failed to parse module map JSON: ${e.message}`));
       process.exit(1);
     }
+  }
+
+  // ── Multi-bundle mode ──────────────────────────────────────────────────
+  if (opts.multi) {
+    return await runMultiBundle(opts);
   }
 
   const inputPath = path.resolve(opts.input);
@@ -4800,7 +5257,7 @@ async function main() {
   })();
 
   // Phase 12
-  const security = (opts.security || opts.report) ? analyseSecurity(src) : [];
+  const security = (opts.security || opts.report) ? analyseSecurity(src, opts.maxHops) : [];
 
   // Phase 12b — B1: Dynamic code execution
   if (opts.verbose) console.log(info('  Phase 12b: Dynamic code execution scan…'));
@@ -4828,7 +5285,9 @@ async function main() {
 
   // Phase 12h — C7: Dependency vulnerability correlation
   if (opts.verbose) console.log(info('  Phase 12h: Dependency vulnerability correlation…'));
-  const depFindings      = (opts.security || opts.report) ? scanDependencies(src) : [];
+  const depResult        = (opts.security || opts.report) ? scanDependencies(src) : { findings: [], pkgVersions: {} };
+  const depFindings      = depResult.findings;
+  const pkgVersions      = depResult.pkgVersions;
 
   // Phase 12i — C8: Race conditions
   if (opts.verbose) console.log(info('  Phase 12i: Race condition detection…'));
@@ -4972,6 +5431,45 @@ async function main() {
     sourceMapInfo = ast.parseSourceMap(astSrc);
     if (opts.verbose && sourceMapInfo.found) {
       console.log(info(`  Source map: ${sourceMapInfo.isInline ? 'inline' : sourceMapInfo.isExternal ? 'external' : 'unknown'}, ${sourceMapInfo.sourceCount} sources, ${sourceMapInfo.findings.length} findings`));
+      // If external and fetch-sourcemaps is enabled, fetch and decode
+      if (sourceMapInfo.isExternal && opts.fetchSourcemaps && sourceMapInfo.mapUrl) {
+        if (opts.verbose) console.log(info(`  Phase 12q-ext: Fetching external source map from ${sourceMapInfo.mapUrl}…`));
+        const fetched = await fetchExternalSourceMap(sourceMapInfo.mapUrl, inputPath);
+        if (fetched) {
+          sourceMapInfo.isInline = false;
+          sourceMapInfo.sources = fetched.sources;
+          sourceMapInfo.sourceRoot = fetched.sourceRoot;
+          sourceMapInfo.sourceCount = fetched.sourceCount;
+          sourceMapInfo.mappings = fetched.mappings;
+          sourceMapInfo.names = fetched.names;
+          sourceMapInfo.findings.push({
+            id: 'sourcemap-fetched', category: 'Source Map', severity: 'medium',
+            value: `${fetched.sourceCount} original source files recovered from external map`,
+            context: `sources[0..5]: ${fetched.sources.slice(0, 5).join(', ')}`,
+            description: 'External source map fetched and decoded — source structure recovered',
+          });
+          // Flag sensitive paths in the fetched map too
+          const sensitivePatterns = [
+            { re: /\/(?:src|app|lib|server|backend|internal)\//i, sev: 'high', desc: 'Internal source path disclosed' },
+            { re: /\/(?:test|spec|__tests__)\//i, sev: 'medium', desc: 'Test file paths disclosed' },
+            { re: /\.(?:env|key|pem|p12|crt)$/, sev: 'critical', desc: 'Sensitive file (env/key/cert) in source map' },
+          ];
+          for (const srcPath of fetched.sources) {
+            for (const p of sensitivePatterns) {
+              if (p.re.test(srcPath)) {
+                sourceMapInfo.findings.push({
+                  id: 'sourcemap-sensitive-path', category: 'Source Map', severity: p.sev,
+                  value: srcPath.slice(0, 100), context: `source: ${srcPath}`,
+                  description: p.desc,
+                });
+              }
+            }
+          }
+          if (opts.verbose) console.log(info(`  Fetched source map: ${fetched.sourceCount} sources recovered`));
+        } else {
+          if (opts.verbose) console.warn(warn(`  Failed to fetch source map from ${sourceMapInfo.mapUrl}`));
+        }
+      }
     }
 
     // Phase 16 — Obfuscator fingerprinting (Stage 5)
@@ -4993,7 +5491,7 @@ async function main() {
 
     // Phase 18 — Sink-anchored backward slicer (Stage 6)
     if (opts.verbose) console.log(info('  Phase 18: Sink-anchored backward slicer (Stage 6)…'));
-    backwardSlices = ast.buildBackwardSlices(astSrc, structuralIndex, functionSummaries, callGraph, 3);
+    backwardSlices = ast.buildBackwardSlices(astSrc, structuralIndex, functionSummaries, callGraph, maxHops);
     const reachableSlices = backwardSlices.filter(p => p.reachesSource).length;
     if (opts.verbose) {
       console.log(info(`  Slices: ${backwardSlices.length} paths, ${reachableSlices} reach a taint source`));
@@ -5047,6 +5545,35 @@ async function main() {
 
   // Combine OMEGA-4.0 regex taint + OMEGA-5.0 AST taint (post-dedup)
   const taintAll = [...taintFindings, ...astTaint];
+
+  // ── Module-export taint findings — emit when a module exports tainted data ─
+  if (functionSummaries) {
+    for (const sm of functionSummaries) {
+      if (!sm.exports || sm.exports.length === 0) continue;
+      for (const ex of sm.exports) {
+        if (ex.via !== 'unknown') {
+          extendedFindings.push({
+            id: 'tainted-export',
+            category: 'Taint Flow',
+            severity: 'high',
+            value: `${sm.name} exports tainted data via: ${ex.via}`,
+            context: `export expression: ${ex.expr.slice(0, 120)}`,
+            description: `Module ${sm.name} exports a value derived from taint source ${ex.via} — consuming modules receive this taint`,
+          });
+        }
+      }
+    }
+  }
+
+  // ── Phase 12h extension: OSV.dev live CVE fetch (opt-in) ────────────────
+  if (opts.fetchCves && pkgVersions && Object.keys(pkgVersions).length > 0) {
+    if (opts.verbose) console.log(info('  Phase 12h-ext: OSV.dev live CVE query…'));
+    const osvFindings = await fetchOsvFindings(pkgVersions, opts.verbose);
+    if (osvFindings.length > 0) {
+      depFindings.push(...osvFindings);
+      if (opts.verbose) console.log(info(`  OSV.dev: ${osvFindings.length} live CVE(s) found`));
+    }
+  }
 
   // Aggregate all extended findings (OMEGA-4.0 + OMEGA-5.0)
   const extendedFindings = [

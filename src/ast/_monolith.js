@@ -2004,6 +2004,103 @@ function extractNetworkSurface(src) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  Source Map V3 VLQ decoder — decodes the base64-VLQ `mappings` field
+//  into an array of segment arrays per generated line.
+//
+//  Each line's segments encode:
+//    [generatedColumn, sourceIndex, originalLine, originalColumn, nameIndex?]
+//  Values are relative to the previous segment in the same line.
+// ═══════════════════════════════════════════════════════════════════════════
+const VLQ_BASE64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+const VLQ_BASE64_DECODE = {};
+for (let i = 0; i < VLQ_BASE64.length; i++) VLQ_BASE64_DECODE[VLQ_BASE64[i]] = i;
+
+function decodeVLQMappings(mappingsStr) {
+  if (!mappingsStr) return [];
+  const lines = [];
+  let line = [];
+  let i = 0;
+  // Running positional state
+  let genCol = 0, srcIdx = 0, origLine = 0, origCol = 0, nameIdx = 0;
+
+  while (i < mappingsStr.length) {
+    const c = mappingsStr[i];
+    if (c === ';') {
+      lines.push(line);
+      line = [];
+      genCol = 0; srcIdx = 0; origLine = 0; origCol = 0; nameIdx = 0;
+      i++;
+      continue;
+    }
+    if (c === ',') { i++; continue; }
+
+    // Decode one VLQ segment (up to 5 values: genCol, srcIdx, origLine, origCol, nameIdx)
+    const values = [];
+    for (let v = 0; v < 5; v++) {
+      if (i >= mappingsStr.length || mappingsStr[i] === ',' || mappingsStr[i] === ';') break;
+      let val = 0, shift = 0, cont;
+      do {
+        const b64 = VLQ_BASE64_DECODE[mappingsStr[i]];
+        if (b64 === undefined) return lines; // malformed — return what we have
+        cont = b64 & 32; // continuation bit
+        val += (b64 & 31) << shift;
+        shift += 5;
+        i++;
+      } while (cont);
+      // Sign handling: LSB is sign bit (1 = negative)
+      if (val & 1) val = -(val >> 1);
+      else val = val >> 1;
+      values.push(val);
+    }
+
+    // Apply relative values to running state
+    if (values.length >= 1) genCol += values[0];
+    if (values.length >= 2) srcIdx += values[1];
+    if (values.length >= 3) origLine += values[2];
+    if (values.length >= 4) origCol += values[3];
+    if (values.length >= 5) nameIdx += values[4];
+
+    if (values.length > 0) {
+      line.push({ genCol, srcIdx, origLine, origCol, nameIdx: values.length >= 5 ? nameIdx : -1 });
+    }
+  }
+  if (line.length > 0) lines.push(line);
+  return lines;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Source map position mapper — given a generated (line, column) and decoded
+//  source map data, returns the closest original position.
+// ═══════════════════════════════════════════════════════════════════════════
+function mapSourcePosition(genLine, genCol, decodedLines, sources, sourceRoot) {
+  // decodedLines is an array of arrays, one per generated line
+  if (genLine < 0 || genLine >= decodedLines.length) return null;
+  const segments = decodedLines[genLine];
+  if (!segments || segments.length === 0) return null;
+
+  // Binary search for the last segment with genCol <= target col
+  let lo = 0, hi = segments.length - 1, best = null;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (segments[mid].genCol <= genCol) {
+      best = segments[mid];
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  if (!best) return { source: null, line: genLine, column: genCol };
+
+  const sourceFile = best.srcIdx >= 0 && best.srcIdx < sources.length ? sources[best.srcIdx] : null;
+  return {
+    source: sourceFile,
+    line: best.origLine,
+    column: best.origCol,
+    sourceRoot,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  PHASE 12q — SOURCE MAP AWARENESS (Stage 3E)
 //
 //  Parses `//# sourceMappingURL=...` references at the end of bundles and,
@@ -2082,6 +2179,9 @@ function parseSourceMap(src) {
           }
         }
 
+        // Decode VLQ mappings for position remapping
+        const decodedLines = map.mappings ? decodeVLQMappings(map.mappings) : [];
+
         return {
           found: true,
           isInline: true,
@@ -2090,6 +2190,8 @@ function parseSourceMap(src) {
           sources,
           sourceRoot,
           sourceCount: sources.length,
+          mappings: map.mappings || '',
+          decodedLines,
           findings,
         };
       } catch (e) {
@@ -2118,6 +2220,8 @@ function parseSourceMap(src) {
     sources: [],
     sourceRoot: null,
     sourceCount: 0,
+    mappings: '',
+    decodedLines: [],
     findings,
   };
 }
@@ -2946,6 +3050,54 @@ function computeFunctionSummaries(src, structuralIndex) {
       }
     }
 
+    // Scan for module exports that may expose tainted data cross-module
+    // Patterns: module.exports = X, exports.X = Y, export default Z
+    const exportsFound = [];
+    const moduleExportRe = /(?:module\s*\.\s*exports|exports)\s*=\s*([^;]{1,200});/g;
+    let em;
+    while ((em = moduleExportRe.exec(bodyText)) !== null) {
+      const rhs = em[1].trim();
+      // Check if the assigned value is a tainted source
+      let via = 'unknown';
+      for (const s of sources) {
+        if (rhs.includes(s.expr)) { via = s.name; break; }
+      }
+      // Check if it's a tainted local variable
+      if (via === 'unknown') {
+        for (const [varName, sourceName] of taintedLocals) {
+          if (rhs === varName) { via = sourceName; break; }
+        }
+      }
+      exportsFound.push({
+        expr: em[0],
+        pos: bodyStartPos + em.index,
+        rhs,
+        via,
+      });
+    }
+    // Also detect individual property exports: exports.foo = X
+    const propExportRe = /exports\s*\.\s*([A-Za-z_$][\w$]*)\s*=\s*([^;]{1,200});/g;
+    while ((em = propExportRe.exec(bodyText)) !== null) {
+      const propName = em[1];
+      const rhs = em[2].trim();
+      let via = 'unknown';
+      for (const s of sources) {
+        if (rhs.includes(s.expr)) { via = s.name; break; }
+      }
+      if (via === 'unknown') {
+        for (const [varName, sourceName] of taintedLocals) {
+          if (rhs === varName) { via = sourceName; break; }
+        }
+      }
+      exportsFound.push({
+        expr: em[0],
+        pos: bodyStartPos + em.index,
+        rhs,
+        via,
+        exportKey: propName,
+      });
+    }
+
     // Find and classify return statements
     const returnStmts = findReturns(bodyStart, bodyEnd);
     const returns = returnStmts.map(r => classifyReturn(r.exprStart, r.exprEnd, params, sources));
@@ -2978,7 +3130,201 @@ function computeFunctionSummaries(src, structuralIndex) {
       sanitizers,
       returns,
       calls,
+      exports: exportsFound,
     });
+  }
+
+  // ── Pass 3: inter-procedural return-value propagation ────────────────
+  // If function A calls function B, and B's summary says "return value =
+  // args[0]" (or is tainted), then A's variable that receives B's return
+  // is tainted when the argument passed is itself tainted.
+  const MAX_RV_PASSES = 3;
+  for (let rvPass = 0; rvPass < MAX_RV_PASSES; rvPass++) {
+    let changed = false;
+
+    for (let fnIdx = 0; fnIdx < structuralIndex.functions.length; fnIdx++) {
+      const fn = structuralIndex.functions[fnIdx];
+      const sm = summaries[fnIdx];
+      if (!sm) continue;
+      const bodyStart = fn.bodyTokStart;
+      const bodyEnd = fn.bodyTokEnd;
+      if (bodyStart < 0 || bodyEnd < 0) continue;
+
+      const bodyStartPos = T[bodyStart] ? T[bodyStart].start : fn.start;
+      const bodyEndPos = T[bodyEnd] ? T[bodyEnd].end : fn.end;
+      const bodyText = src.slice(bodyStartPos, bodyEndPos);
+
+      // Build a local taint map for this function (start fresh each pass)
+      const taintMap = new Map(); // varName -> sourceName
+      // Seed with existing taintedLocals from sources
+      for (const s of sm.sources) {
+        taintMap.set(s.expr, s.name);
+      }
+      // Also add any previously propagated taint (from prior RV passes)
+      for (const s of sm.sinks) {
+        if (s.via && s.via !== 'unknown' && !s.via.startsWith('args[')) {
+          // This sink already has a source — good
+        }
+      }
+
+      // Scan for: const|let|var x = funcName(expr)
+      const callAssignRe = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([A-Za-z_$][\w$]*)\s*\(/g;
+      let cm;
+      while ((cm = callAssignRe.exec(bodyText)) !== null) {
+        const targetVar = cm[1];
+        const calleeName = cm[2];
+
+        // Skip known non-taintable callees
+        if (['String','Number','Boolean','parseInt','parseFloat','Array','Object','JSON','Math','Date','console','document','window','Symbol','BigInt','encodeURI','encodeURIComponent','decodeURI','decodeURIComponent','isNaN','isFinite','RegExp','Error','TypeError'].includes(calleeName)) continue;
+
+        // Extract the argument passed
+        const argStart = cm.index + cm[0].length - 1; // after '('
+        let depth = 1, k = argStart;
+        while (k < bodyText.length && depth > 0) {
+          if (bodyText[k] === '(' || bodyText[k] === '[' || bodyText[k] === '{') depth++;
+          else if (bodyText[k] === ')' || bodyText[k] === ']' || bodyText[k] === '}') depth--;
+          if (depth === 0) break;
+          k++;
+        }
+        const argText = bodyText.slice(argStart, k).trim();
+
+        // Look up callee summary
+        const calleeSummaries = summaries.filter(s => s.name === calleeName);
+        if (calleeSummaries.length === 0) continue;
+
+        for (const calleeSm of calleeSummaries) {
+          for (const ret of calleeSm.returns) {
+            if (ret.kind === 'param') {
+              // Callee returns its param — e.g. returns args[0]
+              const paramMatch = ret.value.match(/args\[(\d+)\]/);
+              if (!paramMatch) continue;
+              const paramIdx = parseInt(paramMatch[1], 10);
+              // Get the Nth argument passed in this call (space-separated for simple cases)
+              const args = argText.split(',').map(a => a.trim());
+              const passedArg = args[paramIdx];
+              if (!passedArg) continue;
+
+              // Check if the passed argument is a tainted local or a direct source
+              let isTainted = false;
+              let sourceName = null;
+              // Check body source patterns
+              for (const s of sm.sources) {
+                if (passedArg.includes(s.expr)) { isTainted = true; sourceName = s.name; break; }
+              }
+              // Check if it's a known tainted var from previous passes
+              if (!isTainted && taintMap.has(passedArg)) {
+                isTainted = true;
+                sourceName = taintMap.get(passedArg);
+              }
+              if (isTainted && sourceName && !taintMap.has(targetVar)) {
+                taintMap.set(targetVar, sourceName);
+                changed = true;
+              }
+            } else if (ret.kind === 'tainted' || ret.kind === 'call') {
+              // Callee returns a value that depends on internal taint or another call
+              // Mark the receiving variable as tainted (conservative)
+              let sourceName = ret.value;
+              if (sourceName.startsWith('tainted:')) sourceName = sourceName.slice(8);
+              if (sourceName.startsWith('call:')) sourceName = sourceName.slice(5);
+              if (!taintMap.has(targetVar)) {
+                taintMap.set(targetVar, sourceName || calleeName);
+                changed = true;
+              }
+            }
+          }
+        }
+      }
+
+      if (!changed) continue;
+
+      // Re-evaluate sinks with the expanded taint map
+      const newSinks = [];
+      for (const pat of SINK_PATTERNS_FN) {
+        const re = new RegExp(pat.re.source, pat.re.flags.includes('g') ? pat.re.flags : pat.re.flags + 'g');
+        let m;
+        while ((m = re.exec(bodyText)) !== null) {
+          const sinkPos = bodyStartPos + m.index;
+          // Check if the sink's argument contains any taint-mapped variable
+          let via = 'unknown';
+          // Extract arg window (same logic as classifySinkFlow but using taintMap)
+          let p = m.index + m[0].length;
+          // Walk forward to find ( or =
+          let depth2 = 0;
+          const MAX_WALK = 300;
+          let walkEnd = -1;
+          for (let w = p; w < Math.min(p + MAX_WALK, bodyText.length); w++) {
+            const cc = bodyText[w];
+            if (cc === '(' && depth2 === 0) {
+              // Extract args to matching )
+              const argS = w + 1;
+              let d2 = 1, q = argS;
+              while (q < bodyText.length && d2 > 0) {
+                if (bodyText[q] === '(' || bodyText[q] === '[' || bodyText[q] === '{') d2++;
+                else if (bodyText[q] === ')' || bodyText[q] === ']' || bodyText[q] === '}') d2--;
+                if (d2 === 0) break;
+                q++;
+              }
+              const argText2 = bodyText.slice(argS, q);
+              // Check taint map
+              for (const [varName, srcName] of taintMap) {
+                if (new RegExp(`(?<![\\w$])${varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w$])`).test(argText2)) {
+                  via = srcName;
+                  break;
+                }
+              }
+              // Also check direct sources
+              if (via === 'unknown') {
+                for (const s of sm.sources) {
+                  if (argText2.includes(s.expr)) { via = s.name; break; }
+                }
+              }
+              break;
+            }
+            if (cc === '=' && depth2 === 0 && bodyText[w + 1] !== '=') {
+              // Assignment sink — extract RHS
+              const rhsS = w + 1;
+              let d2 = 0, q = rhsS;
+              while (q < bodyText.length) {
+                const c2 = bodyText[q];
+                if (c2 === '(' || c2 === '[' || c2 === '{') d2++;
+                else if (c2 === ')' || c2 === ']' || c2 === '}') { if (d2 === 0) break; d2--; }
+                else if (c2 === ';' && d2 === 0) break;
+                q++;
+              }
+              const rhsText2 = bodyText.slice(rhsS, q);
+              for (const [varName, srcName] of taintMap) {
+                if (new RegExp(`(?<![\\w$])${varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w$])`).test(rhsText2)) {
+                  via = srcName;
+                  break;
+                }
+              }
+              if (via === 'unknown') {
+                for (const s of sm.sources) {
+                  if (rhsText2.includes(s.expr)) { via = s.name; break; }
+                }
+              }
+              break;
+            }
+            if (cc === '(' || cc === '[' || cc === '{') depth2++;
+            else if (cc === ')' || cc === ']' || cc === '}') { if (depth2 === 0) break; depth2--; }
+            else if (cc === ';' && depth2 === 0) break;
+          }
+
+          newSinks.push({
+            name: pat.name,
+            pos: sinkPos,
+            cwe: pat.cwe,
+            severity: pat.sev,
+            via,
+          });
+        }
+      }
+
+      // Update sinks in the summary
+      sm.sinks = newSinks;
+    }
+
+    if (!changed) break;
   }
 
   return summaries;
@@ -3010,7 +3356,6 @@ function computeFunctionSummaries(src, structuralIndex) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 function buildBackwardSlices(src, structuralIndex, functionSummaries, callGraph, maxHops) {
-  if (!maxHops) maxHops = 3;
   const paths = [];
 
   // Build a reverse call graph: for each function, who calls it?
@@ -3074,7 +3419,8 @@ function buildBackwardSlices(src, structuralIndex, functionSummaries, callGraph,
         let currentArgIdx = argIdx;
         const visited = new Set([currentFn.id]);
 
-        for (let hop = 0; hop < maxHops; hop++) {
+        let hop = 0;
+        while (hop < maxHops) {
           // Find callers of currentFn
           const callers = reverseCalls.get(currentFn.name) || [];
           if (callers.length === 0) break;
@@ -3092,17 +3438,109 @@ function buildBackwardSlices(src, structuralIndex, functionSummaries, callGraph,
           }
           if (!callerSummary) break;
 
-          // Check if the caller's return value flows from a source or arg
-          const callerReturn = callerSummary.returns[0];
-          if (callerReturn) {
-            if (callerReturn.kind === 'tainted') {
-              path.reachesSource = true;
-              path.sourceChain.push(callerReturn.value);
-            } else if (callerReturn.kind === 'param') {
-              // The caller returns its own param — continue backward
-              const paramMatch = callerReturn.value.match(/args\[(\d+)\]/);
-              if (paramMatch) {
-                currentArgIdx = parseInt(paramMatch[1], 10);
+          // Find the specific call in the caller's body to extract the argument
+          // that flows to `currentArgIdx`. This handles:
+          //   function main() { const x = intermediate(input); processData(x); }
+          //   → backward walk: processData → main (arg 0 = 'x') → intermediate
+          const callerBodyText = src.slice(callerSummary.start, callerSummary.end);
+          const callPattern = new RegExp(
+            `(?<![\\w$.])(?:${currentFn.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})\\s*\\(`,
+            'g'
+          );
+          let callMatch;
+          let resolvedArg = null;
+          let foundCall = false;
+          while ((callMatch = callPattern.exec(callerBodyText)) !== null) {
+            // Extract arguments of this call
+            let depth = 1, argEnd = callMatch.index + callMatch[0].length;
+            while (argEnd < callerBodyText.length && depth > 0) {
+              const cc = callerBodyText[argEnd];
+              if (cc === '(' || cc === '[' || cc === '{') depth++;
+              else if (cc === ')' || cc === ']' || cc === '}') depth--;
+              if (depth === 0) break;
+              argEnd++;
+            }
+            const allArgs = callerBodyText.slice(
+              callMatch.index + callMatch[0].length,
+              argEnd
+            ).split(',').map(a => a.trim());
+            resolvedArg = allArgs[currentArgIdx];
+            foundCall = true;
+            break;
+          }
+
+          // Track whether we followed an intermediate chain (don't consume hop)
+          let followedIntermediate = false;
+
+          if (foundCall && resolvedArg && /^[A-Za-z_$][\w$]*$/.test(resolvedArg)) {
+            // The argument is a simple variable — check if it's assigned from
+            // another function call (return-value chain)
+            const assignCallRe = new RegExp(
+              `(?:const|let|var)\\s+${resolvedArg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*=\\s*([A-Za-z_$][\\w$]*)\\s*\\(`,
+              'g'
+            );
+            let assignMatch;
+            while ((assignMatch = assignCallRe.exec(callerBodyText)) !== null) {
+              const intermediaryName = assignMatch[1];
+              const intermediarySm = functionSummaries.find(s => s.name === intermediaryName);
+              if (!intermediarySm) break;
+
+              // Check intermediary's return classification
+              const intermReturn = intermediarySm.returns[0];
+              let shouldFollow = false;
+              if (intermReturn) {
+                if (intermReturn.kind === 'param') {
+                  const pm = intermReturn.value.match(/args\[(\d+)\]/);
+                  if (pm) {
+                    currentArgIdx = parseInt(pm[1], 10);
+                    currentFn = intermediarySm;
+                    shouldFollow = true;
+                    followedIntermediate = true;
+                  }
+                } else if (intermReturn.kind === 'tainted' || intermReturn.kind === 'call') {
+                  // Intermediary returns tainted — mark source and continue
+                  shouldFollow = true;
+                }
+              }
+
+              // If intermediary reads sources directly, record them
+              if (intermediarySm.sources.length > 0) {
+                path.reachesSource = true;
+                for (const s of intermediarySm.sources) {
+                  if (!path.sourceChain.includes(s.name)) path.sourceChain.push(s.name);
+                }
+              }
+
+              if (shouldFollow && !followedIntermediate) {
+                path.hops.push({
+                  fnName: intermediarySm.name,
+                  fnId: intermediarySm.id,
+                  via: `return→${resolvedArg}`,
+                  sources: intermediarySm.sources.map(s => s.name),
+                  sanitizers: intermediarySm.sanitizers.map(s => s.name),
+                  returns: intermediarySm.returns.map(r => r.value),
+                });
+                path.totalHops++;
+              }
+              break;
+            }
+          }
+
+          // If we followed an intermediate return-value chain, don't consume
+          // the outer hop counter — loop again without moving hop.
+          if (followedIntermediate) {
+            continue;
+          }
+
+          // Also check if the argument variable is directly assigned from a source
+          if (foundCall && resolvedArg) {
+            const directSrcRe = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(location\.[a-zA-Z.]+|document\.[a-zA-Z.]+|window\.[a-zA-Z.]+|localStorage\.[a-zA-Z.]+|sessionStorage\.[a-zA-Z.]+|navigator\.[a-zA-Z.]+)/g;
+            let dsMatch;
+            while ((dsMatch = directSrcRe.exec(callerBodyText)) !== null) {
+              if (dsMatch[1] === resolvedArg) {
+                path.reachesSource = true;
+                if (!path.sourceChain.includes(dsMatch[2])) path.sourceChain.push(dsMatch[2]);
+                break;
               }
             }
           }
@@ -3131,6 +3569,7 @@ function buildBackwardSlices(src, structuralIndex, functionSummaries, callGraph,
           path.totalHops = hop + 1;
 
           currentFn = callerSummary;
+          hop++;
         }
       }
 
@@ -3139,6 +3578,39 @@ function buildBackwardSlices(src, structuralIndex, functionSummaries, callGraph,
         const demote = { critical: 'medium', high: 'low', medium: 'info' };
         path.sink.severity = demote[path.sink.severity] || path.sink.severity;
       }
+
+      // Sanitizer effectiveness check — if the path passes through a known
+      // sanitizer that is effective for this sink, mark it as sanitized so the
+      // caller can choose to suppress or downrate the finding.
+      path.sanitized = false;
+      path.sanitizedBy = [];
+      const sinkName = sink.name;
+      for (const san of path.sanitizersOnPath) {
+        // Look up the sanitizer pattern definition
+        const sanDef = SANITIZER_PATTERNS.find(p => p.name === san.name);
+        if (!sanDef) continue;
+        // Angular's bypassSecurityTrust* is NOT a sanitizer — it's the opposite
+        if (sanDef.note && sanDef.note.includes('NOT a sanitizer')) continue;
+        if (sanDef.effectiveFor.includes(sinkName)) {
+          path.sanitized = true;
+          path.sanitizedBy.push(san.name);
+        }
+      }
+      // If a trusted sanitizer like DOMPurify fully sanitizes the path, mark
+      // reachesSource as false so the finding won't be reported as critical.
+      if (path.sanitized) {
+        path.reachesSource = false;
+        // Also further demote if the only effective sanitizer is present
+        const hasStrongSanitizer = path.sanitizedBy.some(n =>
+          n === 'DOMPurify.sanitize' || n === 'sanitize'
+        );
+        if (hasStrongSanitizer) {
+          // Strong sanitizer: drop severity further
+          const strongDemote = { critical: 'low', high: 'info', medium: 'info' };
+          path.sink.severity = strongDemote[path.sink.severity] || path.sink.severity;
+        }
+      }
+
       paths.push(path);
     }
   }
@@ -3407,6 +3879,8 @@ module.exports = {
   scanModernCrypto,
   extractNetworkSurface,
   parseSourceMap,
+  decodeVLQMappings,
+  mapSourcePosition,
   fingerprintObfuscator,
   computeFunctionSummaries,
   buildBackwardSlices,
