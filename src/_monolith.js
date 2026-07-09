@@ -708,6 +708,9 @@ const CREDENTIAL_PATTERNS = [
   { name:'JWT Secret',           severity:'critical',
     re:/(?:jwt[_-]?secret|jwtSecret)\s*[:=]\s*["']([^"']{8,})["']/gi,
     fpGuard: null },
+  { name:'JWT Token Literal',    severity:'critical',
+    re:/["'](ey[Jt][A-Za-z0-9_-]+\.ey[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)["']/g,
+    fpGuard: v => v.length < 40 || /^(?:eyJ|eyJ0|example|test|placeholder)/i.test(v) },
   { name:'Google OAuth Client ID', severity:'high',
     re:/\d{12,}-[a-z0-9]{32}\.apps\.googleusercontent\.com/g,
     fpGuard: null },
@@ -823,7 +826,16 @@ const SECURITY_PATTERNS = [
     ctx: m => /\.(?:emit|send|post)\s*\(\s*["'](?:message|data|event|request|response|ping|pong|auth|frame|payload)["']/i.test(m) },
   { id:'network-http-open', cat:'Network', sev:'info',
     re:/https?:\/\/[^\s"']+/g,
-    ctx: m => !/(?:accounts\.google|cdnjs\.cloudflare|openstreetmap|github\.com|developer\.mozilla\.org|w3\.org|npmjs\.com|angular\.io|vuejs\.org|reactjs\.org|typescriptlang\.org|babeljs\.io|webpack\.js|nodejs\.org|mit\.edu|apache\.org|opensource\.org|creativecommons\.org|unlicense\.org)/.test(m) },
+    ctx: m => {
+      // Skip known documentation / CDN / package-homepage / citation URLs
+      const skipDomains = /(?:accounts\.google|cdnjs\.cloudflare|openstreetmap|github\.com|developer\.mozilla\.org|w3\.org|npmjs\.com|angular\.io|vuejs\.org|reactjs\.org|typescriptlang\.org|babeljs\.io|webpack\.js|nodejs\.org|mit\.edu|apache\.org|opensource\.org|creativecommons\.org|unlicense\.org|jquery\.com|lodash\.com|d3js\.org|chartjs\.org|threejs\.org|greensock\.com|gsap\.com|preactjs\.com|axios\.http|cryptojs\.git|momentjs\.com|day\.js|eastus\.data\.tables\.net|paas[0-9]+\.southeastasia\.project|yarnpkg\.com|jsdelivr\.net|unpkg\.com|bundlephobia\.com|stackoverflow\.com|stackexchange\.com|wikipedia\.org|arxiv\.org|ieee\.org|acm\.org|springer\.com|linkedin\.com|twitter\.com|facebook\.com|youtube\.com|medium\.com|sitepoint\.com|smashingmagazine\.com|css-tricks\.com|hackernews\.com|reddit\.com|stackblitz\.com|codesandbox\.io|replit\.com)/;
+      if (skipDomains.test(m)) return false;
+      // Skip URLs that look like license/copyright headers in comments
+      if (/license|licence|copyright|\(c\)|released under|MIT|Apache|BSD|CC BY|CC0/i.test(m) && m.length < 120) return false;
+      // Skip URLs in obvious citation contexts (wikipedia / arxiv / doi.org)
+      if (/doi\.org|ieee\.org|acm\.org|arxiv\.org/.test(m)) return false;
+      return true;
+    } },
   { id:'storage-local',  cat:'Storage',    sev:'medium',
     re:/localStorage\./g,      ctx: null },
   { id:'storage-session',cat:'Storage',    sev:'medium',
@@ -862,6 +874,18 @@ const SECURITY_PATTERNS = [
   { id:'xss-window-open', cat:'XSS',       sev:'medium',
     re:/window\.open\s*\(/g, ctx: null },
 
+  // ── B2.5: SQL Injection — string concat/template with SQL keywords ──────
+  { id:'sqli-concat',     cat:'Injection', sev:'critical', cwe:'CWE-89',
+    re:/(?:\$|string)?\s*SELECT\s.+?\bFROM\b/g,
+    ctx: m => {
+      const c = m.slice(0, 500);
+      // Must contain both SQL keyword AND a variable reference (+ or ${})
+      return /\+|`\$\{|\.concat|\.join/.test(c);
+    } },
+  { id:'sqli-template',   cat:'Injection', sev:'critical', cwe:'CWE-89',
+    re:/`.*(?:SELECT|INSERT|UPDATE|DELETE|DROP|ALTER|CREATE).*`/g,
+    ctx: m => /\$\{[^}]+\}/.test(m) },
+
   // ── B3: Angular Template Injection ──────────────────────────────────────
   { id:'ng-tmpl-inject',  cat:'Angular Security', sev:'high',
     re:/DomSanitizer.*bypassSecurityTrustHtml\s*\(\s*[`'"]/g, ctx: null },
@@ -891,6 +915,20 @@ const SECURITY_PATTERNS = [
   { id:'rand-date-token',  cat:'Broken Crypto', sev:'high',
     re:/(?:Date\.now\(\)|new\s+Date\(\)\.getTime\(\))/g,
     ctx: m => /token|nonce|csrf|session|secret|key|nonce/i.test(m) },
+  { id:'rand-math-token',  cat:'Broken Crypto', sev:'high',
+    re:/Math\.random\(\)\s*\.\s*toString\s*\(\s*36\s*\)/g,
+    ctx: m => {
+      const c = m.slice(0, 300);
+      return /token|nonce|csrf|session|secret|key|nonce|id|guid|uuid/i.test(c);
+    } },
+  { id:'rand-math-predictable', cat:'Broken Crypto', sev:'medium',
+    re:/Math\.random\(\)/g,
+    ctx: m => {
+      const c = m.slice(0, 400);
+      // Only flag when used in contexts where cryptographic randomness is expected
+      return /token|nonce|csrf|session|secret|key|password|reset|otp|crypto|salt|hash/g.test(c)
+        && !/Math\.floor|Math\.round|Math\.ceil|parseInt|parseFloat/g.test(c);
+    } },
 
   // ── B7: Complete bypassSecurityTrust* ───────────────────────────────────
   { id:'bypass-style',   cat:'Angular Security', sev:'high',
@@ -3762,12 +3800,23 @@ function scanConfigDrivenBehaviour(src) {
       description:'Hardcoded API base URL in client bundle — verify this is intentional and not an internal/staging URL' });
   }
 
-  // CORS wildcard in config
-  const corsRe = /(?:allowedOrigins|cors)\s*[:=]\s*["'][*]["']/gi;
+  // CORS wildcard in config (expanded patterns)
+  const corsRe = /(?:allowedOrigins|cors|Access-Control-Allow-Origin)\s*[:=]\s*["'][*]["']/gi;
   while ((m = corsRe.exec(src)) !== null) {
     findings.push({ id:'cfg-cors-wildcard', category:'Config Behaviour', severity:'high',
       value: m[0].slice(0,80), context: ctx(m.index),
       description:'CORS wildcard origin configured — allows any origin to make credentialed requests' });
+  }
+  // CORS credentials + wildcard combo (most dangerous — allows credential theft from any site)
+  const corsCredRe = /Access-Control-Allow-Credentials\s*[:=]\s*["']?true["']?/gi;
+  while ((m = corsCredRe.exec(src)) !== null) {
+    // Check context for wildcard
+    const c = ctx(m.index, 300);
+    if (c.includes('*') || /Allow-Origin\s*:\s*\*/.test(c)) {
+      findings.push({ id:'cfg-cors-cred-wildcard', category:'Config Behaviour', severity:'critical',
+        value: m[0].slice(0,80), context: c,
+        description:'CORS with credentials AND wildcard origin — allows any site to make credentialed cross-origin requests, enabling data theft' });
+    }
   }
 
   return findings;
@@ -5491,7 +5540,7 @@ async function main() {
 
     // Phase 18 — Sink-anchored backward slicer (Stage 6)
     if (opts.verbose) console.log(info('  Phase 18: Sink-anchored backward slicer (Stage 6)…'));
-    backwardSlices = ast.buildBackwardSlices(astSrc, structuralIndex, functionSummaries, callGraph, maxHops);
+    backwardSlices = ast.buildBackwardSlices(astSrc, structuralIndex, functionSummaries, callGraph, opts.maxHops);
     const reachableSlices = backwardSlices.filter(p => p.reachesSource).length;
     if (opts.verbose) {
       console.log(info(`  Slices: ${backwardSlices.length} paths, ${reachableSlices} reach a taint source`));

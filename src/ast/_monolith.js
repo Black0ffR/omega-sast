@@ -1150,7 +1150,7 @@ function resolveWebpack5Modules(src) {
 
 function detectBundler(src) {
   const hints = {
-    webpack5:    /self\.webpackChunk_|self\["webpackChunk|webpackChunk_[A-Za-z0-9_$]+|__webpack_require__|__webpack_modules__|performance\.mark\(\s*["']js-parse-end/,
+    webpack5:    /self\.webpackChunk_|self\["webpackChunk|webpackChunk_[A-Za-z0-9_$]+|__webpack_require__|__webpack_modules__|__webpack_module_cache__|performance\.mark\(\s*["']js-parse-end/,
     webpack4:    /\bwebpackJsonp\b/,
     viteLegacy:  /__vitePreload\s*\(|__vite__mapDeps/,
     // FIX (Stage 4 audit): added negative lookahead `(?!https?:)` to reject
@@ -1158,8 +1158,10 @@ function detectBundler(src) {
     // imports. Previously matched any `...foo.js` string, causing false
     // positives when the bundle referenced CDN URLs.
     viteModern:  /\bimport\s*\{[^}]+\}\s*from\s*["'](?!https?:)(?:\.?\/)?[^"']+\.js["']/,
-    rollup:      /var\s+__defProp\s*=\s*Object\.defineProperty|__commonJS|__copyProps/,
-    esMBuild:    /\bexport\s*\{[^}]+\}\s*;/,
+    rollup:      /var\s+(__defProp|__getOwnPropSlot|__copyProps|__export|__commonJS|__esModule)\s*=\s*Object\.defineProperty|Object\.defineProperty\s*\(\s*exports,\s*["']__esModule["']/,
+    esbuild:     /__require\s*=\s*typeof\s+require|__markAsModule|var\s+__defProp\s*=\s*Object\.defineProperty.*__getOwnPropDesc|var\s+__commonJS\s*=\s*\(/,
+    parcel:      /parcelRequire\s*=\s*this\["parcel|bundle\(\)\{.*parcelRequire/,
+    browserify:  /\(function\s*[ef]\s*\{if\(typeof\s+exports\s*===\s*['"]object['"]&&typeof\s+module\s*!==/,
   };
   const detected = [];
   for (const [name, re] of Object.entries(hints)) {
@@ -1929,6 +1931,8 @@ function extractNetworkSurface(src) {
   const ctx = (i, r=120) => src.slice(Math.max(0, i - r/2), i + r/2).replace(/\n/g,' ');
   const findings = [];
 
+  // Known citation / documentation / package-homepage domains to exclude from findings
+  const KNOWN_DOC_DOMAINS = /(?:cdnjs\.cloudflare|github\.com|developer\.mozilla\.org|w3\.org|npmjs\.com|angular\.io|vuejs\.org|reactjs\.org|typescriptlang\.org|babeljs\.io|webpack\.js|nodejs\.org|mit\.edu|apache\.org|opensource\.org|creativecommons\.org|unlicense\.org|jquery\.com|lodash\.com|d3js\.org|chartjs\.org|threejs\.org|greensock\.com|gsap\.com|preactjs\.com|axios\.http|jsdelivr\.net|unpkg\.com|stackoverflow\.com|wikipedia\.org|arxiv\.org|ieee\.org|acm\.org|springer\.com|doi\.org)/;
   // URL extraction
   const URL_RE = /\b((?:https?|wss?|ftp):\/\/[A-Za-z0-9._~:/?#\[\]!@&'()*+,;=\-]{3,200})/g;
   const hosts = new Map();
