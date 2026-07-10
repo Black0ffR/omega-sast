@@ -1685,26 +1685,42 @@ function decodeObfuscatorIo(src) {
       });
 
       // ── Step 3b: detect wrapper functions that call this decoder ──────
+      // Supports:
+      //   same-order:   function W(a,b){return D(a OP OFFSET, b);}
+      //   swapped-arg:  function W(a,b){return D(b OP OFFSET, a);}
+      //   double-neg:   function W(a,b){return D(a - -OFSET, b);}  →  D(a + OFFSET, b)
       const wrapperRe = new RegExp(
-        `function\\s+([A-Za-z_$][\\w$]*)\\s*\\(\\s*([A-Za-z_$][\\w$]*)\\s*,\\s*([A-Za-z_$][\\w$]*)\\s*\\)\\s*\\{\\s*return\\s+${decName}\\s*\\(\\s*\\2\\s*([+-])\\s*(0x[0-9a-fA-F]+|\\d+)\\s*,\\s*\\3\\s*\\)\\s*;?\\s*\\}`,
+        `function\\s+([A-Za-z_$][\\w$]*)\\s*\\(\\s*([A-Za-z_$][\\w$]*)\\s*,\\s*([A-Za-z_$][\\w$]*)\\s*\\)\\s*\\{\\s*return\\s+${decName}\\s*\\(\\s*(?:\\2|\\3)\\s*(?:(?:([+-])\\s*(0x[0-9a-fA-F]+|\\d+))|-\\s*-\\s*(0x[0-9a-fA-F]+|\\d+))\\s*,\\s*(?:\\2|\\3)\\s*\\)\\s*;?\\s*\\}`,
         'g'
       );
       const wrapperInfos = [];
       let wm;
       while ((wm = wrapperRe.exec(src)) !== null) {
+        const isDoubleNeg = wm[6] !== undefined;
+        const op = isDoubleNeg ? '+' : wm[4];
+        const offset = isDoubleNeg ? parseInt(wm[6], 16) : parseInt(wm[5], wm[5].startsWith('0x') ? 16 : 10);
+        const decCallMatch = wm[0].match(new RegExp(`${decName}\\s*\\(\\s*([A-Za-z_$][\\w$]*)`));
+        const firstDecArg = decCallMatch ? decCallMatch[1] : '';
+        const isSwapped = firstDecArg === wm[3];
         wrapperInfos.push({
           wrapperName: wm[1],
-          op: wm[4],
-          offset: parseInt(wm[5], wm[5].startsWith('0x') ? 16 : 10),
+          op,
+          offset,
+          isSwapped,
         });
       }
       // ── Step 3c: inline wrapper calls into direct decoder calls ───────
       for (const wi of wrapperInfos) {
         const wrapperCallRe = new RegExp(
-          `\\b${wi.wrapperName}\\s*\\(\\s*(0x[0-9a-fA-F]+|\\d+)\\s*,\\s*(["'])([^"']*)\\2\\s*\\)`,
+          wi.isSwapped
+            ? `\\b${wi.wrapperName}\\s*\\(\\s*(["'])([^"']*)\\1\\s*,\\s*(0x[0-9a-fA-F]+|\\d+)\\s*\\)`
+            : `\\b${wi.wrapperName}\\s*\\(\\s*(0x[0-9a-fA-F]+|\\d+)\\s*,\\s*(["'])([^"']*)\\2\\s*\\)`,
           'g'
         );
-        src = src.replace(wrapperCallRe, (full, idxStr, quote, key) => {
+        src = src.replace(wrapperCallRe, (...args) => {
+          const idxStr = wi.isSwapped ? args[3] : args[1];
+          const quote = wi.isSwapped ? args[1] : args[2];
+          const key = wi.isSwapped ? args[2] : args[3];
           const idx = parseInt(idxStr, idxStr.startsWith('0x') ? 16 : 10);
           const adjustedIdx = wi.op === '+' ? idx + wi.offset : idx - wi.offset;
           const adjustedStr = '0x' + (adjustedIdx >>> 0).toString(16);
@@ -5998,7 +6014,7 @@ async function main(externalOpts) {
         genLine = f.line;
         genCol = 1;
       }
-      if (genLine < 1) continue;
+      if (genLine < 0) continue;
       const remapped = ast.mapSourcePosition(genLine, Math.max(0, genCol), decodedLines, sources, sourceRoot);
       if (remapped && remapped.source) {
         f.sourceLocation = {
