@@ -884,7 +884,7 @@ const SECURITY_PATTERNS = [
       return /\+|`\$\{|\.concat|\.join/.test(c);
     } },
   { id:'sqli-template',   cat:'Injection', sev:'critical', cwe:'CWE-89',
-    re:/`[^`]*(?:SELECT|INSERT|UPDATE|DELETE|DROP|ALTER|CREATE)[^`]*`/g,
+    re:/`[^`]*\b(?:SELECT|INSERT|UPDATE|DELETE|DROP|ALTER|CREATE)\b[^`]*`/g,
     ctx: m => {
       // Must have template interpolation AND be assigned to a sink or used in exec/query
       if (!/\$\{[^}]+\}/.test(m)) return false;
@@ -1640,12 +1640,28 @@ function decodeObfuscatorIo(src) {
   //   (b) RC4: key is used, charCodeAt loop
   for (const sa of stringArrays) {
     // Find decoder functions that reference this array
-    const decoderRe = new RegExp(
+    // Strict regex: requires exact parameter naming matching the body reference
+    const decoderReStrict = new RegExp(
       `function\\s+([A-Za-z_$][\\w$]*)\\s*\\(\\s*([A-Za-z_$][\\w$]*)\\s*,\\s*([A-Za-z_$][\\w$]*)\\s*\\)\\s*\\{[\\s\\S]{0,800}?${sa.name}\\[\\s*\\2\\s*\\][\\s\\S]{0,800}?\\}`,
       'g'
     );
+    // Broad regex as fallback: any function with 2 params referencing the array
+    const decoderReBroad = new RegExp(
+      `function\\s+([A-Za-z_$][\\w$]*)\\s*\\(\\s*[A-Za-z_$][\\w$]*\\s*,\\s*[A-Za-z_$][\\w$]*\\s*\\)\\s*\\{[\\s\\S]{0,800}?${sa.name}\\[\\s*[A-Za-z_$][\\w$]*\\s*\\][\\s\\S]{0,800}?\\}`,
+      'g'
+    );
+    // Collect matches from strict first, then fallback to broad
+    const decoderMatches = [];
     let dm;
-    while ((dm = decoderRe.exec(src)) !== null) {
+    while ((dm = decoderReStrict.exec(src)) !== null) decoderMatches.push(dm);
+    if (decoderMatches.length === 0) {
+      while ((dm = decoderReBroad.exec(src)) !== null) decoderMatches.push(dm);
+    }
+    // De-duplicate by function name
+    const seenNames = new Set();
+    for (const dm of decoderMatches) {
+      if (seenNames.has(dm[1])) continue;
+      seenNames.add(dm[1]);
       const decName = dm[1];
       const idxParam = dm[2];
       const keyParam = dm[3];
@@ -2903,6 +2919,7 @@ function scanCredentials(src) {
           name: pat.name, severity: pat.severity,
           value: value.slice(0,120),
           line: getLine(m.index),
+          pos: m.index,
           context: src.slice(Math.max(0, m.index-40), m.index+80).replace(/\n/g,' '),
         });
       },
@@ -2948,6 +2965,7 @@ function analyseSecurity(src, maxHops) {
           id: pat.id, category: pat.cat, severity: pat.sev,
           value,
           context: snippet.replace(/\n/g,' ').trim(),
+          pos: m.index,
         });
       },
       (reason) => { abortedPatterns.push({ pattern: pat.id, reason }); }
@@ -3726,7 +3744,7 @@ function scanTaintFlow(src) {
           value: `${taintSource} → ${sink.name}`,
           context: ctx(m.index),
           description: `Tainted data from "${taintSource}" flows to "${sink.name}" — ${sink.cwe}`,
-          cwe: sink.cwe });
+          cwe: sink.cwe, pos: m.index });
       }
     }
   }
@@ -4065,7 +4083,7 @@ function generateReports(data, outDir) {
           astFwFindings, bundlerInfo, webpackGraph, callGraph,
           astTaint, modernCrypto, networkSurface, useAst,
           obfuscatorFingerprint, functionSummaries, backwardSlices,
-          variableRenameTable, sourceExpander } = data;
+          variableRenameTable, sourceExpander, originalSrc } = data;
 
   const ext = extendedFindings || [];
   const sev_order = { critical:0, high:1, medium:2, low:3, info:4 };
@@ -4207,7 +4225,16 @@ function generateReports(data, outDir) {
           locations: [{
             physicalLocation: {
               artifactLocation: { uri: data.meta.file || 'input.js' },
-              region: f.pos ? { offset: f.pos, length: Math.max(1, (f.value || '').length) } : { startLine: 0 },
+              region: (() => {
+                if (typeof f.pos !== 'number') return { startLine: 1 };
+                const text = originalSrc || '';
+                let line = 1, col = 1;
+                const max = Math.min(f.pos, text.length);
+                for (let i = 0; i < max; i++) {
+                  if (text.charCodeAt(i) === 10) { line++; col = 1; } else col++;
+                }
+                return { startLine: line, startColumn: col, offset: f.pos, length: Math.max(1, (f.value || '').length) };
+              })(),
             },
           }],
           partialFingerprints: { primaryLocationLineHash: hash },
@@ -5895,9 +5922,16 @@ async function main(externalOpts) {
     const sources = sourceMapInfo.sources || [];
     const sourceRoot = sourceMapInfo.sourceRoot || '';
     for (const f of allSec) {
-      if (f.pos == null) continue;
-      const genLine = src.slice(0, f.pos).split('\n').length;
-      const genCol = f.pos - src.lastIndexOf('\n', f.pos) - 1;
+      // Derive generated line/col from whatever position info is available
+      let genLine = 0, genCol = 0;
+      if (typeof f.pos === 'number') {
+        genCol = f.pos - src.lastIndexOf('\n', f.pos) - 1;
+        genLine = src.slice(0, f.pos).split('\n').length;
+      } else if (typeof f.line === 'number' && f.line > 0) {
+        genLine = f.line;
+        genCol = 1;
+      }
+      if (genLine < 1) continue;
       const remapped = ast.mapSourcePosition(genLine, Math.max(0, genCol), decodedLines, sources, sourceRoot);
       if (remapped && remapped.source) {
         f.sourceLocation = {
@@ -6001,6 +6035,7 @@ async function main(externalOpts) {
       astTaint, modernCrypto, networkSurface, useAst,
       obfuscatorFingerprint, functionSummaries, backwardSlices,
       variableRenameTable, sourceExpander,
+      originalSrc: src,
       meta: {
         file:    path.basename(inputPath),
         size:    `${(stat.size/1024).toFixed(1)} KB`,
