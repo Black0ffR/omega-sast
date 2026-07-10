@@ -884,8 +884,15 @@ const SECURITY_PATTERNS = [
       return /\+|`\$\{|\.concat|\.join/.test(c);
     } },
   { id:'sqli-template',   cat:'Injection', sev:'critical', cwe:'CWE-89',
-    re:/`.*(?:SELECT|INSERT|UPDATE|DELETE|DROP|ALTER|CREATE).*`/g,
-    ctx: m => /\$\{[^}]+\}/.test(m) },
+    re:/`[^`]*(?:SELECT|INSERT|UPDATE|DELETE|DROP|ALTER|CREATE)[^`]*`/g,
+    ctx: m => {
+      // Must have template interpolation AND be assigned to a sink or used in exec/query
+      if (!/\$\{[^}]+\}/.test(m)) return false;
+      // Skip pure-string-formatting templates like `Map(${t.size})` — not SQL
+      const varPart = /\$\{[^}]+\}/.exec(m);
+      if (varPart && /\.(?:size|length|toString|toFixed|toPrecision|valueOf)/.test(varPart[0])) return false;
+      return true;
+    } },
 
   // ── B3: Angular Template Injection ──────────────────────────────────────
   { id:'ng-tmpl-inject',  cat:'Angular Security', sev:'high',
@@ -901,9 +908,8 @@ const SECURITY_PATTERNS = [
   { id:'proto-merge-suspect', cat:'Prototype Pollution', sev:'medium',
     re:/Object\.(?:assign|merge)\s*\(\s*[A-Za-z_$][\w$]*\s*,\s*[A-Za-z_$][\w$]*\s*\)/g,
     ctx: m => /user|request|input|body|data|param|query/i.test(m.slice(-200)) },
-  // Deprecated: old read-access pattern (too many FPs on .extend/.slice.call)
-  { id:'proto-assign',    cat:'Prototype Pollution', sev:'critical',
-    re:/(?:__proto__|prototype)\s*\[/g, ctx: m => /=\s*[^;]+$/.test(m) || /=/.test(m.slice(0,400)) },
+  // NOTE: proto-assign removed — too many FPs on reads (.extend/.slice.call).
+  // Use proto-write above for write-only detection.
   { id:'proto-setproto',  cat:'Prototype Pollution', sev:'medium',
     re:/Object\.setPrototypeOf\s*\(/g, ctx: m => /Object\.prototype/.test(m) },
   { id:'proto-jsonparse',  cat:'Prototype Pollution', sev:'medium',
@@ -4198,12 +4204,12 @@ function generateReports(data, outDir) {
           ruleId: f.id || f.category,
           level: sevToSarif[f.severity] || 'note',
           message: { text: `${f.category || ''}: ${f.value || f.description || ''}`.trim() },
-          locations: f.pos ? [{
+          locations: [{
             physicalLocation: {
-              artifactLocation: { uri: data.meta.file },
-              region: { offset: f.pos, length: (f.value || '').length || 1 },
+              artifactLocation: { uri: data.meta.file || 'input.js' },
+              region: f.pos ? { offset: f.pos, length: Math.max(1, (f.value || '').length) } : { startLine: 0 },
             },
-          }] : undefined,
+          }],
           partialFingerprints: { primaryLocationLineHash: hash },
         };
       }),
@@ -5007,6 +5013,10 @@ async function runMultiBundle(opts) {
           try {
             // Build opts from workerData
             const wd = workerData;
+            // Override argv so parseArgs() reads our opts instead of parent's
+            if (process.argv && process.argv.length > 2) {
+              process.argv = ['node', wd.bundlePath, '--quiet'];
+            }
             const opts = {
               input: wd.bundlePath,
               out: wd.outDir,
@@ -5751,30 +5761,7 @@ async function main(externalOpts) {
         console.log(info(`  Source expander: ${sinkSummaries.length} sink summaries`));
       }
     }
-
-    // Phase 18 — Sink-anchored backward slicer (Stage 6)
-    if (opts.verbose) console.log(info('  Phase 18: Sink-anchored backward slicer (Stage 6)…'));
-    backwardSlices = ast.buildBackwardSlices(astSrc, structuralIndex, functionSummaries, callGraph, opts.maxHops);
-    const reachableSlices = backwardSlices.filter(p => p.reachesSource).length;
-    if (opts.verbose) {
-      console.log(info(`  Slices: ${backwardSlices.length} paths, ${reachableSlices} reach a taint source`));
-    }
-
-    // Phase 19 — Variable Rename Table (Stage 7)
-    if (opts.verbose) console.log(info('  Phase 19: Variable rename table (Stage 7)…'));
-    variableRenameTable = ast.buildVariableRenameTable(structuralIndex, functionSummaries);
-    if (opts.verbose) {
-      console.log(info(`  VRT: ${variableRenameTable.stats.renamed} renamed (${variableRenameTable.stats.params} params, ${variableRenameTable.stats.locals} locals, ${variableRenameTable.stats.functions} functions)`));
-    }
-
-    // Phase 20 — On-demand source expansion (Stage 7)
-    if (opts.verbose) console.log(info('  Phase 20: Source expansion interface (Stage 7)…'));
-    sourceExpander = ast.createSourceExpander(astSrc, structuralIndex, functionSummaries);
-    if (opts.verbose) {
-      const sinkSummaries = sourceExpander.getSinkSummaries();
-      console.log(info(`  Expander: ${sinkSummaries.length} sink summaries ready (cache empty, on-demand)`));
-    }
-  }
+  } // end if (useAst)
 
   // ── Dedup taint findings between regex Phase 12j and AST Phase 14c ────
   // FIX: previously both scanners ran and produced overlapping findings for
