@@ -884,10 +884,11 @@ const SECURITY_PATTERNS = [
       return /\+|`\$\{|\.concat|\.join/.test(c);
     } },
   { id:'sqli-template',   cat:'Injection', sev:'critical', cwe:'CWE-89',
-    re:/`[^`]*\b(?:SELECT|INSERT|UPDATE|DELETE|DROP|ALTER|CREATE)\b[^`]*`/g,
+    // Require at least one ${...} interpolation inside the backtick-delimited
+    // template literal so we match m[0] (not just ctx snippet containing nearby
+    // interpolation). This prevents FP on `"SELECT"` (HTML form constant).
+    re:/`[^`]*\b(?:SELECT|INSERT|UPDATE|DELETE|DROP|ALTER|CREATE)\b[^`]*\$\{[^}]+\}[^`]*`/g,
     ctx: m => {
-      // Must have template interpolation AND be assigned to a sink or used in exec/query
-      if (!/\$\{[^}]+\}/.test(m)) return false;
       // Skip pure-string-formatting templates like `Map(${t.size})` — not SQL
       const varPart = /\$\{[^}]+\}/.exec(m);
       if (varPart && /\.(?:size|length|toString|toFixed|toPrecision|valueOf)/.test(varPart[0])) return false;
@@ -1684,44 +1685,54 @@ function decodeObfuscatorIo(src) {
       });
 
       // ── Step 4: find all calls to this decoder with constant args ──────
-      const callRe = new RegExp(
+      // Supports direct calls, .call(), .apply(), and indirect (0, fn)() patterns
+      const callPatterns = [
+        // Direct: decName(0x123, 'key')
         `\\b${decName}\\s*\\(\\s*(0x[0-9a-fA-F]+|\\d+)\\s*,\\s*["']([^"']*)["']\\s*\\)`,
-        'g'
-      );
+        // .call(): decName.call(this, 0x123, 'key') or decName.call(null, 0x123, 'key')
+        `\\b${decName}\\.call\\s*\\(\\s*(?:this|null|undefined)\\s*,\\s*(0x[0-9a-fA-F]+|\\d+)\\s*,\\s*["']([^"']*)["']\\s*\\)`,
+        // .apply(): decName.apply(this, [0x123, 'key'])
+        `\\b${decName}\\.apply\\s*\\(\\s*(?:this|null|undefined)\\s*,\\s*\\[(0x[0-9a-fA-F]+|\\d+)\\s*,\\s*["']([^"']*)["']\\s*\\]\\s*\\)`,
+        // Indirect: (0, decName)(0x123, 'key')
+        `\\(\\s*0\\s*,\\s*${decName}\\s*\\)\\s*\\(\\s*(0x[0-9a-fA-F]+|\\d+)\\s*,\\s*["']([^"']*)["']\\s*\\)`,
+      ];
       let replacedCount = 0;
-      src = src.replace(callRe, (full, idxStr, key) => {
-        const idx = parseInt(idxStr, idxStr.startsWith('0x') ? 16 : 10);
-        if (idx < 0 || idx >= sa.strings.length) return full;
+      for (const callPattern of callPatterns) {
+        const callRe = new RegExp(callPattern, 'g');
+        src = src.replace(callRe, (full, idxStr, key) => {
+          const idx = parseInt(idxStr, idxStr.startsWith('0x') ? 16 : 10);
+          if (idx < 0 || idx >= sa.strings.length) return full;
 
-        let decoded;
-        try {
-          const raw = sa.strings[idx];
-          if (isPlain) {
-            decoded = raw;
-          } else if (isBase64) {
-            decoded = Buffer.from(raw, 'base64').toString('utf8');
-          } else if (isRC4) {
-            decoded = rc4Decrypt(raw, key);
+          let decoded;
+          try {
+            const raw = sa.strings[idx];
+            if (isPlain) {
+              decoded = raw;
+            } else if (isBase64) {
+              decoded = Buffer.from(raw, 'base64').toString('utf8');
+            } else if (isRC4) {
+              decoded = rc4Decrypt(raw, key);
+            }
+          } catch (_) {
+            return full;
           }
-        } catch (_) {
-          return full;
-        }
 
-        if (typeof decoded !== 'string') return full;
-        if (!/^[\x20-\x7e\s]*$/.test(decoded)) return full;
+          if (typeof decoded !== 'string') return full;
+          if (!/^[\x20-\x7e\s]*$/.test(decoded)) return full;
 
-        const escaped = decoded.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n').replace(/\r/g, '\\r');
-        replacedCount++;
+          const escaped = decoded.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n').replace(/\r/g, '\\r');
+          replacedCount++;
 
-        decodedStrings.push({
-          call: full,
-          decoded,
-          idx,
-          key: isRC4 ? key : null,
+          decodedStrings.push({
+            call: full,
+            decoded,
+            idx,
+            key: isRC4 ? key : null,
+          });
+
+          return `'${escaped}'`;
         });
-
-        return `'${escaped}'`;
-      });
+      }
 
       if (replacedCount > 0) {
         findings.push({
@@ -5926,7 +5937,7 @@ async function main(externalOpts) {
       let genLine = 0, genCol = 0;
       if (typeof f.pos === 'number') {
         genCol = f.pos - src.lastIndexOf('\n', f.pos) - 1;
-        genLine = src.slice(0, f.pos).split('\n').length;
+        genLine = src.slice(0, f.pos).split('\n').length - 1; // 0-indexed for mapSourcePosition
       } else if (typeof f.line === 'number' && f.line > 0) {
         genLine = f.line;
         genCol = 1;
