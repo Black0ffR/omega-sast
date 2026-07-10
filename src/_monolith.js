@@ -1684,6 +1684,34 @@ function decodeObfuscatorIo(src) {
         description: `Found obfuscator.io decoder function ${decName}`,
       });
 
+      // ── Step 3b: detect wrapper functions that call this decoder ──────
+      const wrapperRe = new RegExp(
+        `function\\s+([A-Za-z_$][\\w$]*)\\s*\\(\\s*([A-Za-z_$][\\w$]*)\\s*,\\s*([A-Za-z_$][\\w$]*)\\s*\\)\\s*\\{\\s*return\\s+${decName}\\s*\\(\\s*\\2\\s*([+-])\\s*(0x[0-9a-fA-F]+|\\d+)\\s*,\\s*\\3\\s*\\)\\s*;?\\s*\\}`,
+        'g'
+      );
+      const wrapperInfos = [];
+      let wm;
+      while ((wm = wrapperRe.exec(src)) !== null) {
+        wrapperInfos.push({
+          wrapperName: wm[1],
+          op: wm[4],
+          offset: parseInt(wm[5], wm[5].startsWith('0x') ? 16 : 10),
+        });
+      }
+      // ── Step 3c: inline wrapper calls into direct decoder calls ───────
+      for (const wi of wrapperInfos) {
+        const wrapperCallRe = new RegExp(
+          `\\b${wi.wrapperName}\\s*\\(\\s*(0x[0-9a-fA-F]+|\\d+)\\s*,\\s*(["'])([^"']*)\\2\\s*\\)`,
+          'g'
+        );
+        src = src.replace(wrapperCallRe, (full, idxStr, quote, key) => {
+          const idx = parseInt(idxStr, idxStr.startsWith('0x') ? 16 : 10);
+          const adjustedIdx = wi.op === '+' ? idx + wi.offset : idx - wi.offset;
+          const adjustedStr = '0x' + (adjustedIdx >>> 0).toString(16);
+          return `${decName}(${adjustedStr}, ${quote}${key}${quote})`;
+        });
+      }
+
       // ── Step 4: find all calls to this decoder with constant args ──────
       // Supports direct calls, .call(), .apply(), and indirect (0, fn)() patterns
       const callPatterns = [
@@ -4094,7 +4122,7 @@ function generateReports(data, outDir) {
           astFwFindings, bundlerInfo, webpackGraph, callGraph,
           astTaint, modernCrypto, networkSurface, useAst,
           obfuscatorFingerprint, functionSummaries, backwardSlices,
-          variableRenameTable, sourceExpander, originalSrc } = data;
+          variableRenameTable, sourceExpander, originalSrc, sourceMapSources } = data;
 
   const ext = extendedFindings || [];
   const sev_order = { critical:0, high:1, medium:2, low:3, info:4 };
@@ -4210,6 +4238,18 @@ function generateReports(data, outDir) {
     ...(security || []).map(f => ({ ...f, category: f.category || 'Security' })),
     ...(extendedFindings || []),
   ];
+
+  // Build artifacts array: bundle file + any original source files from source map
+  const bundleUri = data.meta.file || 'input.js';
+  const srcMapSrcs = sourceMapSources || [];
+  const seenArtifacts = new Set();
+  seenArtifacts.add(bundleUri);
+  for (const s of srcMapSrcs) seenArtifacts.add(s);
+  const artifacts = [...seenArtifacts].map(uri => ({
+    location: { uri },
+    sourceLanguage: 'javascript',
+  }));
+
   const sarif = {
     version: '2.1.0',
     $schema: 'https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json',
@@ -4227,29 +4267,45 @@ function generateReports(data, outDir) {
           })),
         },
       },
+      artifacts,
       results: allFindingsForSarif.map((f, i) => {
         const hash = crypto.createHash('sha1').update(String(f.value || '') + String(f.pos || i)).digest('hex');
-        return {
+        const region = (() => {
+          if (typeof f.pos !== 'number') return { startLine: 1 };
+          const text = originalSrc || '';
+          let line = 1, col = 1;
+          const max = Math.min(f.pos, text.length);
+          for (let i = 0; i < max; i++) {
+            if (text.charCodeAt(i) === 10) { line++; col = 1; } else col++;
+          }
+          return { startLine: line, startColumn: col, offset: f.pos, length: Math.max(1, (f.value || '').length) };
+        })();
+        const result = {
           ruleId: f.id || f.category,
           level: sevToSarif[f.severity] || 'note',
           message: { text: `${f.category || ''}: ${f.value || f.description || ''}`.trim() },
           locations: [{
             physicalLocation: {
-              artifactLocation: { uri: data.meta.file || 'input.js' },
-              region: (() => {
-                if (typeof f.pos !== 'number') return { startLine: 1 };
-                const text = originalSrc || '';
-                let line = 1, col = 1;
-                const max = Math.min(f.pos, text.length);
-                for (let i = 0; i < max; i++) {
-                  if (text.charCodeAt(i) === 10) { line++; col = 1; } else col++;
-                }
-                return { startLine: line, startColumn: col, offset: f.pos, length: Math.max(1, (f.value || '').length) };
-              })(),
+              artifactLocation: { uri: bundleUri },
+              region,
             },
           }],
           partialFingerprints: { primaryLocationLineHash: hash },
         };
+        if (f.sourceLocation && f.sourceLocation.file) {
+          result.relatedLocations = [{
+            id: 0,
+            physicalLocation: {
+              artifactLocation: { uri: f.sourceLocation.file },
+              region: {
+                startLine: (f.sourceLocation.line || 0) + 1,
+                startColumn: Math.max(1, (f.sourceLocation.column || 0) + 1),
+              },
+            },
+            message: { text: `remapped to original source: ${f.sourceLocation.file}` },
+          }];
+        }
+        return result;
       }),
     }],
   };
@@ -6047,6 +6103,7 @@ async function main(externalOpts) {
       obfuscatorFingerprint, functionSummaries, backwardSlices,
       variableRenameTable, sourceExpander,
       originalSrc: src,
+      sourceMapSources: (sourceMapInfo && sourceMapInfo.sources) || [],
       meta: {
         file:    path.basename(inputPath),
         size:    `${(stat.size/1024).toFixed(1)} KB`,
