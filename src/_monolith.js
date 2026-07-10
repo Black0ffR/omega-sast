@@ -1713,8 +1713,8 @@ function decodeObfuscatorIo(src) {
       for (const wi of wrapperInfos) {
         const wrapperCallRe = new RegExp(
           wi.isSwapped
-            ? `\\b${wi.wrapperName}\\s*\\(\\s*(["'])([^"']*)\\1\\s*,\\s*(0x[0-9a-fA-F]+|\\d+)\\s*\\)`
-            : `\\b${wi.wrapperName}\\s*\\(\\s*(0x[0-9a-fA-F]+|\\d+)\\s*,\\s*(["'])([^"']*)\\2\\s*\\)`,
+            ? `\\b${wi.wrapperName}\\s*\\(\\s*(["'])([^"']*)\\1\\s*,\\s*(-?0x[0-9a-fA-F]+|-?\\d+)\\s*\\)`
+            : `\\b${wi.wrapperName}\\s*\\(\\s*(-?0x[0-9a-fA-F]+|-?\\d+)\\s*,\\s*(["'])([^"']*)\\2\\s*\\)`,
           'g'
         );
         src = src.replace(wrapperCallRe, (...args) => {

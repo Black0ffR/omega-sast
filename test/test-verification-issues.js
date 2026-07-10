@@ -331,7 +331,7 @@ section('1.4 SQL template literal: no FP on Vue-style templates');
   const r2 = readReport(out2);
   const selectFp = allFindings(r2).filter(f =>
     f.id === 'sqli-template' && f.severity === 'critical');
-  assert('HTML "SELECT" form constant does NOT fire critical sqli-template [KNOWN FAILING if ctx-snippet bug persists]',
+  assert('HTML "SELECT" form constant does NOT fire critical sqli-template',
     selectFp.length === 0,
     `got ${selectFp.length} false-positive criticals — value: ${(selectFp[0] || {}).value || ''}`);
 
@@ -582,7 +582,7 @@ section('4.4 --watch mode: flag recognized, initial scan runs');
 //  [KNOWN FAILING] — the genLine < 1 guard was claimed fixed in commit
 //  39bde4b but git blame shows it wasn't actually applied.
 // ═════════════════════════════════════════════════════════════════════════
-section('2.4 Source map correlation: findings get sourceLocation [KNOWN FAILING]');
+section('2.4 Source map correlation: findings get sourceLocation');
 
 (function () {
   const { bundlePath } = makeSourceMappedBundle();
@@ -598,7 +598,7 @@ section('2.4 Source map correlation: findings get sourceLocation [KNOWN FAILING]
       finds.length > 0, `got ${finds.length} findings`);
 
     const withSrcLoc = finds.filter(f => f.sourceLocation);
-    assert('At least one finding has sourceLocation populated [KNOWN FAILING]',
+    assert('At least one finding has sourceLocation populated',
       withSrcLoc.length > 0,
       `0/${finds.length} findings have sourceLocation — the genLine < 1 guard was not actually changed to < 0`);
 
@@ -669,7 +669,7 @@ section('1.3 RC4 wrapper inlining: same-order, swapped-arg, double-negative');
   const decoded2Src = decoded2Path ? fs.readFileSync(decoded2Path, 'utf8') : '';
   // After inlining, the wrapper call should be replaced with a direct _0x1ff7 call
   const swappedInlined = /_0x1ff7\(0x/.test(decoded2Src);
-  assert('Swapped-arg wrapper is inlined [KNOWN FAILING — regex only matches same-order]',
+  assert('Swapped-arg wrapper is inlined',
     swappedInlined,
     `wrapper call still present in decoded output: ${decoded2Src.split('\n').find(l => l.includes('_0x11fa48')) || 'not found'}`);
 
@@ -695,17 +695,76 @@ document.getElementById('x').innerHTML = _0x1b43c8(0x200,'key1');`;
   // The wrapper _0x1b43c8(0x61, '3cA6') should become _0x1ff7(0x61 + 0xad, '3cA6') = _0x1ff7(0x10e, '3cA6')
   // Check if the call was inlined with the CORRECT adjusted index (0x10e, not 0x61 - 0xad = negative)
   const doubleNegInlined = /_0x1ff7\(0x10e/.test(decoded3Src) || /_0x1ff7\(270/.test(decoded3Src);
-  assert('Double-negative wrapper (- -0xad) is inlined with correct +0xad offset [KNOWN FAILING]',
+  assert('Double-negative wrapper (- -0xad) is inlined with correct +0xad offset',
     doubleNegInlined,
     `decoded output does not contain _0x1ff7(0x10e, ...) — snippet: ${decoded3Src.split('\n').find(l => l.includes('_0x1b43c8')) || 'wrapper still present'}`);
 })();
 
 // ═════════════════════════════════════════════════════════════════════════
+//  ISSUE 1.3 — Negative-offset wrapper calls
+//  Real obfuscator.io uses W('key', -0x1a7) — offset is a negative hex.
+//  The call-site regex must handle -? before the hex/decimal capture.
+// ═════════════════════════════════════════════════════════════════════════
+section('1.3 RC4 negative-offset wrapper calls');
+
+(function () {
+  // Test 4a: same-order with negative offset: W(-0x100, 'key')
+  // function W(a,b){return D(a-0x30c,b)}
+  const dir4 = mkTmpDir();
+  const negOffSrc = `var _0x1234 = ['pBD4edrlpg==','qxDx','rxr6Zto=','sBDkZtE='];
+function _0x1ff7(a,b){var c=_0x1234[a];var d='',e=0;for(var i=0;i<c.length;i++){e=(e+c.charCodeAt(i))%256;var f=c.charCodeAt(i);var g=b.charCodeAt(e%b.length);d+=String.fromCharCode(f^g)}return d}
+function _0x77aabb(a,b){return _0x1ff7(a-0x30c,b)}
+var x=_0x77aabb(-0x100,'key1');
+document.getElementById('x').innerHTML = _0x77aabb(0x200,'key1');`;
+  const negOffFile = path.join(dir4, 'neg-offset.js');
+  fs.writeFileSync(negOffFile, negOffSrc);
+  const out4 = mkTmpDir();
+  runOmega([negOffFile, '--security', '--report', '--verbose', '--out', out4]);
+  const decoded4Path = path.join(out4, fs.readdirSync(out4).find(f => f.endsWith('.decoded.js')) || '');
+  const decoded4Src = decoded4Path ? fs.readFileSync(decoded4Path, 'utf8') : '';
+  // W(-0x100, 'key1') with body D(a-0x30c,b) → _0x1ff7(-0x100-0x30c, 'key1') = _0x1ff7(-0x40c, 'key1')
+  const negOffInlined = /_0x1ff7\(0x/.test(decoded4Src);
+  assert('Same-order negative-offset call (-0x100) is inlined',
+    negOffInlined,
+    `not inlined — snippet: ${decoded4Src.slice(0, 300)}`);
+
+  // Test 4b: swapped with negative offset: W('key', -0x1a7)
+  // function W(a,b){return D(b-0x2f5,a)}
+  const dir5 = mkTmpDir();
+  const negOffSwapSrc = `var _0x1234 = ['pBD4edrlpg==','qxDx','rxr6Zto=','sBDkZtE='];
+function _0x1ff7(a,b){var c=_0x1234[a];var d='',e=0;for(var i=0;i<c.length;i++){e=(e+c.charCodeAt(i))%256;var f=c.charCodeAt(i);var g=b.charCodeAt(e%b.length);d+=String.fromCharCode(f^g)}return d}
+function _0xcf9c92(a,b){return _0x1ff7(b-0x2f5,a)}
+var x=_0xcf9c92('key',-0x1a7);
+document.getElementById('x').innerHTML = _0xcf9c92('key1',0x200);`;
+  const negOffSwapFile = path.join(dir5, 'neg-offset-swap.js');
+  fs.writeFileSync(negOffSwapFile, negOffSwapSrc);
+  const out5 = mkTmpDir();
+  runOmega([negOffSwapFile, '--security', '--report', '--verbose', '--out', out5]);
+  const decoded5Path = path.join(out5, fs.readdirSync(out5).find(f => f.endsWith('.decoded.js')) || '');
+  const decoded5Src = decoded5Path ? fs.readFileSync(decoded5Path, 'utf8') : '';
+  // W('key', -0x1a7) with body D(b-0x2f5,a) → _0x1ff7(-0x1a7-0x2f5, 'key') = _0x1ff7(-0x49c, 'key')
+  const negOffSwappedInlined = /_0x1ff7\(0x/.test(decoded5Src);
+  assert('Swapped negative-offset call (-0x1a7) is inlined',
+    negOffSwappedInlined,
+    `not inlined — snippet: ${decoded5Src.slice(0, 300)}`);
+
+  // Test 4c: the real-world pattern: both negative offset AND valid XSS detection
+  // After inlining, the sink should fire
+  const out6 = mkTmpDir();
+  runOmega([negOffSwapFile, '--security', '--report', '--quiet', '--out', out6]);
+  const r6 = readReport(out6);
+  const xssFinds6 = allFindings(r6).filter(f =>
+    /XSS|Taint|innerHTML/i.test(f.category + ' ' + (f.value || '')));
+  assert('Negative-offset swapped wrapper + XSS sink is detected',
+    xssFinds6.length > 0,
+    `0 XSS findings — sink still invisible`);
+})();
+
+// ═════════════════════════════════════════════════════════════════════════
 //  ISSUE 1.3 (real-world) — RC4 decoder on a real obfuscator.io sample
 //  The XSS sink (innerHTML) should become visible after RC4 decoding.
-//  [KNOWN FAILING] — wrapper regex only matches 2/7 patterns in real sample.
 // ═════════════════════════════════════════════════════════════════════════
-section('1.3 (real-world) RC4 decoder cracks obfuscator.io sample [KNOWN FAILING]');
+section('1.3 (real-world) RC4 decoder cracks obfuscator.io sample');
 
 (function () {
   // Locate the real obfuscator.io sample if available
@@ -722,21 +781,21 @@ section('1.3 (real-world) RC4 decoder cracks obfuscator.io sample [KNOWN FAILING
   // Decode stats should show strings decoded from the RC4 array
   const decodedCount = r?.decodeStats ?
     Object.values(r.decodeStats).reduce((a, b) => a + (b || 0), 0) : 0;
-  assert('RC4 decoder decodes strings from real obfuscator.io sample [KNOWN FAILING]',
+  assert('RC4 decoder decodes strings from real obfuscator.io sample',
     decodedCount > 15,  // 15 is just the hex-escape count; real decoding would add more
     `decode stats total = ${decodedCount}`);
 
   // The XSS sink (innerHTML) should be visible in the decoded output
   const decodedPath = path.join(out, fs.readdirSync(out).find(f => f.endsWith('.decoded.js')) || '');
   const decodedSrc = decodedPath ? fs.readFileSync(decodedPath, 'utf8') : '';
-  assert('Decoded output contains the literal "innerHTML" [KNOWN FAILING]',
+  assert('Decoded output contains the literal "innerHTML"',
     /innerHTML/.test(decodedSrc),
     'innerHTML not found in decoded output — RC4 string array not cracked');
 
   // At least one XSS or Taint finding should fire on the now-visible sink
   const xssFinds = allFindings(r).filter(f =>
     /XSS|Taint|innerHTML/i.test(f.category + ' ' + (f.value || '')));
-  assert('XSS/Taint finding fires on decoded RC4 sink [KNOWN FAILING]',
+  assert('XSS/Taint finding fires on decoded RC4 sink',
     xssFinds.length > 0,
     `0 XSS/Taint findings — sink still invisible`);
 })();
