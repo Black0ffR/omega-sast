@@ -801,6 +801,107 @@ section('1.3 (real-world) RC4 decoder cracks obfuscator.io sample');
 })();
 
 // ═════════════════════════════════════════════════════════════════════════
+//  ISSUE 1.3e — Direct decoder call with negative offset
+//  decName(-0x1a7, 'key') — Step 4 patterns must have -? prefix
+// ═════════════════════════════════════════════════════════════════════════
+section('1.3e Direct decoder call with negative offset');
+
+(function () {
+  const dir = mkTmpDir();
+  const src = `var sa = ['a','b','c'];
+function D(i,k){return sa[i]}
+var x = D(-0x2, 'k');`;
+  const file = path.join(dir, 'direct-neg.js');
+  fs.writeFileSync(file, src);
+  const out = mkTmpDir();
+  runOmega([file, '--security', '--report', '--verbose', '--out', out]);
+  const decodedPath = path.join(out, fs.readdirSync(out).find(f => f.endsWith('.decoded.js')) || '');
+  const decodedSrc = decodedPath ? fs.readFileSync(decodedPath, 'utf8') : '';
+  assert('Direct negative-offset call (-0x2) does not crash',
+    !/Error|TypeError/.test(decodedSrc),
+    `unexpected error: ${decodedSrc.slice(0, 200)}`);
+  assert('Direct negative-offset call is preserved when out of bounds',
+    /D\(-0x2/.test(decodedSrc),
+    `call was incorrectly inlined: ${decodedSrc.slice(0, 200)}`);
+})();
+
+// ═════════════════════════════════════════════════════════════════════════
+//  ISSUE 1.3f — Decoder with built-in subtract base offset
+//  function D(i,k){i = i - 0x100; return sa[i]} with D(0x100, 'k') -> sa[0]
+// ═════════════════════════════════════════════════════════════════════════
+section('1.3f Decoder with built-in subtract base offset');
+
+(function () {
+  const dir = mkTmpDir();
+  const src = `var sa = ['api','user','admin'];
+function D(i,k){i = i - 0x100; return sa[i]}
+var x = D(0x100, 'k');
+var y = D(0x102, 'k');`;
+  const file = path.join(dir, 'base-offset.js');
+  fs.writeFileSync(file, src);
+  const out = mkTmpDir();
+  runOmega([file, '--security', '--report', '--verbose', '--out', out]);
+  const decodedPath = path.join(out, fs.readdirSync(out).find(f => f.endsWith('.decoded.js')) || '');
+  const decodedSrc = decodedPath ? fs.readFileSync(decodedPath, 'utf8') : '';
+  assert('Decoder with subtract base offset (0x100) inlines D(0x100) to "api"',
+    decodedSrc.includes("'api'"),
+    `missing 'api': ${decodedSrc.slice(0, 300)}`);
+  assert('Decoder with subtract base offset inlines D(0x102) to "admin"',
+    decodedSrc.includes("'admin'"),
+    `missing 'admin': ${decodedSrc.slice(0, 300)}`);
+})();
+
+// ═════════════════════════════════════════════════════════════════════════
+//  ISSUE 1.3g — Decoder with built-in add base offset
+//  function D(i,k){i = i + 0x100; return sa[i]} with D(-0x100, 'k') -> sa[0]
+// ═════════════════════════════════════════════════════════════════════════
+section('1.3g Decoder with built-in add base offset');
+
+(function () {
+  const dir = mkTmpDir();
+  const src = `var sa = ['x','y','z'];
+function D(i,k){i = i + 0x100; return sa[i]}
+var x = D(-0x100, 'k');`;
+  const file = path.join(dir, 'base-add.js');
+  fs.writeFileSync(file, src);
+  const out = mkTmpDir();
+  runOmega([file, '--security', '--report', '--verbose', '--out', out]);
+  const decodedPath = path.join(out, fs.readdirSync(out).find(f => f.endsWith('.decoded.js')) || '');
+  const decodedSrc = decodedPath ? fs.readFileSync(decodedPath, 'utf8') : '';
+  assert('Decoder with add base offset (+0x100) inlines D(-0x100) to "x"',
+    decodedSrc.includes("'x'"),
+    `missing 'x': ${decodedSrc.slice(0, 300)}`);
+})();
+
+// ═════════════════════════════════════════════════════════════════════════
+//  ISSUE 1.3h — Source map finding de-duplication
+//  After removing redundant sourcemap-ref regex rule, source map leaks
+//  should produce at most 2 findings (ref + external), not 3.
+// ═════════════════════════════════════════════════════════════════════════
+section('1.3h Source map dedup: at most 2 findings per leak');
+
+(function () {
+  const dir = mkTmpDir();
+  const src = `var x = 1;
+//# sourceMappingURL=axios.min.js.map
+`;
+  const file = path.join(dir, 'has-map.js');
+  fs.writeFileSync(file, src);
+  const out = mkTmpDir();
+  runOmega([file, '--security', '--report', '--quiet', '--out', out]);
+  const r = readReport(out);
+  const sourceMapFinds = allFindings(r).filter(f =>
+    f.id && f.id.startsWith('sourcemap'));
+  assert('Source map leak produces at most 2 findings (was 3)',
+    sourceMapFinds.length <= 2,
+    `got ${sourceMapFinds.length}: ${sourceMapFinds.map(f => `${f.id}(${f.severity})`).join(', ')}`);
+  const extFindings = sourceMapFinds.filter(f => f.id === 'sourcemap-external');
+  assert('sourcemap-external finding is present for .map URL',
+    extFindings.length === 1,
+    `got ${extFindings.length} sourcemap-external`);
+})();
+
+// ═════════════════════════════════════════════════════════════════════════
 //  Summary
 // ═════════════════════════════════════════════════════════════════════════
 console.log(`\n${'═'.repeat(70)}`);

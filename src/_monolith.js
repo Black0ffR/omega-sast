@@ -964,8 +964,8 @@ const SECURITY_PATTERNS = [
     re:/(?:error|err|e)\.stack\b/g, ctx: null },
 
   // ── B9: Source Map Artifacts ────────────────────────────────────────────
-  { id:'sourcemap-ref',  cat:'Info Leakage',  sev:'low',
-    re:/\/\/[#@]\s*sourceMappingURL\s*=/g, ctx: null },
+  // Note: sourceMappingURL detection is handled by Phase 12q (parseSourceMap)
+  // with contextual severity. Regex rules here only catch non-parseSourceMap refs.
   { id:'sourcemap-file', cat:'Info Leakage',  sev:'low',
     re:/\.map["']\s*\)|\bsource-maps?\b/gi, ctx: null },
 
@@ -1668,6 +1668,16 @@ function decodeObfuscatorIo(src) {
       const keyParam = dm[3];
       const body = dm[0];
 
+      // Detect built-in base offset: idxParam = idxParam OP BASE
+      // obfuscator.io often adds:  var idx = idx - 0xNNN;  at the start of decoders
+      let baseOffset = 0;
+      const offsetMatch = body.match(new RegExp(
+        `\\b${idxParam}\\s*=\\s*${idxParam}\\s*([+-])\\s*(0x[0-9a-fA-F]+|\\d+)`
+      ));
+      if (offsetMatch) {
+        baseOffset = offsetMatch[1] === '-' ? parseInt(offsetMatch[2], offsetMatch[2].startsWith('0x') ? 16 : 10) : -parseInt(offsetMatch[2], offsetMatch[2].startsWith('0x') ? 16 : 10);
+      }
+
       // Determine decoder type
       const isRC4 = /charCodeAt[\s\S]{0,200}fromCharCode/.test(body) && body.includes(keyParam);
       const isBase64 = /atob\s*\(/.test(body) && !isRC4;
@@ -1721,7 +1731,7 @@ function decodeObfuscatorIo(src) {
           const idxStr = wi.isSwapped ? args[3] : args[1];
           const quote = wi.isSwapped ? args[1] : args[2];
           const key = wi.isSwapped ? args[2] : args[3];
-          const idx = parseInt(idxStr, idxStr.startsWith('0x') ? 16 : 10);
+          const idx = parseInt(idxStr, /^-?0x/i.test(idxStr) ? 16 : 10);
           const adjustedIdx = wi.op === '+' ? idx + wi.offset : idx - wi.offset;
           const adjustedStr = '0x' + (adjustedIdx >>> 0).toString(16);
           return `${decName}(${adjustedStr}, ${quote}${key}${quote})`;
@@ -1731,25 +1741,26 @@ function decodeObfuscatorIo(src) {
       // ── Step 4: find all calls to this decoder with constant args ──────
       // Supports direct calls, .call(), .apply(), and indirect (0, fn)() patterns
       const callPatterns = [
-        // Direct: decName(0x123, 'key')
-        `\\b${decName}\\s*\\(\\s*(0x[0-9a-fA-F]+|\\d+)\\s*,\\s*["']([^"']*)["']\\s*\\)`,
-        // .call(): decName.call(this, 0x123, 'key') or decName.call(null, 0x123, 'key')
-        `\\b${decName}\\.call\\s*\\(\\s*(?:this|null|undefined)\\s*,\\s*(0x[0-9a-fA-F]+|\\d+)\\s*,\\s*["']([^"']*)["']\\s*\\)`,
+        // Direct: decName(0x123, 'key') or decName(-0x1a7, 'key')
+        `\\b${decName}\\s*\\(\\s*(-?0x[0-9a-fA-F]+|-?\\d+)\\s*,\\s*["']([^"']*)["']\\s*\\)`,
+        // .call(): decName.call(this, 0x123, 'key') or decName.call(null, -0x1a7, 'key')
+        `\\b${decName}\\.call\\s*\\(\\s*(?:this|null|undefined)\\s*,\\s*(-?0x[0-9a-fA-F]+|-?\\d+)\\s*,\\s*["']([^"']*)["']\\s*\\)`,
         // .apply(): decName.apply(this, [0x123, 'key'])
-        `\\b${decName}\\.apply\\s*\\(\\s*(?:this|null|undefined)\\s*,\\s*\\[(0x[0-9a-fA-F]+|\\d+)\\s*,\\s*["']([^"']*)["']\\s*\\]\\s*\\)`,
+        `\\b${decName}\\.apply\\s*\\(\\s*(?:this|null|undefined)\\s*,\\s*\\[(-?0x[0-9a-fA-F]+|-?\\d+)\\s*,\\s*["']([^"']*)["']\\s*\\]\\s*\\)`,
         // Indirect: (0, decName)(0x123, 'key')
-        `\\(\\s*0\\s*,\\s*${decName}\\s*\\)\\s*\\(\\s*(0x[0-9a-fA-F]+|\\d+)\\s*,\\s*["']([^"']*)["']\\s*\\)`,
+        `\\(\\s*0\\s*,\\s*${decName}\\s*\\)\\s*\\(\\s*(-?0x[0-9a-fA-F]+|-?\\d+)\\s*,\\s*["']([^"']*)["']\\s*\\)`,
       ];
       let replacedCount = 0;
       for (const callPattern of callPatterns) {
         const callRe = new RegExp(callPattern, 'g');
         src = src.replace(callRe, (full, idxStr, key) => {
-          const idx = parseInt(idxStr, idxStr.startsWith('0x') ? 16 : 10);
-          if (idx < 0 || idx >= sa.strings.length) return full;
+          const idx = parseInt(idxStr, /^-?0x/i.test(idxStr) ? 16 : 10);
+          const adjustedIdx = idx - baseOffset;
+          if (adjustedIdx < 0 || adjustedIdx >= sa.strings.length) return full;
 
           let decoded;
           try {
-            const raw = sa.strings[idx];
+            const raw = sa.strings[adjustedIdx];
             if (isPlain) {
               decoded = raw;
             } else if (isBase64) {
@@ -1770,7 +1781,7 @@ function decodeObfuscatorIo(src) {
           decodedStrings.push({
             call: full,
             decoded,
-            idx,
+            idx: adjustedIdx,
             key: isRC4 ? key : null,
           });
 

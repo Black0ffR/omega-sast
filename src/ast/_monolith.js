@@ -2145,8 +2145,11 @@ function parseSourceMap(src) {
   while ((m = SOURCEMAP_RE.exec(src)) !== null) {
     const url = m[1] || m[2];
     mapRef = { url, pos: m.index, isInline: false, isExternal: false };
+    const sev = mapRef.url.startsWith('data:') ? 'medium' :
+                mapRef.url.startsWith('http://') ? 'high' :
+                mapRef.url.startsWith('https://') ? 'low' : 'low';
     findings.push({
-      id: 'sourcemap-ref', category: 'Source Map', severity: 'high',
+      id: 'sourcemap-ref', category: 'Source Map', severity: sev,
       value: url.slice(0, 100), context: ctx(m.index),
       description: 'sourceMappingURL reference in production bundle — original source structure leaked',
     });
