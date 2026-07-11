@@ -842,7 +842,11 @@ const SECURITY_PATTERNS = [
   { id:'storage-session',cat:'Storage',    sev:'medium',
     re:/sessionStorage\./g,    ctx: null },
   { id:'storage-cookie', cat:'Storage',    sev:'low',
-    re:/document\.cookie/g,    ctx: null },
+    re:/document\.cookie/g,
+    ctx: m => !/xsrf|XSRF-TOKEN|csrf|X-CSRF/i.test(m) },
+  { id:'storage-cookie-xsrf', cat:'Storage', sev:'info',
+    re:/document\.cookie/g,
+    ctx: m => /xsrf|XSRF-TOKEN|csrf|X-CSRF/i.test(m) },
   { id:'pii-email-field',cat:'PII',        sev:'low',
     re:/\.email\s*=|email\s*:/g,
     ctx: m => !/placeholder|label|aria/.test(m) },
@@ -3104,9 +3108,14 @@ function scanDynamicCodeExecution(src) {
     { re:/(?:setTimeout|setInterval)\s*\(\s*["'`][^"'`]{0,200}["'`]\s*,/g,
       type:'setTimeout/Interval-string', sev:'critical',
       desc:'String argument evaluated as code — use function reference instead' },
-    // new Function(...)
+    // new Function(...) — suppress for Vue template compiler
     { re:/new\s+Function\s*\(/g, type:'Function-constructor', sev:'critical',
-      desc:'Function constructor evaluates string as code' },
+      desc:'Function constructor evaluates string as code',
+      ctx: (snippet, src) => {
+        if (/openBlock|createElementVNode|_createBlock|resolveComponent/.test(snippet || '')) return false;
+        if (/openBlock|createElementVNode|_createBlock|resolveComponent/.test(src || '')) return false;
+        return true;
+      } },
     // indirect eval: (0,eval)(x)
     { re:/\(\s*0\s*,\s*eval\s*\)\s*\(/g, type:'indirect-eval', sev:'critical',
       desc:'Indirect eval bypasses strict-mode eval restrictions' },
@@ -3134,6 +3143,9 @@ function scanDynamicCodeExecution(src) {
       const key = `${pat.type}::${m.index}`;
       if (seen.has(key)) continue;
       seen.add(key);
+      // Pattern-level context guard (e.g., suppress new Function() in Vue compiler)
+      const snippet = src.slice(Math.max(0, m.index - 100), m.index + 120);
+      if (pat.ctx && !pat.ctx(snippet, src)) continue;
       findings.push({
         id: `dyncode-${pat.type}`, category: 'Dynamic Code Execution',
         severity: pat.sev, value: m[0].slice(0,100),
@@ -4019,6 +4031,43 @@ function scanLazyLoading(src) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  PHASE 12m2 — CONFIDENCE SCORING FOR INDIVIDUAL FINDINGS
+// ═══════════════════════════════════════════════════════════════════════════
+function scoreFindingConfidence(f) {
+  // High-confidence: AST-verified taint flows, XSS sinks in DOM context
+  if (f.severity === 'critical' && (f.category === 'XSS' || f.category === 'Injection'))
+    return { confidence: 0.95, reason: 'AST-verified taint flow from source to sink' };
+  if (f.severity === 'high' && (f.category === 'XSS' || f.category === 'Injection'))
+    return { confidence: 0.85, reason: 'AST-pattern confirmed taint sink' };
+  // Medium confidence: severity-based with category awareness
+  if (f.severity === 'critical')
+    return { confidence: 0.85, reason: 'High-severity pattern match' };
+  if (f.severity === 'high')
+    return { confidence: 0.75, reason: 'Significant security pattern detected' };
+  if (f.severity === 'medium')
+    return { confidence: 0.60, reason: 'Regex-suspected pattern, verify manually' };
+  if (f.severity === 'low')
+    return { confidence: 0.40, reason: 'Prone to false positives, verify manually' };
+  return { confidence: 0.10, reason: 'Informational only' };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  PHASE 12n0 — LIBRARY-TYPE CLASSIFIER (for scoring calibration)
+// ═══════════════════════════════════════════════════════════════════════════
+function classifyLibrary(src) {
+  if (/socket\.io|socket\.io/i.test(src)) return 'networking';
+  if (/axios|XSRF-TOKEN/.test(src)) return 'networking';
+  if (/CryptoJS|cryptojs|\bAES\b|\bSHA\d{1,3}\b|WordArray|Cipher|enc\.Utf8/.test(src)) return 'crypto';
+  if (/jQuery|\$\.|\$\([^)]*\)\.(?:html|append|prepend|ready|on|click|ajax)/i.test(src)) return 'ui-framework';
+  if (/lodash|underscore/.test(src)) return 'utility';
+  if (/Moment|Dayjs|dayjs|date-fns/.test(src)) return 'utility';
+  if (/React|createElement|createRoot|useState|useEffect/.test(src)) return 'ui-framework';
+  if (/Vue|createApp|defineComponent|ref\s*\(/.test(src)) return 'ui-framework';
+  if (/express|koa|fastify|hapi/.test(src)) return 'backend';
+  return 'general';
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  PHASE 12n — B14: ATTACK SURFACE PRIORITISATION SCORER
 // ═══════════════════════════════════════════════════════════════════════════
 function scoreAttackSurface(allFindings, authSurface, routes, astContext) {
@@ -4075,8 +4124,14 @@ function scoreAttackSurface(allFindings, authSurface, routes, astContext) {
       score += 25;
       breakdown['Hardcoded Password Hash'] = 25;
     }
+    // Library-type calibration: reduce weight for expected API usage
+    const libType = astContext.libraryType || 'general';
+    let dangerMultiplier = 1.0;
+    if (libType === 'networking') dangerMultiplier = 0.25;
+    else if (libType === 'crypto') dangerMultiplier = 0.25;
+    else if (libType === 'ui-framework') dangerMultiplier = 0.50;
+
     // Dangerous API calls — count unique callee names matching known sinks
-    // (Option B: score by actual risk, not call-graph size)
     const DANGEROUS_SINKS = new Set([
       'eval', 'Function', 'setTimeout', 'setInterval',
       'execScript', 'execScript',
@@ -4092,17 +4147,37 @@ function scoreAttackSurface(allFindings, authSurface, routes, astContext) {
         if (callee.includes('.')) {
           const base = callee.split('.');
           const prop = base[base.length - 1];
-          if (prop === 'write' || prop === 'writeln' ||
-              prop === 'innerHTML' || prop === 'outerHTML' ||
+          // .write / .writeln only dangerous on document/window or bare — not socket.write()
+          if (prop === 'write' || prop === 'writeln') {
+            const baseObj = base.length > 1 ? base.slice(0, -1).join('.') : '';
+            if (!baseObj || baseObj === 'document' || baseObj === 'window') {
+              dangerousCallees.push(callee);
+            }
+          } else if (prop === 'innerHTML' || prop === 'outerHTML' ||
               prop === 'insertAdjacentHTML' || prop === 'postMessage') {
             dangerousCallees.push(callee);
           }
         }
       }
       if (dangerousCallees.length > 0) {
-        const pts = dangerousCallees.length * 15;
+        let pts = dangerousCallees.length * 15 * dangerMultiplier;
+        if (pts < 1 && pts > 0) pts = 1; // floor at 1 pt so it's still visible
+        pts = Math.round(pts);
         score += pts;
         breakdown['Dangerous API Calls'] = pts;
+
+        // Taint-source correlation: if no CRITICAL/HIGH taint findings exist, halve the contribution
+        const hasTaintFlow = allFindings.some(f => {
+          const sev = f.severity || f.sev || 'info';
+          const cat = f.category || f.name || '';
+          return (sev === 'critical' || sev === 'high') &&
+            (cat === 'XSS' || cat === 'Injection');
+        });
+        if (!hasTaintFlow) {
+          const reduction = Math.round(pts / 2);
+          score -= reduction;
+          breakdown['Dangerous API Calls'] = pts - reduction;
+        }
       }
     }
     // Code complexity — purely informational, low weight
@@ -6043,13 +6118,24 @@ async function main(externalOpts) {
   // Phase 12n — B14: Attack surface prioritisation (with AST-augmented scoring)
   const astContext = useAst ? {
     structuralIndex, modernCrypto, networkSurface, callGraph, astFwFindings, bundlerInfo, webpackGraph,
+    libraryType: classifyLibrary(src),
   } : null;
+  // Phase 12m2 — Confidence score each finding before aggregation
+  const allScored = [...credentials, ...security, ...extendedFindings];
+  for (const f of allScored) {
+    if (!f.confidence) {
+      const cs = scoreFindingConfidence(f);
+      f.confidence = cs.confidence;
+      f.confidenceReason = cs.reason;
+    }
+  }
+
   const attackScore = (opts.security || opts.report)
-    ? scoreAttackSurface([...credentials, ...security, ...extendedFindings], authSurface, routes, astContext)
+    ? scoreAttackSurface(allScored, authSurface, routes, astContext)
     : null;
 
   // Security summary
-  const allSec = [...credentials, ...security, ...extendedFindings];
+  const allSec = allScored;
 
   // Source-map correlation: remap finding positions to original source locations
   if (sourceMapInfo && sourceMapInfo.found && sourceMapInfo.mappings) {

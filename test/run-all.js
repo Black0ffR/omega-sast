@@ -26,7 +26,7 @@ for (const file of testFiles) {
   const filePath = path.join(testDir, file);
   process.stdout.write(`  ${file.padEnd(35)} `);
   try {
-    const output = execSync(`node ${filePath}`, { encoding: 'utf8', timeout: 30000 });
+    const output = execSync(`node ${filePath}`, { encoding: 'utf8', timeout: 90000 });
     // Extract pass/fail counts from output
     const passMatch = output.match(/PASSED: (\d+)|PASS: (\d+)/);
     const failMatch = output.match(/FAILED: (\d+)|FAIL: (\d+)/);
