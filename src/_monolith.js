@@ -1625,7 +1625,7 @@ function decodeObfuscatorIo(src) {
     // The rotation IIFE may pass either the array name or the getter function name
     const arrOrGetter = sa.getterName ? `(?:${sa.name}|${sa.getterName})` : sa.name;
     const rotateRe = new RegExp(
-      `\\(function\\s*\\(\\s*${arrOrGetter}\\s*,\\s*[A-Za-z_$][\\w$]*\\s*\\)\\s*\\{[\\s\\S]{0,1000}?(?:push|shift)[\\s\\S]{0,1000}?\\}\\s*\\(\\s*${arrOrGetter}\\s*,\\s*(0x[0-9a-fA-F]+|\\d+)\\s*\\)\\s*\\)`
+      `\\(function\\s*\\(\\s*[A-Za-z_$][\\w$]*\\s*,\\s*[A-Za-z_$][\\w$]*\\s*\\)\\s*\\{[\\s\\S]{0,1000}?(?:push|shift)[\\s\\S]{0,1000}?\\}\\s*\\(\\s*${arrOrGetter}\\s*,\\s*(0x[0-9a-fA-F]+|\\d+)\\s*\\)\\s*\\)`
     );
     const rm = rotateRe.exec(src);
     if (rm) {
