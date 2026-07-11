@@ -1691,7 +1691,21 @@ function decodeObfuscatorIo(src) {
       const decName = dm[1];
       const idxParam = dm[2];
       const keyParam = dm[3];
-      const body = dm[0];
+      // Use brace-matching to capture the full function body
+      // (regex dm[0] may be truncated by non-greedy quantifiers,
+      //  missing RC4 indicators in large decoder bodies)
+      const idx0 = dm[0].indexOf('{');
+      let body = dm[0];
+      if (idx0 !== -1) {
+        let depth = 1;
+        let end = dm.index + idx0 + 1;
+        for (let i = end; i < src.length && depth > 0; i++) {
+          if (src[i] === '{') depth++;
+          else if (src[i] === '}') depth--;
+          end = i;
+        }
+        body = src.slice(dm.index, end + 1);
+      }
 
       // Detect built-in base offset: idxParam = idxParam OP BASE
       // obfuscator.io often adds:  var idx = idx - 0xNNN;  at the start of decoders
