@@ -1603,6 +1603,21 @@ function decodeObfuscatorIo(src) {
     return { src, findings, decodedStrings };
   }
 
+  // ── Step 1b: detect getter functions wrapping string arrays ────────────
+  // obfuscator.io often wraps the string array in a zero-arg getter:
+  //   function GETTER() { const ARR = [...]; return ARR; }
+  // The decoder then calls GETTER() and indexes a LOCAL variable.
+  for (const sa of stringArrays) {
+    const getterRe = new RegExp(
+      `function\\s+([A-Za-z_$][\\w$]*)\\s*\\(\\s*\\)\\s*\\{[\\s\\S]{0,5000}?\\b(?:const|let|var)\\s+${sa.name}\\s*=\\s*\\[[\\s\\S]{0,5000}?\\breturn\\s+${sa.name}\\s*;?\\s*\\}`,
+      'g'
+    );
+    const gm = getterRe.exec(src);
+    if (gm) {
+      sa.getterName = gm[1];
+    }
+  }
+
   // ── Step 2: extract rotation IIFE ──────────────────────────────────────
   // Pattern: (function(NAME, KEY){ ...push/shift... }(NAME, 0xNNN))
   // The rotation count is 0xNNN % arr.length
@@ -1657,6 +1672,16 @@ function decodeObfuscatorIo(src) {
     while ((dm = decoderReStrict.exec(src)) !== null) decoderMatches.push(dm);
     if (decoderMatches.length === 0) {
       while ((dm = decoderReBroad.exec(src)) !== null) decoderMatches.push(dm);
+    }
+    // Tier 3: getter-based fallback — decoder indexes a local variable
+    // that was populated by calling the getter function.
+    //   function DEC(p1, p2) { ... var local = GETTER(); ... local[p1] ... }
+    if (decoderMatches.length === 0 && sa.getterName) {
+      const decoderReGetter = new RegExp(
+        `function\\s+([A-Za-z_$][\\w$]*)\\s*\\(\\s*([A-Za-z_$][\\w$]*)\\s*,\\s*([A-Za-z_$][\\w$]*)\\s*\\)\\s*\\{[\\s\\S]{0,800}?${sa.getterName}\\s*\\(\\s*\\)[\\s\\S]{0,200}?[A-Za-z_$][\\w$]*\\[\\s*\\2\\s*\\][\\s\\S]{0,800}?\\}`,
+        'g'
+      );
+      while ((dm = decoderReGetter.exec(src)) !== null) decoderMatches.push(dm);
     }
     // De-duplicate by function name
     const seenNames = new Set();
