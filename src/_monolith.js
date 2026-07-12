@@ -1578,7 +1578,7 @@ function decodeObfuscatorIo(src) {
 
   // ── Step 1: extract string-array declaration ───────────────────────────
   // Pattern: var|const|let NAME = ['s1','s2',...];  (at least 3 strings)
-  const saDeclRe = /(?:var|const|let)\s+([A-Za-z_$][\w$]*)\s*=\s*\[((?:["'][^"']*["']\s*,?\s*){3,})\]\s*;/g;
+  const saDeclRe = /(?:var|const|let)\s+([A-Za-z_$][\w$]*)\s*=\s*\[(\s*(?:["'][^"']*["']\s*,?\s*){3,})\]\s*;/g;
   let saMatch;
   const stringArrays = [];  // { name, strings, pos, endPos }
 
@@ -1783,8 +1783,21 @@ function decodeObfuscatorIo(src) {
         });
       }
 
+      // ── Step 3d: find local aliases of this decoder ─────────────────────
+      // obfuscator.io creates var ALIAS = decName inside functions, then
+      // all call sites use ALIAS instead of decName. We detect these aliases
+      // so Step 4 can match both the original and alias names.
+      const aliasRe = new RegExp(
+        `(?:var|const|let)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*${decName}\\b`,
+        'g'
+      );
+      const aliases = new Set();
+      let am;
+      while ((am = aliasRe.exec(src)) !== null) aliases.add(am[1]);
+
       // ── Step 4: find all calls to this decoder with constant args ──────
       // Supports direct calls, .call(), .apply(), and indirect (0, fn)() patterns
+      // Includes any local aliases detected above.
       const callPatterns = [
         // Direct: decName(0x123, 'key') or decName(-0x1a7, 'key')
         `\\b${decName}\\s*\\(\\s*(-?0x[0-9a-fA-F]+|-?\\d+)\\s*,\\s*["']([^"']*)["']\\s*\\)`,
@@ -1795,6 +1808,14 @@ function decodeObfuscatorIo(src) {
         // Indirect: (0, decName)(0x123, 'key')
         `\\(\\s*0\\s*,\\s*${decName}\\s*\\)\\s*\\(\\s*(-?0x[0-9a-fA-F]+|-?\\d+)\\s*,\\s*["']([^"']*)["']\\s*\\)`,
       ];
+      for (const alias of aliases) {
+        callPatterns.push(
+          `\\b${alias}\\s*\\(\\s*(-?0x[0-9a-fA-F]+|-?\\d+)\\s*,\\s*["']([^"']*)["']\\s*\\)`,
+          `\\b${alias}\\.call\\s*\\(\\s*(?:this|null|undefined)\\s*,\\s*(-?0x[0-9a-fA-F]+|-?\\d+)\\s*,\\s*["']([^"']*)["']\\s*\\)`,
+          `\\b${alias}\\.apply\\s*\\(\\s*(?:this|null|undefined)\\s*,\\s*\\[(-?0x[0-9a-fA-F]+|-?\\d+)\\s*,\\s*["']([^"']*)["']\\s*\\]\\s*\\)`,
+          `\\(\\s*0\\s*,\\s*${alias}\\s*\\)\\s*\\(\\s*(-?0x[0-9a-fA-F]+|-?\\d+)\\s*,\\s*["']([^"']*)["']\\s*\\)`
+        );
+      }
       let replacedCount = 0;
       for (const callPattern of callPatterns) {
         const callRe = new RegExp(callPattern, 'g');

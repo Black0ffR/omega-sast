@@ -902,6 +902,84 @@ section('1.3h Source map dedup: at most 2 findings per leak');
 })();
 
 // ═════════════════════════════════════════════════════════════════════════
+//  ISSUE 1.3i — Local alias tracking for decoder calls
+//  var ALIAS = D; ALIAS(0x100, 'k') should inline like D(0x100, 'k')
+// ═════════════════════════════════════════════════════════════════════════
+section('1.3i Local alias tracking: alias calls are inlined');
+
+(function () {
+  const dir = mkTmpDir();
+  const src = `var sa = ['api','user','admin'];
+function D(i,k){return sa[i]}
+var a = D, b = D;
+var x = a(0x100, 'k');
+var y = b(0x102, 'k');`;
+  const file = path.join(dir, 'alias-decoder.js');
+  fs.writeFileSync(file, src);
+  const out = mkTmpDir();
+  runOmega([file, '--security', '--report', '--verbose', '--out', out]);
+  const decodedPath = path.join(out, fs.readdirSync(out).find(f => f.endsWith('.decoded.js')) || '');
+  const decodedSrc = decodedPath ? fs.readFileSync(decodedPath, 'utf8') : '';
+  assert('Alias call a(0x100) inlines to "api"',
+    decodedSrc.includes("'api'"),
+    `missing 'api': ${decodedSrc.slice(0, 300)}`);
+  assert('Alias call b(0x102) inlines to "admin"',
+    decodedSrc.includes("'admin'"),
+    `missing 'admin': ${decodedSrc.slice(0, 300)}`);
+})();
+
+// ═════════════════════════════════════════════════════════════════════════
+//  ISSUE 1.3j — Multi-line string array declaration
+//  var x = [\n  'a',\n  'b',\n  'c'\n]; should extract 3 strings
+// ═════════════════════════════════════════════════════════════════════════
+section('1.3j Multi-line string array declaration');
+
+(function () {
+  const dir = mkTmpDir();
+  const src = "var sa = [\n  'hello',\n  'world',\n  'test'\n];\n" +
+    "function D(i,k){return sa[i]}\n" +
+    "var x = D(0, 'k');";
+  const file = path.join(dir, 'multiline-sa.js');
+  fs.writeFileSync(file, src);
+  const out = mkTmpDir();
+  runOmega([file, '--security', '--report', '--verbose', '--out', out]);
+  const decodedPath = path.join(out, fs.readdirSync(out).find(f => f.endsWith('.decoded.js')) || '');
+  const decodedSrc = decodedPath ? fs.readFileSync(decodedPath, 'utf8') : '';
+  assert('Multi-line string array: D(0) inlines to "hello"',
+    decodedSrc.includes("'hello'"),
+    `missing 'hello': ${decodedSrc.slice(0, 300)}`);
+})();
+
+// ═════════════════════════════════════════════════════════════════════════
+//  ISSUE 1.3k — Inline data: source map detection
+//  //# sourceMappingURL=data:application/json;base64,... should be detected
+// ═════════════════════════════════════════════════════════════════════════
+section('1.3k Inline data: source map detection');
+
+(function () {
+  const b64 = Buffer.from(
+    JSON.stringify({version:3,sources:['src/app.js'],mappings:'AAAA'})
+  ).toString('base64');
+  const dir = mkTmpDir();
+  const src = `var x = 1;\n//# sourceMappingURL=data:application/json;base64,${b64}\n`;
+  const file = path.join(dir, 'inline-map.js');
+  fs.writeFileSync(file, src);
+  const out = mkTmpDir();
+  runOmega([file, '--security', '--report', '--quiet', '--out', out]);
+  const r = readReport(out);
+  const findings = allFindings(r);
+  const inlineFindings = findings.filter(f => f.id === 'sourcemap-inline-decoded');
+  assert('Inline source map is decoded (sourcemap-inline-decoded found)',
+    inlineFindings.length > 0,
+    `got ${inlineFindings.length} inline findings`);
+  if (inlineFindings.length > 0) {
+    assert('Inline source map reports source count > 0',
+      inlineFindings[0].value.includes('1 source file'),
+      `val: ${inlineFindings[0].value}`);
+  }
+})();
+
+// ═════════════════════════════════════════════════════════════════════════
 //  Summary
 // ═════════════════════════════════════════════════════════════════════════
 console.log(`\n${'═'.repeat(70)}`);
