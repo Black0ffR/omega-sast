@@ -1624,9 +1624,11 @@ function decodeObfuscatorIo(src) {
 
   // ── Step 2: extract rotation IIFE ──────────────────────────────────────
   // Pattern: (function(NAME, KEY){ ...push/shift... }(NAME, 0xNNN))
-  // The rotation count is 0xNNN % arr.length
+  // The initial rotation estimate is 0xNNN % arr.length, but the actual
+  // effective rotation depends on a self-referencing computation inside the
+  // IIFE that can change as the array rotates. We defer final rotation to
+  // after decoder inlining (see Step 4f).
   for (const sa of stringArrays) {
-    // The rotation IIFE may pass either the array name or the getter function name
     const arrOrGetter = sa.getterName ? `(?:${sa.name}|${sa.getterName})` : sa.name;
     const rotateRe = new RegExp(
       `\\(function\\s*\\(\\s*[A-Za-z_$][\\w$]*\\s*,\\s*[A-Za-z_$][\\w$]*\\s*\\)\\s*\\{[\\s\\S]{0,1000}?(?:push|shift)[\\s\\S]{0,1000}?\\}\\s*\\(\\s*${arrOrGetter}\\s*,\\s*(0x[0-9a-fA-F]+|\\d+)\\s*\\)\\s*\\)`
@@ -1634,18 +1636,18 @@ function decodeObfuscatorIo(src) {
     const rm = rotateRe.exec(src);
     if (rm) {
       const rotateCount = parseInt(rm[1], rm[1].startsWith('0x') ? 16 : 10);
-      const effective = rotateCount % sa.strings.length;
-      // Apply rotation: push then shift, N times. This moves the first element
-      // to the end N times, equivalent to slicing at N.
-      sa.strings = sa.strings.slice(effective).concat(sa.strings.slice(0, effective));
+      const initialEffective = rotateCount % sa.strings.length;
+      sa.rotationKey = rotateCount;
+      // Apply initial estimate as starting point; will be corrected in Step 4f
+      sa.strings = sa.strings.slice(initialEffective).concat(sa.strings.slice(0, initialEffective));
       sa.rotated = true;
       findings.push({
         id: 'obfuscator-io-rotation',
         category: 'Obfuscator.io Decoder',
         severity: 'info',
-        value: `rotated ${sa.name} by ${effective} (key=${rotateCount})`,
+        value: `rotated ${sa.name} by ${initialEffective} (key=${rotateCount})`,
         context: `array of ${sa.strings.length} strings`,
-        description: `Applied obfuscator.io string-array rotation: ${effective} positions`,
+        description: `Applied obfuscator.io string-array rotation: ${initialEffective} positions`,
       });
     }
   }
@@ -1713,6 +1715,59 @@ function decodeObfuscatorIo(src) {
         body = src.slice(dm.index, end + 1);
       }
 
+      // ── Step 3e: correct rotation by evaluating the IIFE ──────────────
+      // The rotation IIFE's while loop uses a computation that depends on
+      // decoder results which change as the array rotates. Simple key%length
+      // gives the wrong offset. We extract the IIFE, getter, and decoder,
+      // evaluate them in a sandbox, and capture the actual rotated array.
+      const rotEvalKey = `${sa.name}_${sa.getterName || ''}`;
+      if (sa.rotated && sa.getterName && !decodeObfuscatorIo._rotEvaled?.has(rotEvalKey)) {
+        (decodeObfuscatorIo._rotEvaled ??= new Set()).add(rotEvalKey);
+        try {
+          const getterRe = new RegExp(
+            `function\\s+${sa.getterName}\\s*\\(\\s*\\)\\s*\\{[\\s\\S]{0,2000}?${sa.name}\\s*=\\s*\\[[^\\]]+\\][\\s\\S]{0,2000}?\\}`,
+            'g'
+          );
+          const gm2 = getterRe.exec(src);
+          if (gm2) {
+            const brace = gm2[0].indexOf('{');
+            let gDepth = 1, gEnd = gm2.index + brace + 1;
+            for (let i = gEnd; i < src.length && gDepth > 0; i++) {
+              if (src[i] === '{') gDepth++;
+              else if (src[i] === '}') gDepth--;
+              gEnd = i;
+            }
+            const getterBody = src.slice(gm2.index, gEnd + 1);
+            const decoderBody = body;
+            const rotRe2 = new RegExp(
+              `\\(function\\s*\\(\\s*[A-Za-z_$][\\w$]*\\s*,\\s*[A-Za-z_$][\\w$]*\\s*\\)\\s*\\{[\\s\\S]{0,2000}?(?:push|shift)[\\s\\S]{0,2000}?\\}\\s*\\(\\s*${sa.getterName}\\s*,\\s*(?:0x[0-9a-fA-F]+|\\d+)\\s*\\)\\s*\\)`
+            );
+            const rm2 = rotRe2.exec(src);
+            if (rm2) {
+              const sandboxSrc = `"use strict";${getterBody}${decoderBody}${rm2[0]};JSON.stringify(${sa.getterName}())`;
+              const vm = require('vm');
+              const script = new vm.Script(sandboxSrc, { timeout: 5000 });
+              const rotatedJson = script.runInNewContext({ parseInt: parseInt, String: String, Array: Array, JSON: JSON }, { timeout: 5000 });
+              const rotatedArr = JSON.parse(rotatedJson);
+              if (Array.isArray(rotatedArr) && rotatedArr.length === sa.strings.length) {
+                sa.strings = rotatedArr;
+                // Update the rotation finding with corrected value
+                const correctedBy = [...rotatedArr].reduce((idx, v, i) =>
+                  v !== sa.strings[i] ? (idx === -1 ? i : idx) : idx, -1
+                );
+                for (const f of findings) {
+                  if (f.id === 'obfuscator-io-rotation' && f.value.includes(sa.name)) {
+                    f.value = `rotated ${sa.name} (sandbox-evaluated, ${sa.strings[0].slice(0, 8)}…)`;
+                    f.description = `Corrected rotation via IIFE evaluation`;
+                    break;
+                  }
+                }
+              }
+            }
+          }
+        } catch (_) { /* fall back to initial rotation estimate */ }
+      }
+
       // Detect built-in base offset: idxParam = idxParam OP BASE
       // obfuscator.io often adds:  var idx = idx - 0xNNN;  at the start of decoders
       let baseOffset = 0;
@@ -1724,7 +1779,9 @@ function decodeObfuscatorIo(src) {
       }
 
       // Determine decoder type
-      const isRC4 = /charCodeAt[\s\S]{0,200}fromCharCode/.test(body) && body.includes(keyParam);
+      const hasCA = body.includes('charCodeAt');
+      const hasFC = body.includes('fromCharCode');
+      const isRC4 = hasCA && hasFC && body.includes(keyParam);
       const isBase64 = /atob\s*\(/.test(body) && !isRC4;
       const isPlain = !isRC4 && !isBase64;  // just array indexing, no transform
 
@@ -1788,12 +1845,16 @@ function decodeObfuscatorIo(src) {
       // all call sites use ALIAS instead of decName. We detect these aliases
       // so Step 4 can match both the original and alias names.
       const aliasRe = new RegExp(
-        `(?:var|const|let)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*${decName}\\b`,
+        `(?:,\\s*|(?:var|const|let)\\s+)([A-Za-z_$][\\w$]*)\\s*=\\s*${decName}\\b`,
         'g'
       );
       const aliases = new Set();
       let am;
-      while ((am = aliasRe.exec(src)) !== null) aliases.add(am[1]);
+      while ((am = aliasRe.exec(src)) !== null) {
+        const nextCh = src[am.index + am[0].length];
+        if (nextCh === '[' || nextCh === '.') continue;
+        aliases.add(am[1]);
+      }
 
       // ── Step 4: find all calls to this decoder with constant args ──────
       // Supports direct calls, .call(), .apply(), and indirect (0, fn)() patterns
@@ -1855,6 +1916,91 @@ function decodeObfuscatorIo(src) {
         });
       }
 
+      // ── Step 4e: resolve decoder calls through argument objects ────────
+      // obfuscator.io --string-array-calls-transform wraps args in object
+      // property lookups instead of direct constants:
+      //   var OBJ = {_0x1234: 0x17b, _0x5678: 'GGl7', ...};
+      //   ALIAS(OBJ._0x1234, OBJ._0x5678);
+      // We resolve OBJ.PROP → literal value before decoding.
+      const argObjRe = /(?:var|const|let)\s+([A-Za-z_$][\w$]*)\s*=\s*\{([^}]+)\}/g;
+      const argObjMap = {};
+      let aom;
+      while ((aom = argObjRe.exec(src)) !== null) {
+        const propsStr = aom[2];
+        const propMap = {};
+        const propRe = /([A-Za-z_$][\w$]*)\s*:\s*(-?0x[0-9a-fA-F]+|-?\d+|["'][^"']*["'])/g;
+        let pm;
+        while ((pm = propRe.exec(propsStr)) !== null) {
+          propMap[pm[1]] = pm[2];
+        }
+        const vals = Object.values(propMap);
+        const hasHexIdx = vals.some(v => /^-?0x[0-9a-fA-F]+$/.test(v));
+        const hasStrKey = vals.some(v => /^["'][^"']+["']$/.test(v));
+        if (hasHexIdx && hasStrKey) {
+          argObjMap[aom[1]] = propMap;
+        }
+      }
+      // Helper: attempt to decode and replace a decoder call
+      const tryDecodeAndReplace = (full, idx, key) => {
+        const adjustedIdx = idx - baseOffset;
+        if (adjustedIdx < 0 || adjustedIdx >= sa.strings.length) return full;
+        let decoded;
+        try {
+          const raw = sa.strings[adjustedIdx];
+          if (isPlain) decoded = raw;
+          else if (isBase64) decoded = Buffer.from(raw, 'base64').toString('utf8');
+          else if (isRC4) decoded = rc4Decrypt(raw, key);
+        } catch (_) { return full; }
+        if (typeof decoded !== 'string') return full;
+        if (!/^[\x20-\x7e\s]*$/.test(decoded)) return full;
+        const escaped = decoded.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n').replace(/\r/g, '\\r');
+        replacedCount++;
+        decodedStrings.push({ call: full, decoded, idx: adjustedIdx, key: isRC4 ? key : null });
+        return `'${escaped}'`;
+      };
+      const allNames = [decName, ...aliases];
+      for (const name of allNames) {
+        // Pattern 1: NAME(OBJ.PROP, OBJ.PROP) — both args via object lookup
+        const objPropRe = new RegExp(
+          `\\b${name}\\s*\\(\\s*([A-Za-z_$][\\w$]*)\\.([A-Za-z_$][\\w$]*)\\s*,\\s*\\1\\.([A-Za-z_$][\\w$]*)\\s*\\)`,
+          'g'
+        );
+        src = src.replace(objPropRe, (full, objName, prop1, prop2) => {
+          const objDef = argObjMap[objName];
+          if (!objDef || !objDef[prop1] || !objDef[prop2]) return full;
+          const idxStr = objDef[prop1];
+          const keyRaw = objDef[prop2];
+          const idx = parseInt(idxStr, idxStr.startsWith('0x') || idxStr.startsWith('-0x') ? 16 : 10);
+          const key = keyRaw.replace(/^["']|["']$/g, '');
+          return tryDecodeAndReplace(full, idx, key);
+        });
+        // Pattern 2: NAME(OBJ.PROP, 'string') — idx via OBJ, key is direct
+        const mixPropIdxRe = new RegExp(
+          `\\b${name}\\s*\\(\\s*([A-Za-z_$][\\w$]*)\\.([A-Za-z_$][\\w$]*)\\s*,\\s*["']([^"']*)["']\\s*\\)`,
+          'g'
+        );
+        src = src.replace(mixPropIdxRe, (full, objName, prop1, key) => {
+          const objDef = argObjMap[objName];
+          if (!objDef || !objDef[prop1]) return full;
+          const idxStr = objDef[prop1];
+          const idx = parseInt(idxStr, idxStr.startsWith('0x') || idxStr.startsWith('-0x') ? 16 : 10);
+          return tryDecodeAndReplace(full, idx, key);
+        });
+        // Pattern 3: NAME(0xNNN, OBJ.PROP) — idx is direct, key via OBJ
+        const mixPropKeyRe = new RegExp(
+          `\\b${name}\\s*\\(\\s*(-?0x[0-9a-fA-F]+|-?\\d+)\\s*,\\s*([A-Za-z_$][\\w$]*)\\.([A-Za-z_$][\\w$]*)\\s*\\)`,
+          'g'
+        );
+        src = src.replace(mixPropKeyRe, (full, idxStr, objName, prop2) => {
+          const objDef = argObjMap[objName];
+          if (!objDef || !objDef[prop2]) return full;
+          const keyRaw = objDef[prop2];
+          const idx = parseInt(idxStr, idxStr.startsWith('0x') || idxStr.startsWith('-0x') ? 16 : 10);
+          const key = keyRaw.replace(/^["']|["']$/g, '');
+          return tryDecodeAndReplace(full, idx, key);
+        });
+      }
+
       if (replacedCount > 0) {
         findings.push({
           id: 'obfuscator-io-decoded',
@@ -1873,16 +2019,36 @@ function decodeObfuscatorIo(src) {
 
 // ── RC4 decryption helper (obfuscator.io-compatible) ────────────────────
 // obfuscator.io's RC4 variant: key-scheduling + XOR stream cipher
-// Input: ciphertext (base64-decoded), key (string)
-// Output: plaintext string
+// Uses the obfuscator.io custom base64 alphabet (lowercase-first) and
+// a character-by-character base64 decoder that matches how the real
+// decoder processes strings (no fixed block padding).
+const OBF_ALPHABET = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/=';
 function rc4Decrypt(ciphertext, key) {
-  // obfuscator.io sometimes base64-encodes the ciphertext before RC4
-  let data;
-  try {
-    data = Buffer.from(ciphertext, 'base64');
-  } catch (_) {
-    data = Buffer.from(ciphertext, 'binary');
+  // Character-by-character base64 decode (obfuscator.io compatible)
+  const OBF_ALPHABET = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/=';
+  let rawBytes = '';
+  let buffer = 0;
+  let bits = 0;
+  for (let i = 0; i < ciphertext.length; i++) {
+    const idx = OBF_ALPHABET.indexOf(ciphertext[i]);
+    if (idx === -1) continue;
+    buffer = (buffer << 6) | idx;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      rawBytes += String.fromCharCode((buffer >> bits) & 0xFF);
+      buffer &= (1 << bits) - 1;
+    }
   }
+  // obfuscator.io percent-encodes the raw bytes then calls decodeURIComponent
+  // which collapses multi-byte UTF-8 sequences into single characters.
+  // This changes the effective length of the string fed to RC4 XOR.
+  let uriStr = '';
+  for (let i = 0; i < rawBytes.length; i++) {
+    const code = rawBytes.charCodeAt(i);
+    uriStr += '%' + (code < 16 ? '0' : '') + code.toString(16);
+  }
+  const decodedStr = decodeURIComponent(uriStr);
   // Key scheduling
   const s = [];
   for (let i = 0; i < 256; i++) s[i] = i;
@@ -1893,15 +2059,15 @@ function rc4Decrypt(ciphertext, key) {
   }
   // Stream generation + XOR
   let i = 0; j = 0;
-  const out = [];
-  for (let n = 0; n < data.length; n++) {
+  let result = '';
+  for (let n = 0; n < decodedStr.length; n++) {
     i = (i + 1) & 0xFF;
     j = (j + s[i]) & 0xFF;
     const tmp = s[i]; s[i] = s[j]; s[j] = tmp;
     const k = s[(s[i] + s[j]) & 0xFF];
-    out.push(data[n] ^ k);
+    result += String.fromCharCode(decodedStr.charCodeAt(n) ^ k);
   }
-  return Buffer.from(out).toString('utf8');
+  return result;
 }
 
 
