@@ -430,6 +430,43 @@ var _0x1b2c = _0xdec(0x13, 'x');
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+section('12. obfuscator.io sandbox eval rotation correction');
+{
+  // Build a bundle where the rotation IIFE uses decoder calls to determine
+  // rotation, producing a DIFFERENT result than the naive key % length estimate.
+  // key=0x5 (5), length=5 → naive: 5%5=0 (no rotation)
+  // actual: sum of parseInt(arr[0]) ≥ 5 after 4 iterations → rotates by 4
+  const src = `
+function _0xget(){var _0xarr=['3','1','4','1','5'];return _0xarr}
+(function(g,k){var a=g();var d=function(i){return a[i]};while(!![]){try{var c=parseInt(d(0),10);if(c===k)break;a.push(a.shift())}catch(_){a.push(a.shift());break}}_0xget=function(){return a}}(_0xget,0x5));
+function _0xdec(_0xidx,_0xkey){var _0xlocal=_0xget();return _0xlocal[_0xidx]}
+var a=_0xdec(0x0,'x');
+var b=_0xdec(0x1,'x');
+  `.trim();
+  const result = decodeObfuscatorIo(src);
+  assert('sandbox-evaluated rotation finding emitted',
+    result.findings.some(f => f.id === 'obfuscator-io-rotation' && f.value.includes('sandbox-evaluated')),
+    `rotation: ${result.findings.filter(f=>f.id==='obfuscator-io-rotation').map(f=>f.value+ ' | ' + f.description).join('; ')}`);
+  assert('sandbox-evaluated: 2 strings decoded',
+    result.decodedStrings.length === 2,
+    `decoded count: ${result.decodedStrings.length}`);
+  // After decoder-dependent rotation by 4:
+  //   arr = ['5', '3', '1', '4', '1'] (not the naive ['3','1','4','1','5'])
+  //   _0xdec(0x0) = arr[0] = '5'
+  //   _0xdec(0x1) = arr[1] = '3'
+  assert('sandbox-evaluated: decoded[0] = "5" (not "3" from naive rotation)',
+    result.decodedStrings[0] && result.decodedStrings[0].decoded === '5',
+    `decoded[0]=${result.decodedStrings[0] && result.decodedStrings[0].decoded}`);
+  assert('sandbox-evaluated: decoded[1] = "3"',
+    result.decodedStrings[1] && result.decodedStrings[1].decoded === '3',
+    `decoded[1]=${result.decodedStrings[1] && result.decodedStrings[1].decoded}`);
+  // Verify source was rewritten with decoded values
+  assert('sandbox-evaluated: source contains decoded literals',
+    /'5'/.test(result.src) && /'3'/.test(result.src),
+    `src: ${result.src.slice(0, 500)}`);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 console.log(`\n${'═'.repeat(60)}`);
 console.log(`  TOTAL: ${total}   PASSED: ${passed}   FAILED: ${failed}`);
 console.log(`${'═'.repeat(60)}`);

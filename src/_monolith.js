@@ -1576,6 +1576,35 @@ function decodeObfuscatorIo(src) {
   const findings = [];
   const decodedStrings = [];
 
+  // Brace-matching helper: walks from startPos, tracking {/} with string/regex awareness.
+  // Returns position of matching } or src.length-1 if unbalanced.
+  function _findMatchingBrace(str, startPos) {
+    let depth = 1;
+    let i = startPos;
+    const len = str.length;
+    while (i < len && depth > 0) {
+      const ch = str[i];
+      // Skip escape sequences in strings and regexes
+      if (ch === '\\') { i += 2; continue; }
+      // Handle string literals — ignore braces inside them
+      if (ch === "'" || ch === '"' || ch === '`') {
+        const quote = ch;
+        i++;
+        while (i < len) {
+          if (str[i] === '\\') { i += 2; continue; }
+          if (str[i] === quote) break;
+          i++;
+        }
+      } else if (ch === '{') {
+        depth++;
+      } else if (ch === '}') {
+        depth--;
+      }
+      i++;
+    }
+    return i - 1;
+  }
+
   // ── Step 1: extract string-array declaration ───────────────────────────
   // Pattern: var|const|let NAME = ['s1','s2',...];  (at least 3 strings)
   const saDeclRe = /(?:var|const|let)\s+([A-Za-z_$][\w$]*)\s*=\s*\[(\s*(?:["'][^"']*["']\s*,?\s*){3,})\]\s*;/g;
@@ -1631,7 +1660,7 @@ function decodeObfuscatorIo(src) {
   for (const sa of stringArrays) {
     const arrOrGetter = sa.getterName ? `(?:${sa.name}|${sa.getterName})` : sa.name;
     const rotateRe = new RegExp(
-      `\\(function\\s*\\(\\s*[A-Za-z_$][\\w$]*\\s*,\\s*[A-Za-z_$][\\w$]*\\s*\\)\\s*\\{[\\s\\S]{0,1000}?(?:push|shift)[\\s\\S]{0,1000}?\\}\\s*\\(\\s*${arrOrGetter}\\s*,\\s*(0x[0-9a-fA-F]+|\\d+)\\s*\\)\\s*\\)`
+      `\\(function\\s*\\(\\s*[A-Za-z_$][\\w$]*\\s*,\\s*[A-Za-z_$][\\w$]*\\s*\\)\\s*\\{[\\s\\S]*?(?:push|shift)[\\s\\S]*?\\}\\s*\\(\\s*${arrOrGetter}\\s*,\\s*(0x[0-9a-fA-F]+|\\d+)\\s*\\)\\s*\\)`
     );
     const rm = rotateRe.exec(src);
     if (rm) {
@@ -1705,13 +1734,7 @@ function decodeObfuscatorIo(src) {
       const idx0 = dm[0].indexOf('{');
       let body = dm[0];
       if (idx0 !== -1) {
-        let depth = 1;
-        let end = dm.index + idx0 + 1;
-        for (let i = end; i < src.length && depth > 0; i++) {
-          if (src[i] === '{') depth++;
-          else if (src[i] === '}') depth--;
-          end = i;
-        }
+        const end = _findMatchingBrace(src, dm.index + idx0 + 1);
         body = src.slice(dm.index, end + 1);
       }
 
@@ -1725,22 +1748,17 @@ function decodeObfuscatorIo(src) {
         (decodeObfuscatorIo._rotEvaled ??= new Set()).add(rotEvalKey);
         try {
           const getterRe = new RegExp(
-            `function\\s+${sa.getterName}\\s*\\(\\s*\\)\\s*\\{[\\s\\S]{0,2000}?${sa.name}\\s*=\\s*\\[[^\\]]+\\][\\s\\S]{0,2000}?\\}`,
+            `function\\s+${sa.getterName}\\s*\\(\\s*\\)\\s*\\{[\\s\\S]{0,10000}?${sa.name}\\s*=\\s*\\[[^\\]]+\\][\\s\\S]{0,10000}?\\}`,
             'g'
           );
           const gm2 = getterRe.exec(src);
           if (gm2) {
-            const brace = gm2[0].indexOf('{');
-            let gDepth = 1, gEnd = gm2.index + brace + 1;
-            for (let i = gEnd; i < src.length && gDepth > 0; i++) {
-              if (src[i] === '{') gDepth++;
-              else if (src[i] === '}') gDepth--;
-              gEnd = i;
-            }
+            const bb = gm2[0].indexOf('{');
+            const gEnd = _findMatchingBrace(src, gm2.index + bb + 1);
             const getterBody = src.slice(gm2.index, gEnd + 1);
             const decoderBody = body;
             const rotRe2 = new RegExp(
-              `\\(function\\s*\\(\\s*[A-Za-z_$][\\w$]*\\s*,\\s*[A-Za-z_$][\\w$]*\\s*\\)\\s*\\{[\\s\\S]{0,2000}?(?:push|shift)[\\s\\S]{0,2000}?\\}\\s*\\(\\s*${sa.getterName}\\s*,\\s*(?:0x[0-9a-fA-F]+|\\d+)\\s*\\)\\s*\\)`
+              `\\(function\\s*\\(\\s*[A-Za-z_$][\\w$]*\\s*,\\s*[A-Za-z_$][\\w$]*\\s*\\)\\s*\\{[\\s\\S]*?(?:push|shift)[\\s\\S]*?\\}\\s*\\(\\s*${sa.getterName}\\s*,\\s*(?:0x[0-9a-fA-F]+|\\d+)\\s*\\)\\s*\\)`
             );
             const rm2 = rotRe2.exec(src);
             if (rm2) {
@@ -1765,7 +1783,17 @@ function decodeObfuscatorIo(src) {
               }
             }
           }
-        } catch (_) { /* fall back to initial rotation estimate */ }
+        } catch (e) {
+          if (e?.message) {
+            const short = e.message.slice(0, 200);
+            for (const f of findings) {
+              if (f.id === 'obfuscator-io-rotation' && f.value.includes(sa.name)) {
+                f.description = `Sandbox eval failed: ${short}. Using static estimate.`;
+                break;
+              }
+            }
+          }
+        }
       }
 
       // Detect built-in base offset: idxParam = idxParam OP BASE
