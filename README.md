@@ -1,6 +1,6 @@
 # OMEGA-5.0 — Zero-Dependency JavaScript SAST Engine
 
-[![Test Suite](https://img.shields.io/badge/tests-414%20passing-brightgreen)](test/)
+[![Test Suite](https://img.shields.io/badge/tests-571%20passing-brightgreen)](test/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D14.0.0-green)](package.json)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-success)](package.json)
@@ -31,7 +31,7 @@ OMEGA-5.0 analyzes a JavaScript bundle in 20 phases:
 | 1 | Escape decode | Unicode/hex/octal/HTML-entity |
 | 2 | String decode | fromCharCode, atob, base64, hex arrays (10-pass) |
 | 2b | CharCode decoder | Juice-Shop-style IIFE obfuscation |
-| 2c | obfuscator.io decoder | String-array rotation + RC4/base64 |
+| 2c | obfuscator.io decoder | String-array rotation + RC4/base64 + brute-force fallback |
 | 2d | Constant evaluator | Safe partial evaluator for runtime strings |
 | 3-6 | Normalization | Booleans, webpack cleanup, Angular Ivy, RxJS |
 | 7 | Beautifier | Token-based formatter (arrow-safe) |
@@ -41,6 +41,7 @@ OMEGA-5.0 analyzes a JavaScript bundle in 20 phases:
 | 12 | Security patterns | XSS, injection, crypto, network, storage |
 | 12b-m | Behavioral detectors | Dynamic code, business logic, WebSocket, IDOR, CVEs |
 | 12o-p | Modern scanners | JWT/WebCrypto/Node crypto, network surface |
+| 12r | ReDoS detection | In-source ReDoS vulnerable pattern scan |
 | 12q | Source map parser | Inline/external map detection |
 | 13-14 | Webpack + call graph | Module resolution, dependency edges |
 | 14c | AST taint tracker | SSA-based cross-statement taint |
@@ -54,7 +55,7 @@ OMEGA-5.0 analyzes a JavaScript bundle in 20 phases:
 ## Key Features
 
 ### Inter-Procedural Taint Tracking
-Tracks data flow from taint sources (`location.hash`, `localStorage`, `event.data`) through function boundaries to dangerous sinks (`innerHTML`, `eval`). Uses per-function SSA-style variable tracking with destructuring support.
+Tracks data flow from taint sources (`location.hash`, `localStorage`, `event.data`) through function boundaries to dangerous sinks (`innerHTML`, `eval`, `exec`, `spawn`, `fork`). Uses per-function SSA-style variable tracking with destructuring support.
 
 ### Obfuscator Fingerprinting
 Detects 6 obfuscator types (obfuscator.io, Jscrambler, ByteHide, JSProtect, JSFuck, generic) with confidence scoring. Emits LLM-actionable metadata: "expect mangled identifiers", "expect control-flow flattening", etc.
@@ -149,6 +150,9 @@ omega-sast/
 │   ├── test-charcode.js      # CharCode decoder tests (15)
 │   ├── test-redos.js         # ReDoS protection tests (10)
 │   ├── test-arrow-functions.js # Arrow function tests (19)
+│   ├── test-corpus.js          # Bundle corpus regression (51)
+│   ├── test-getter-function-detection.js # Getter detection (15)
+│   ├── test-verification-issues.js # FP-fix + RC4 + cmd-injection tests (73)
 │   └── fixtures/
 │       └── sample-bundle.js  # Test fixture
 ├── docs/
@@ -165,7 +169,7 @@ omega-sast/
 ## Test Suite
 
 ```bash
-# Run all 414 tests
+# Run all 571 tests
 npm test
 
 # Run individual suites
@@ -188,7 +192,7 @@ npm run test:obfuscator
 
 ## Supported Obfuscators
 
-- **obfuscator.io** — string-array rotation, RC4/base64 decoder, control-flow flattening
+- **obfuscator.io** — string-array rotation, RC4/base64 decoder (sandbox eval + brute-force rotation fallback), control-flow flattening
 - **Jscrambler** — chained atob/charCode decoder, OC* globals, date anti-debug
 - **ByteHide** — namespace detection, XOR decryptor
 - **JSProtect** — eval(CryptoJS.decrypt(...))
@@ -200,6 +204,7 @@ npm run test:obfuscator
 - **Intra-procedural taint**: The SSA tracker handles local variable propagation and destructuring, but cross-function flows rely on the backward slicer's hop-based traversal (max 3 hops by default).
 - **No runtime evaluation**: The constant evaluator handles a strict subset (arithmetic, atob, charCodeAt, concat). No user functions, no Proxy, no eval.
 - **Static CVE list**: The dependency scanner uses a curated snapshot (30 packages). For production use, pair with `npm audit` or OSV.dev.
+- **Command injection**: Covered via both pattern matching (`child_process`, `cp`, `shell` prefixes and bare `exec`/`spawn`/`fork` with `require("child_process")` context guard) and taint tracking (sinks include `exec`, `spawn`, `fork`). Covers destructured imports and dynamic require patterns.
 
 ## License
 
