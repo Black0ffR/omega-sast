@@ -1002,6 +1002,13 @@ function detectFrameworksAST(src, structuralIndex) {
       reactHits++;
     }
   }
+  // Also check for production React bundles using the source string directly
+  if (reactHits === 0 && src && (
+    src.includes('__SECRET_INTERNALS_DO_NOT_USE_OR_YOU_WILL_BE_FIRED') ||
+    src.includes('"react-dom"') || src.includes("'react-dom'")
+  )) {
+    reactHits = 10;
+  }
   // Conservative component count: every 2 createElement callsites ≈ 1 component
   findings.react.components = Math.max(0, Math.floor(reactHits / 2));
   findings.react.total = reactHits;
@@ -1858,7 +1865,7 @@ function scanModernCrypto(src, structuralIndex) {
   const BCRYPT_LITERAL_RE = /bcrypt\.(?:compare|compareSync|hash|hashSync)\s*\(\s*[^,]+,\s*["'](\$2[aby]\$\d{2}\$[./A-Za-z0-9]{40,70})["']/g;
   while ((m = BCRYPT_LITERAL_RE.exec(src)) !== null) {
     findings.push({
-      id:'crypto-bcrypt-literal', category:'Broken Crypto', severity:'critical',
+      id:'crypto-bcrypt-literal', category:'Hardcoded Credential', severity:'high',
       value: m[1], context: ctx(m.index),
       description: 'bcrypt called with literal hash — password comparison hardcoded in bundle',
     });
@@ -1868,7 +1875,7 @@ function scanModernCrypto(src, structuralIndex) {
   const ARGON2_LITERAL_RE = /argon2\.(?:verify|hash|verifyAsync)\s*\(\s*[^,]+,\s*["'](\$argon2[id]+\$[^"']{20,})["']/g;
   while ((m = ARGON2_LITERAL_RE.exec(src)) !== null) {
     findings.push({
-      id:'crypto-argon2-literal', category:'Broken Crypto', severity:'critical',
+      id:'crypto-argon2-literal', category:'Hardcoded Credential', severity:'high',
       value: m[1], context: ctx(m.index),
       description: 'argon2 verify called with literal hash — password comparison hardcoded in bundle',
     });
@@ -2697,13 +2704,18 @@ const SOURCE_PATTERNS_FN = [
 // Known sink patterns (for function-body scanning)
 const SINK_PATTERNS_FN = [
   { re: /\.innerHTML\s*=/g,                          name: 'innerHTML',        cwe: 'CWE-79', sev: 'critical' },
+  { re: /\[["']innerHTML["']\]\s*=/g,                name: 'innerHTML',        cwe: 'CWE-79', sev: 'critical' },
   { re: /\.outerHTML\s*=/g,                          name: 'outerHTML',        cwe: 'CWE-79', sev: 'critical' },
+  { re: /\[["']outerHTML["']\]\s*=/g,                name: 'outerHTML',        cwe: 'CWE-79', sev: 'critical' },
   { re: /\.insertAdjacentHTML\s*\(/g,                name: 'insertAdjacentHTML', cwe: 'CWE-79', sev: 'critical' },
+  { re: /\[["']insertAdjacentHTML["']\]\s*\(/g,      name: 'insertAdjacentHTML', cwe: 'CWE-79', sev: 'critical' },
   { re: /document\.write\s*\(/g,                     name: 'document.write',   cwe: 'CWE-79', sev: 'critical' },
   { re: /\beval\s*\(/g,                              name: 'eval',             cwe: 'CWE-95', sev: 'critical' },
   { re: /new\s+Function\s*\(/g,                      name: 'Function()',       cwe: 'CWE-95', sev: 'critical' },
   { re: /\.setAttribute\s*\(\s*['"]on\w+['"]/g,      name: 'setAttribute(on*)', cwe: 'CWE-79', sev: 'critical' },
+  { re: /\[["']setAttribute["']\]\s*\(\s*['"]on\w+['"]/g, name: 'setAttribute(on*)', cwe: 'CWE-79', sev: 'critical' },
   { re: /location\.(?:href|replace|assign)\s*=/g,    name: 'location.href=',   cwe: 'CWE-601', sev: 'high' },
+  { re: /location\[["'](?:href|replace|assign)["']\]\s*=/g, name: 'location.href=', cwe: 'CWE-601', sev: 'high' },
   { re: /\.srcdoc\s*=/g,                             name: 'srcdoc',           cwe: 'CWE-79', sev: 'critical' },
   { re: /\bexec(?:Sync)?\s*\(/g,                     name: 'exec()',           cwe: 'CWE-78', sev: 'critical' },
   { re: /\bspawn(?:Sync)?\s*\(/g,                     name: 'spawn()',          cwe: 'CWE-78', sev: 'critical' },

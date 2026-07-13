@@ -205,6 +205,10 @@ npm run test:obfuscator
 - **No runtime evaluation**: The constant evaluator handles a strict subset (arithmetic, atob, charCodeAt, concat). No user functions, no Proxy, no eval.
 - **Static CVE list**: The dependency scanner uses a curated snapshot (30 packages). For production use, pair with `npm audit` or OSV.dev.
 - **Command injection**: Covered via both pattern matching (`child_process`, `cp`, `shell` prefixes and bare `exec`/`spawn`/`fork` with `require("child_process")` context guard) and taint tracking (sinks include `exec`, `spawn`, `fork`). Covers destructured imports and dynamic require patterns.
+- **Bracket-notation sinks**: Security patterns and taint tracking cover bracket-notation invocations (`obj[method](arg)`, `obj["eval"](arg)`, `this[fn](arg)`, `window[name](arg)`) for eval, exec, spawn, fork, and other dangerous method names.
+- **Indirect eval**: Detects non-literal `eval(expr)`, `Function(arg)`, `setTimeout(str)`, `setImmediate(str)` where the argument is stored in a variable, returned from a function, passed as parameter, or comes from user-controlled sources.
+- **Prototype Pollution FP reduction**: `prototype["methodName"] = fn` (known-good library pattern) is no longer flagged; only `__proto__[key]` and dynamic-key `prototype[key]` assignments fire.
+- **bcrypt/argon2 recategorized**: These password hashing functions are no longer flagged as "Broken Crypto" — they are moved to "Hardcoded Credential" to reduce false positives on legitimate password hashing use.
 
 ## License
 

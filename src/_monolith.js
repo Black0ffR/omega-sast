@@ -706,6 +706,11 @@ const CREDENTIAL_PATTERNS = [
   { name:'Hardcoded API Key',    severity:'critical',
     re:/(?:api[_-]?key|apikey)\s*[:=]\s*["']([A-Za-z0-9_\-]{20,64})["']/gi,
     fpGuard: null },
+  { name:'Hardcoded API Key',    severity:'critical',
+    // JSON-style: 'apiKey':'...' or {"apiKey":"..."} where key and value are
+    // adjacent string literals (common in decoded obfuscator.io output)
+    re:/['"](?:api[_-]?key|apikey)['"]\s*[:=]\s*['"]((?:sk_live|sk_test|sk_prod)[A-Za-z0-9_\-]{16,60})['"]/gi,
+    fpGuard: null },
   { name:'JWT Secret',           severity:'critical',
     re:/(?:jwt[_-]?secret|jwtSecret)\s*[:=]\s*["']([^"']{8,})["']/gi,
     fpGuard: null },
@@ -793,8 +798,21 @@ const SECURITY_PATTERNS = [
   { id:'xss-innerhtml',  cat:'XSS',        sev:'high',
     re:/\.innerHTML\s*=/g,
     ctx: m => !/sanitize|DomSanitizer|bypassSecurityTrust/.test(m.slice(-200)) },
+  { id:'xss-innerhtml',  cat:'XSS',        sev:'high',
+    re:/\[["']innerHTML["']\]\s*=/g,
+    ctx: m => !/sanitize|DomSanitizer|bypassSecurityTrust/.test(m.slice(-200)) },
   { id:'xss-eval',       cat:'XSS',        sev:'critical',
     re:/\beval\s*\(/g,        ctx: null },
+  // Indirect eval: (0, eval)(x) comma-operator pattern
+  { id:'xss-eval',       cat:'XSS',        sev:'critical',
+    re:/\(0,\s*eval\)\s*\(/g, ctx: null },
+  // Indirect eval: eval as function argument (helper(eval, x))
+  { id:'xss-eval',       cat:'XSS',        sev:'high',
+    re:/[,(]\s*eval\s*[,)]/g,
+    ctx: m => !/if\s*\(|switch|case/.test(m) },
+  // Indirect eval: variable alias (var e = eval; -> e(x) detected via cross-ref)
+  { id:'xss-eval-alias', cat:'XSS',        sev:'high',
+    re:/(?:var|let|const)\s+(\w+)\s*=\s*eval\b/g, ctx: null },
   { id:'xss-new-func',   cat:'XSS',        sev:'critical',
     re:/new\s+Function\s*\(/g,
     ctx: (snippet, src) => {
@@ -871,10 +889,17 @@ const SECURITY_PATTERNS = [
   // ── B2: DOM XSS Sinks ──────────────────────────────────────────────────
   { id:'xss-outerhtml',  cat:'XSS',        sev:'critical',
     re:/\.outerHTML\s*=/g, ctx: null },
+  { id:'xss-outerhtml',  cat:'XSS',        sev:'critical',
+    re:/\[["']outerHTML["']\]\s*=/g, ctx: null },
   { id:'xss-insertadj',  cat:'XSS',        sev:'critical',
     re:/\.insertAdjacentHTML\s*\(/g, ctx: null },
+  { id:'xss-insertadj',  cat:'XSS',        sev:'critical',
+    re:/\[["']insertAdjacentHTML["']\]\s*\(/g, ctx: null },
   { id:'xss-srcdoc',     cat:'XSS',        sev:'critical',
     re:/\.srcdoc\s*=/g,
+    ctx: m => !/ɵɵ|@angular\/|trustedHTML/.test(m) },
+  { id:'xss-srcdoc',     cat:'XSS',        sev:'critical',
+    re:/\[["']srcdoc["']\]\s*=/g,
     ctx: m => !/ɵɵ|@angular\/|trustedHTML/.test(m) },
   { id:'xss-createfrag', cat:'XSS',        sev:'high',
     re:/createContextualFragment\s*\(/g, ctx: null },
@@ -884,13 +909,22 @@ const SECURITY_PATTERNS = [
     re:/(?:jQuery|\$)\([^)]*\)\.(?:append|prepend|after|before|wrap)\s*\([^)]+\)/g, ctx: null },
   { id:'xss-set-attr-on',cat:'XSS',        sev:'critical',
     re:/\.setAttribute\s*\(\s*['"]on\w+['"]\s*,/g, ctx: null },
+  { id:'xss-set-attr-on',cat:'XSS',        sev:'critical',
+    re:/\[["']setAttribute["']\]\s*\(\s*['"]on\w+['"]\s*,/g, ctx: null },
   { id:'redirect-location-href',cat:'Open Redirect', sev:'high', cwe:'CWE-601',
     re:/(?:location|window\.location)\.href\s*=/g,
     ctx: m => !/https?:\/\//.test(m) },
+  { id:'redirect-location-href',cat:'Open Redirect', sev:'high', cwe:'CWE-601',
+    re:/(?:location|window\.location)\[["']href["']\]\s*=/g,
+    ctx: m => !/https?:\/\//.test(m) },
   { id:'redirect-loc-replace', cat:'Open Redirect',  sev:'high', cwe:'CWE-601',
     re:/location\.(?:replace|assign)\s*\(/g, ctx: null },
+  { id:'redirect-loc-replace', cat:'Open Redirect',  sev:'high', cwe:'CWE-601',
+    re:/location\[["'](?:replace|assign)["']\]\s*\(/g, ctx: null },
   { id:'xss-window-open', cat:'XSS',       sev:'medium',
     re:/window\.open\s*\(/g, ctx: null },
+  { id:'xss-window-open', cat:'XSS',       sev:'medium',
+    re:/window\[["']open["']\]\s*\(/g, ctx: null },
 
   // ── B2.5: SQL Injection — string concat/template with SQL keywords ──────
   { id:'sqli-concat',     cat:'Injection', sev:'critical', cwe:'CWE-89',
@@ -919,9 +953,21 @@ const SECURITY_PATTERNS = [
     re:/\$compile\s*\(\s*(?!['"])/g, ctx: null },
 
   // ── B4: Prototype Pollution ─────────────────────────────────────────────
-  // Write-only: only flag actual ASSIGNMENT to prototype[key], not read access
+  // Write-only: flag prototype writes, but suppress FP when the key is a
+  // simple alphanumeric identifier — that's a benign library method definition
+  // (X.prototype["render"] = fn). Real prototype pollution uses dynamic keys
+  // (__proto__, constructor, or variable expressions).
   { id:'proto-write',     cat:'Prototype Pollution', sev:'critical',
-    re:/(?:__proto__|prototype)\s*\[\s*['"][^'"]+['"]\s*\]\s*=/g, ctx: null },
+    re:/(?:__proto__|prototype)\s*\[\s*['"]([^'"]+)['"]\s*\]\s*=/g,
+    ctx: m => {
+      // __proto__ assignment is ALWAYS pollution regardless of key name
+      if (/__proto__/.test(m)) return true;
+      const k = m.match(/\[['"]([^'"]+)['"]\]/)?.[1] || '';
+      if (k === 'constructor' || k === 'prototype') return true;
+      // Simple method name = benign (library prototype extension)
+      if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k)) return false;
+      return true;
+    } },
   // Merge suspect: Object.assign with user-controlled source — potential pollution
   { id:'proto-merge-suspect', cat:'Prototype Pollution', sev:'medium',
     re:/Object\.(?:assign|merge)\s*\(\s*[A-Za-z_$][\w$]*\s*,\s*[A-Za-z_$][\w$]*\s*\)/g,
@@ -937,6 +983,8 @@ const SECURITY_PATTERNS = [
   // ── B5: PostMessage ─────────────────────────────────────────────────────
   { id:'postmsg-wildcard', cat:'PostMessage',  sev:'high',
     re:/\.postMessage\s*\([^)]+,\s*['"][*]['"]/g, ctx: null },
+  { id:'postmsg-wildcard', cat:'PostMessage',  sev:'high',
+    re:/\[["']postMessage["']\]\s*\([^)]+,\s*['"][*]['"]/g, ctx: null },
   { id:'postmsg-nocheck',  cat:'PostMessage',  sev:'medium',
     re:/addEventListener\s*\(\s*['"]message['"]/g,
     ctx: m => !/event\.origin|e\.origin/.test(m.slice(0, 400)) },
@@ -1019,8 +1067,8 @@ const FRAMEWORKS = [
   { name:'Webpack 5', re:/webpackChunk[a-zA-Z]|__webpack_require__|self\.webpackChunk|performance\.mark\(\s*["']js-parse-end/,
     score: s => (s.match(/webpackChunk|__webpack_require__|__webpack_modules__/g)||[]).length,
   },
-  { name:'Socket.io', re:/socket\.io|io\.connect|io\(\)|\\.emit\(|\\.on\("connect"\)/,
-    score: s => (s.match(/socket\.io|\.emit\s*\(|\.on\s*\(\s*['"]connect['"]/g)||[]).length,
+  { name:'Socket.io', re:/socket\.io|io\.connect/,
+    score: s => (s.match(/socket\.io|io\.connect/g)||[]).length,
   },
   { name:'RxJS',      re:/BehaviorSubject|switchMap|catchError|combineLatest|pipe\(/,
     score: s => (s.match(/BehaviorSubject|switchMap|catchError|combineLatest|\.pipe\s*\(/g)||[]).length,
@@ -4148,13 +4196,20 @@ function scanTaintFlow(src) {
   // Taint sinks — dangerous operations
   const SINKS = [
     { re:/\.innerHTML\s*=/g, name:'innerHTML', sev:'critical', cwe:'CWE-79' },
+    { re:/\[["']innerHTML["']\]\s*=/g, name:'innerHTML', sev:'critical', cwe:'CWE-79' },
     { re:/\.outerHTML\s*=/g, name:'outerHTML', sev:'critical', cwe:'CWE-79' },
+    { re:/\[["']outerHTML["']\]\s*=/g, name:'outerHTML', sev:'critical', cwe:'CWE-79' },
     { re:/\.insertAdjacentHTML\s*\(/g, name:'insertAdjacentHTML', sev:'critical', cwe:'CWE-79' },
+    { re:/\[["']insertAdjacentHTML["']\]\s*\(/g, name:'insertAdjacentHTML', sev:'critical', cwe:'CWE-79' },
     { re:/document\.write\s*\(/g, name:'document.write', sev:'critical', cwe:'CWE-79' },
     { re:/\beval\s*\(/g, name:'eval()', sev:'critical', cwe:'CWE-95' },
+    { re:/\(0,\s*eval\)\s*\(/g, name:'eval()', sev:'critical', cwe:'CWE-95' },
+    { re:/[,(]\s*eval\s*[,)]/g, name:'eval-arg', sev:'high', cwe:'CWE-95' },
     { re:/new\s+Function\s*\(/g, name:'Function()', sev:'critical', cwe:'CWE-95' },
     { re:/(?:location\.(?:href|replace|assign)\s*=|window\.location\s*=)/g, name:'location navigation', sev:'high', cwe:'CWE-601' },
+    { re:/(?:location\[["'](?:href|replace|assign)["']\]\s*=|window\.location\[["']href["']\]\s*=)/g, name:'location navigation', sev:'high', cwe:'CWE-601' },
     { re:/\.setAttribute\s*\(\s*['"]on\w+['"]/g, name:'setAttribute(on*)', sev:'critical', cwe:'CWE-79' },
+    { re:/\[["']setAttribute["']\]\s*\(\s*['"]on\w+['"]/g, name:'setAttribute(on*)', sev:'critical', cwe:'CWE-79' },
     { re:/\bexec(?:Sync)?\s*\(/g, name:'exec()', sev:'critical', cwe:'CWE-78' },
     { re:/\bspawn(?:Sync)?\s*\(/g, name:'spawn()', sev:'critical', cwe:'CWE-78' },
     { re:/\bfork\s*\(/g, name:'fork()', sev:'critical', cwe:'CWE-78' },
@@ -6035,6 +6090,28 @@ async function main(externalOpts) {
 
   let src = fs.readFileSync(inputPath, 'utf8');
 
+  // Chunk single lines > 100 KB to prevent regex backtracking hangs in decode
+  // phases. Real bundles have line breaks even when minified (frameworks inject
+  // sourceURL, semicolons, etc.). A single 5 MB line is pathological.
+  const CHUNK_LINE_MAX = 100 * 1024;
+  const lines = src.split('\n');
+  let chunked = false;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].length > CHUNK_LINE_MAX) {
+      // Insert a newline every CHUNK_LINE_MAX chars within the line
+      const chunks = [];
+      for (let j = 0; j < lines[i].length; j += CHUNK_LINE_MAX) {
+        chunks.push(lines[i].slice(j, j + CHUNK_LINE_MAX));
+      }
+      lines[i] = chunks.join('\n');
+      chunked = true;
+    }
+  }
+  if (chunked) {
+    src = lines.join('\n');
+    if (!opts.quiet) console.log(warn(`Input contains lines > 100 KB — chunked for regex safety`));
+  }
+
   if (!opts.quiet) console.log(head('DECODING'));
 
   // Phase 0
@@ -6061,10 +6138,30 @@ async function main(externalOpts) {
   }
 
   // Phase 2c — obfuscator.io string-array decoder (Stage 5)
+  // Multi-pass: iterate the decoder over its own output to resolve multi-layer
+  // RC4 where decoded strings contain further decoder call sites.
+  // Convergence check: stop when a pass produces no *new* decoded strings.
   if (opts.verbose) console.log(info('  Phase 2c: obfuscator.io string-array decoder…'));
-  const { src: src2c, findings: obfIoFindings, decodedStrings: obfIoDecoded } = decodeObfuscatorIo(src);
+  let src2c = src;
+  const obfIoFindings = [];
+  const obfIoDecoded = [];
+  const decodedSet = new Set();
+  for (let pass = 0; pass < 5; pass++) {
+    const result = decodeObfuscatorIo(src2c);
+    const newStrings = result.decodedStrings.filter(d => {
+      const k = d.decoded || '';
+      if (decodedSet.has(k)) return false;
+      decodedSet.add(k);
+      return true;
+    });
+    if (newStrings.length === 0) break;
+    src2c = result.src;
+    obfIoFindings.push(...result.findings);
+    obfIoDecoded.push(...newStrings);
+    if (opts.verbose) console.log(info(`  Phase 2c pass ${pass + 2}: ${newStrings.length} new strings decoded`));
+  }
   src = src2c;
-  if (obfIoFindings.length && !opts.quiet) {
+  if (obfIoDecoded.length && !opts.quiet) {
     console.log(ok(`Phase 2c: obfuscator.io decoder — ${obfIoDecoded.length} strings decoded`));
     obfIoDecoded.slice(0, 10).forEach(d => console.log(`  ${C.cyan}→${C.reset} "${d.decoded.slice(0,40)}"  (idx=${d.idx}${d.key ? ', RC4' : ''})`));
   }
