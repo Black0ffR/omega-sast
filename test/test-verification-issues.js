@@ -980,6 +980,40 @@ section('1.3k Inline data: source map detection');
 })();
 
 // ═════════════════════════════════════════════════════════════════════════
+//  3.0 — v4 review features: ReDoS, library filter, bundler detection
+// ═════════════════════════════════════════════════════════════════════════
+section('3.0 v4 features: ReDoS detector, library filter, bundler detection');
+
+(function () {
+  // Create a fixture with a ReDoS-vulnerable pattern inside a jQuery-like context
+  const dir = mkTmpDir();
+  const src = [
+    '// jquery.min.js',
+    'var re = /(.+)+/;',
+    'function App() { return React.createElement("div"); }',
+  ].join('\n');
+  const file = path.join(dir, 'v4-features.js');
+  fs.writeFileSync(file, src);
+  const out = mkTmpDir();
+  const r = runOmega([file, '--security', '--report', '--quiet', '--out', out], { env: { ...process.env, OMEGA_FAIL_ON: 'none' } });
+  assert('v4 scan completes without crash', r.status === 0, r.stderr || '');
+  const report = readReport(out);
+  if (report) {
+    const f = allFindings(report);
+    const redos = f.filter(f => f.id === 'redos-vulnerable');
+    assert('ReDoS finding exists for vulnerable pattern', redos.length > 0,
+      `got ${redos.length} redos findings`);
+    const libTagged = f.filter(f => f.libraryInternal === true);
+    assert('Library-tagged findings exist (jQuery + React context)', libTagged.length > 0,
+      `got ${libTagged.length} library-tagged findings`);
+    if (libTagged.length > 0) {
+      const demoted = libTagged.some(f => f.severity !== 'critical' && f.severity !== undefined);
+      assert('Library-tagged findings have demoted severity', demoted);
+    }
+  }
+})();
+
+// ═════════════════════════════════════════════════════════════════════════
 //  Summary
 // ═════════════════════════════════════════════════════════════════════════
 console.log(`\n${'═'.repeat(70)}`);

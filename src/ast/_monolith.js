@@ -1149,7 +1149,7 @@ function resolveWebpack5Modules(src) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 function detectBundler(src) {
-  const PRIORITY = ['nextAppRouter','webpack5','webpack4','viteRelChunks','viteLegacy','viteModern','rollup','esbuild','parcel','browserify','umdNamed','umdGeneric','iifeGlobal'];
+  const PRIORITY = ['nextAppRouter','webpack5','webpack4','viteRelChunks','viteLegacy','viteModern','rollup','esbuild','parcel','angularJs','jqueryUmd','browserify','umdNamed','umdGeneric','iifeGlobal'];
   const hints = {
     webpack5:    /self\.webpackChunk_|self\["webpackChunk|webpackChunk_[A-Za-z0-9_$]+|__webpack_require__|__webpack_modules__|__webpack_module_cache__|performance\.mark\(\s*["']js-parse-end/,
     webpack4:    /\bwebpackJsonp\b/,
@@ -1160,14 +1160,16 @@ function detectBundler(src) {
     // imports. Previously matched any `...foo.js` string, causing false
     // positives when the bundle referenced CDN URLs.
     viteModern:  /\bimport\s*\{[^}]+\}\s*from\s*["'](?!https?:)(?:\.?\/)?[^"']+\.js["']/,
-    rollup:      /var\s+(__defProp|__getOwnPropSlot|__copyProps|__export|__commonJS|__esModule)\s*=\s*Object\.defineProperty|Object\.defineProperty\s*\(\s*exports,\s*["']__esModule["']/,
-    esbuild:     /__require\s*=\s*typeof\s+require|__markAsModule|var\s+__defProp\s*=\s*Object\.defineProperty.*__getOwnPropDesc|var\s+__commonJS\s*=\s*\(/,
+    rollup:      /var\s+(__defProp|__getOwnPropSlot|__copyProps|__export|__commonJS|__esModule)\s*=\s*Object\.defineProperty|Object\.defineProperty\s*\(\s*exports,\s*["']__esModule["']|\/\*\s*rollup|\/\/!\s*rollup/,
+    esbuild:     /__require\s*=\s*typeof\s+require|__markAsModule|var\s+__defProp\s*=\s*Object\.defineProperty.*__getOwnPropDesc|var\s+__commonJS\s*=\s*\(|\/\/\s*esbuild|\/\*\s*esbuild-built/,
     parcel:      /parcelRequire\s*=\s*this\["parcel|bundle\(\)\{.*parcelRequire/,
     browserify:  /\(function\s*[ef]\s*\{if\(typeof\s+exports\s*===\s*['"]object['"]&&typeof\s+module\s*!==/,
     nextAppRouter:/\$_appRouterManifest|__next_root_layout/,
+    angularJs:   /angular\.module\s*\(|\.module\s*\(\s*['"][^'"]*['"]\s*,\s*\[/,
+    jqueryUmd:   /jQuery.*noConflict|\.fn\.(?:jquery|init)/i,
     umdGeneric:  /\(function\s*\([a-z]\s*,\s*[a-z]\s*,\s*[a-z]\s*\)\s*\{\s*(?:typeof\s+define\s*===\s*['"]function['"]|"object"==typeof\s+(?:exports|module))/,
     umdNamed:    /\(function\s*\(\s*[a-z]\s*,\s*[a-z]\s*,\s*[a-z]\s*\)\s*\{[\s\S]{0,200}typeof\s+define/i,
-    iifeGlobal:  /^!\s*function\s*\([^)]*\)\s*\{/,
+    iifeGlobal:  /!\s*function\s*\([^)]*\)\s*\{/,
   };
   const detected = [];
   for (const [name, re] of Object.entries(hints)) {

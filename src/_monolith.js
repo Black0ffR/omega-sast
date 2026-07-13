@@ -4246,6 +4246,82 @@ function scanLazyLoading(src) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  PHASE 12r — ReDoS VULNERABILITY DETECTOR
+// ═══════════════════════════════════════════════════════════════════════════
+// Scans source code regex literals and new RegExp() calls for patterns
+// known to cause catastrophic backtracking (CWE-1333).
+function isVulnerable(pattern) {
+  try { new RegExp(pattern); } catch { return false; }
+  // Nested quantifiers: group with [+*] where group body also contains [+*]
+  const nestedQuant = /\([^)]*[+*][?+]?[^)]*\)[+*]/;
+  if (nestedQuant.test(pattern)) return true;
+  // Backreference: \1, \2, etc. in quantified groups
+  if (/\\([1-9])/.test(pattern)) return true;
+  // Overlapping alternation in quantified groups
+  const altGroupRe = /\(([^)]+)\)[+*]/g;
+  let am;
+  while ((am = altGroupRe.exec(pattern)) !== null) {
+    const alts = am[1].split('|');
+    if (alts.length > 1) {
+      const trimmed = alts.map(a => a.replace(/\s/g, ''));
+      for (let i = 0; i < trimmed.length; i++) {
+        for (let j = i + 1; j < trimmed.length; j++) {
+          if (trimmed[i] === trimmed[j]) return true;
+          if (trimmed[i].length > 0 && trimmed[j].length > 0 &&
+              trimmed[i] !== trimmed[j] &&
+              (trimmed[j].startsWith(trimmed[i]) || trimmed[i].startsWith(trimmed[j]))) {
+            return true;
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
+
+function scanReDoS(src) {
+  const findings = [];
+  const patterns = new Set();
+  // Strip single-line comments before extracting regex literals to prevent
+  // `// comment` from being misidentified as the start of a regex.
+  const stripped = src.replace(/\/\/.*$/gm, '');
+  const litRe = /(?<!\\)\/((?:[^\/\\]|\\.)+)\/([gimsuy]*)/g;
+  let m;
+  while ((m = litRe.exec(stripped)) !== null) {
+    const p = m[1];
+    if (p.length > 2 && p.length < 1000) patterns.add(p);
+  }
+  // Note: `stripped` is already defined above (comment-stripped src)
+  const ctorRe = /new\s+RegExp\s*\(\s*['"`]([^'"`]+)['"`]/g;
+  while ((m = ctorRe.exec(stripped)) !== null) {
+    const p = m[1].replace(/\\(.)/g, '$1');
+    if (p.length > 2 && p.length < 1000) patterns.add(p);
+  }
+  for (const pattern of patterns) {
+    if (isVulnerable(pattern)) {
+      findings.push({
+        id: 'redos-vulnerable',
+        category: 'ReDoS',
+        severity: 'medium',
+        cwe: 'CWE-1333',
+        value: pattern.slice(0, 80),
+        context: ctxFromPattern(src, pattern),
+        description: 'Regex vulnerable to catastrophic backtracking — pattern contains nested quantifiers or overlapping alternatives that can cause exponential backtracking on crafted input',
+      });
+    }
+  }
+  return findings;
+}
+
+function ctxFromPattern(src, pattern) {
+  const idx = src.indexOf(pattern);
+  if (idx === -1) return pattern.slice(0, 120);
+  const start = Math.max(0, idx - 60);
+  const end = Math.min(src.length, idx + pattern.length + 60);
+  return src.slice(start, end);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  PHASE 12m2 — CONFIDENCE SCORING FOR INDIVIDUAL FINDINGS
 // ═══════════════════════════════════════════════════════════════════════════
 function scoreFindingConfidence(f) {
@@ -4280,6 +4356,45 @@ function classifyLibrary(src) {
   if (/Vue|createApp|defineComponent|ref\s*\(/.test(src)) return 'ui-framework';
   if (/express|koa|fastify|hapi/.test(src)) return 'backend';
   return 'general';
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  PHASE 12n1 — LIBRARY-vs-APP CONTEXT FILTER
+// ═══════════════════════════════════════════════════════════════════════════
+// Tags findings that originate from library/vendor code by checking the
+// finding's context against known library signatures. Library-internal
+// findings get demoted severity and a confidence penalty.
+const LIBRARY_SIGNS = [
+  { re: /node_modules[\\/]/,              name: 'node_modules' },
+  { re: /cdnjs\.cloudflare\.com\/ajax\/libs\//, name: 'cdnjs' },
+  { re: /(?:jQuery|jquery|\.fn\.jquery)/, name: 'jQuery' },
+  { re: /(?:React|createElement|createRoot|useState|useEffect)/, name: 'React' },
+  { re: /(?:createApp|defineComponent|Vue)/, name: 'Vue' },
+  { re: /angular\.module|ng\./,           name: 'Angular' },
+  { re: /(?:lodash|underscore)/,          name: 'lodash' },
+  { re: /d3\.(?:scale|select|axis|format)/, name: 'D3' },
+  { re: /(?:gsap|Tween|TimelineLite|TimelineMax)/, name: 'GSAP' },
+  { re: /THREE\./,                        name: 'Three.js' },
+  { re: /Chart\.(?:register|new Chart)/,  name: 'Chart.js' },
+  { re: /io\(|socket\.io/,                name: 'Socket.IO' },
+  { re: /CryptoJS|cryptojs/,              name: 'CryptoJS' },
+];
+function tagLibraryFindings(findings, src) {
+  for (const f of findings) {
+    if (f.libraryInternal) continue;
+    const ctx = ((f.context || '') + ' ' + (f.value || '')).toLowerCase();
+    for (const { re, name } of LIBRARY_SIGNS) {
+      if (re.test(ctx)) {
+        f.libraryInternal = true;
+        // Demote severity
+        const demote = { critical: 'high', high: 'medium', medium: 'low', low: 'info' };
+        if (demote[f.severity]) f.severity = demote[f.severity];
+        // Penalise confidence
+        if (f.confidence) f.confidence *= 0.5;
+        break;
+      }
+    }
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -6006,6 +6121,13 @@ async function main(externalOpts) {
   if (opts.verbose) console.log(info('  Phase 12m: Lazy-loading route security…'));
   const lazyFindings     = (opts.security || opts.report) ? scanLazyLoading(src) : [];
 
+  // Phase 12r — In-source ReDoS vulnerability detection (uses pre-beautify src
+  // so that regex literal formatting is preserved — the beautifier inserts
+  // whitespace inside regex patterns, breaking pattern-matching).
+  if (opts.verbose) console.log(info('  Phase 12r: In-source ReDoS vulnerability scan…'));
+  const redosFindings = (opts.security || opts.report) ? scanReDoS(srcPreBeautify) : [];
+  if (opts.verbose) console.log(info(`  Phase 12r: ${redosFindings.length} ReDoS findings`));
+
   // ─────────────────────────────────────────────────────────────────────────
   //  OMEGA-5.0: AST-powered structural analysis (Tier 1)
   //  Auto-enabled by --security, explicit via --ast, opt-out via --no-ast.
@@ -6288,7 +6410,13 @@ async function main(externalOpts) {
     ...((obfuscatorFingerprint && obfuscatorFingerprint.findings) || []),
     ...obfIoFindings,
     ...constExprFindings,
+    ...redosFindings,
   ];
+
+  // Phase 12n1 — Tag library-internal findings to reduce FP noise (uses
+  // pre-beautify src so library boilerplate signatures are not disturbed
+  // by the token-based beautifier).
+  tagLibraryFindings(extendedFindings, srcPreBeautify);
 
   // ── Apply severity-floor filter ────────────────────────────────────────
   // Filters out findings below the user-specified threshold before they reach
@@ -6574,5 +6702,6 @@ module.exports = {
   runCLI,
   parseArgs,
   printHelp,
+  scanReDoS,
 };
 
