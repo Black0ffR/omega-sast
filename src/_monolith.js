@@ -4037,7 +4037,7 @@ function scanTaintFlow(src) {
     { re:/document\.write\s*\(/g, name:'document.write', sev:'critical', cwe:'CWE-79' },
     { re:/\beval\s*\(/g, name:'eval()', sev:'critical', cwe:'CWE-95' },
     { re:/new\s+Function\s*\(/g, name:'Function()', sev:'critical', cwe:'CWE-95' },
-    { re:/location\.(?:href|replace|assign)\s*=/g, name:'location navigation', sev:'high', cwe:'CWE-601' },
+    { re:/(?:location\.(?:href|replace|assign)\s*=|window\.location\s*=)/g, name:'location navigation', sev:'high', cwe:'CWE-601' },
     { re:/\.setAttribute\s*\(\s*['"]on\w+['"]/g, name:'setAttribute(on*)', sev:'critical', cwe:'CWE-79' },
   ];
 
@@ -4181,15 +4181,15 @@ function scanConfigDrivenBehaviour(src) {
       description:'Hardcoded API base URL in client bundle — verify this is intentional and not an internal/staging URL' });
   }
 
-  // CORS wildcard in config (expanded patterns)
-  const corsRe = /(?:allowedOrigins|cors|Access-Control-Allow-Origin)\s*[:=]\s*["'][*]["']/gi;
+  // CORS wildcard origin (config + programmatic API forms)
+  const corsRe = /(?:allowedOrigins|origin|Access-Control-Allow-Origin)(?:\s*[:=]\s*["']?[*]["']?|\s*['"]\s*,\s*['"][*]['"])/gi;
   while ((m = corsRe.exec(src)) !== null) {
     findings.push({ id:'cfg-cors-wildcard', category:'Config Behaviour', severity:'high',
       value: m[0].slice(0,80), context: ctx(m.index),
       description:'CORS wildcard origin configured — allows any origin to make credentialed requests' });
   }
   // CORS credentials + wildcard combo (most dangerous — allows credential theft from any site)
-  const corsCredRe = /Access-Control-Allow-Credentials\s*[:=]\s*["']?true["']?/gi;
+  const corsCredRe = /Access-Control-Allow-Credentials\s*(?:[:=]\s*["']?true["']?|['"]\s*,\s*['"]true['"])/gi;
   while ((m = corsCredRe.exec(src)) !== null) {
     // Check context for wildcard
     const c = ctx(m.index, 300);
@@ -6383,7 +6383,7 @@ async function main(externalOpts) {
   let suppressed = [];
   if (opts.baseline) {
     const baseline = loadBaseline(opts.baseline);
-    const result = applyBaseline(allSec, baseline, meta.file || path.basename(inputPath));
+    const result = applyBaseline(allSec, baseline, path.basename(inputPath));
     allSec.length = 0; allSec.push(...result.findings);
     suppressed = result.suppressed;
     if (suppressed.length && !opts.quiet) {

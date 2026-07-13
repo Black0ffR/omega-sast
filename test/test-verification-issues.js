@@ -515,7 +515,7 @@ section('2.2 .omega-ignore baseline suppression');
     const out2 = mkTmpDir();
     // Copy the baseline file to the new out dir
     fs.copyFileSync(baselinePath, path.join(out2, '.omega-ignore'));
-    const r2 = runOmega([fixture, '--security', '--report', '--baseline', baselinePath, '--quiet', '--out', out2]);
+    const r2 = runOmega([fixture, '--security', '--report', '--baseline', baselinePath, '--out', out2]);
     const r2Report = readReport(out2);
     // After applying baseline, findings should be suppressed (moved to a suppressed array, OR exit code lower)
     const remainingFindings = allFindings(r2Report).length;
