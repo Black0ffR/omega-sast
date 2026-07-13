@@ -28,6 +28,7 @@ const moduleSrc = `
 ${extractFnSrc('rc4Decrypt')}
 ${extractFnSrc('evalConstantArith')}
 ${extractFnSrc('decodeObfuscatorIo')}
+${extractFnSrc('rotateBruteForce')}
 module.exports = { decodeObfuscatorIo };
 `;
 const tmpPath = path.join(__dirname, '_corpus-omega-extracted.js');

@@ -40,6 +40,7 @@ const ast      = require(path.join(ROOT, 'lib', 'ast.js'));
 // decodeVLQMappings + mapSourcePosition are in src/ast/_monolith.js, not lib/ast.js
 const astMonolith = require(path.join(ROOT, 'src', 'ast', '_monolith.js'));
 const OMEGA    = path.join(ROOT, 'bin', 'omega.js');
+const OMEGA_SRC = fs.readFileSync(path.join(ROOT, 'src', '_monolith.js'), 'utf8');
 
 // ── Tiny test framework (matches existing test-harness.js style) ─────────
 let total = 0, passed = 0, failed = 0;
@@ -1011,6 +1012,59 @@ section('3.0 v4 features: ReDoS detector, library filter, bundler detection');
       assert('Library-tagged findings have demoted severity', demoted);
     }
   }
+})();
+
+// ═════════════════════════════════════════════════════════════════════════
+//  3.1-3.3 Brute-force rotation correction (Step 3f)
+// ═════════════════════════════════════════════════════════════════════════
+section('3.1 Brute-force rotation: returns non-null for plain-text sample');
+
+(function () {
+  const strings = ['\x01\x02', '\x03\x04', 'hello', 'world', 'test', 'data'];
+  const sa = { strings: strings.slice(2).concat(strings.slice(0, 2)), length: 6, name: '_0xARR' };
+  const src = [
+    `var _0xARR = [${strings.map(s => "'" + s.replace("'", "\\'") + "'").join(',')}];`,
+    'function D(a,b){return _0xARR[a]}',
+    'var x1 = D(2,"k"); var x2 = D(3,"k"); var x3 = D(4,"k");',
+  ].join('\n');
+  const m = OMEGA_SRC.match(/function rotateBruteForce\s*\([^)]*\)\s*\{[\s\S]*?\n\}/);
+  assert('rotateBruteForce extractable', m !== null);
+  if (!m) return;
+  const fn = eval('(' + m[0] + ')');
+  const best = fn(src, sa, 'D', 'a', 'b', 0, false, false, true);
+  assert('Brute-force returns non-null for plain-text sample', best !== null, `got ${best}`);
+})();
+
+section('3.2 Brute-force rotation: returns null for <2 call sites');
+
+(function () {
+  const src = "var _0xARR=['a','b','c'];\nfunction D(a,b){return _0xARR[a]}\nvar x=D(0,'k');";
+  const sa = { strings: ['a','b','c'], length: 3, name: '_0xARR' };
+  const m = OMEGA_SRC.match(/function rotateBruteForce\s*\([^)]*\)\s*\{[\s\S]*?\n\}/);
+  if (!m) { assert('rotateBruteForce extractable', false); return; }
+  const fn = eval('(' + m[0] + ')');
+  const best = fn(src, sa, 'D', 'a', 'b', 0, false, false, true);
+  assert('Brute-force returns null for <2 call sites', best === null, `got ${best}`);
+})();
+
+section('3.3 Brute-force rotation: returns non-null for base64 sample');
+
+(function () {
+  const encrypted = ['hello','world','test'].map(p => Buffer.from(p,'utf8').toString('base64'));
+  const garbage = ['\x01\x02\x03', '\x04\x05\x06'];
+  const strings = [...garbage, ...encrypted];
+  const rotated = strings.slice(2).concat(strings.slice(0, 2));
+  const src = [
+    `var _0xARR = [${rotated.map(s => "'" + s.replace("'","\\'") + "'").join(',')}];`,
+    'function D(a,b){return _0xARR[a]}',
+    'var x0=D(0,"k");var x1=D(1,"k");var x2=D(2,"k");var x3=D(3,"k");',
+  ].join('\n');
+  const m = OMEGA_SRC.match(/function rotateBruteForce\s*\([^)]*\)\s*\{[\s\S]*?\n\}/);
+  if (!m) { assert('rotateBruteForce extractable', false); return; }
+  const fn = eval('(' + m[0] + ')');
+  const sa = { strings: rotated, length: rotated.length, name: '_0xARR' };
+  const best = fn(src, sa, 'D', 'a', 'b', 0, false, true, false);
+  assert('Brute-force returns non-null for base64 sample', best !== null, `got ${best}`);
 })();
 
 // ═════════════════════════════════════════════════════════════════════════

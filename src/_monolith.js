@@ -1595,6 +1595,22 @@ function decodeObfuscatorIo(src) {
           if (str[i] === quote) break;
           i++;
         }
+      } else if (ch === '/') {
+        const next = str[i + 1];
+        if (next === '/') {
+          i = str.indexOf('\n', i);
+          if (i === -1) break;
+        } else if (next === '*') {
+          const end = str.indexOf('*/', i + 2);
+          if (end !== -1) { i = end + 1; } else break;
+        } else if (i === 0 || /[{(\[=,:!&|^?+\-*/%<>~\s;]/.test(str[i - 1])) {
+          i++;
+          while (i < len) {
+            if (str[i] === '\\') { i += 2; continue; }
+            if (str[i] === '/') break;
+            i++;
+          }
+        }
       } else if (ch === '{') {
         depth++;
       } else if (ch === '}') {
@@ -1738,11 +1754,32 @@ function decodeObfuscatorIo(src) {
         body = src.slice(dm.index, end + 1);
       }
 
+      // Detect built-in base offset: idxParam = idxParam OP BASE
+      // obfuscator.io often adds:  var idx = idx - 0xNNN;  at the start of decoders
+      let baseOffset = 0;
+      const offsetMatch = body.match(new RegExp(
+        `\\b${idxParam}\\s*=\\s*${idxParam}\\s*([+-])\\s*(0x[0-9a-fA-F]+|\\d+)`
+      ));
+      if (offsetMatch) {
+        baseOffset = offsetMatch[1] === '-' ? parseInt(offsetMatch[2], offsetMatch[2].startsWith('0x') ? 16 : 10) : -parseInt(offsetMatch[2], offsetMatch[2].startsWith('0x') ? 16 : 10);
+      }
+
+      // Determine decoder type
+      const hasCA = body.includes('charCodeAt');
+      const hasFC = body.includes('fromCharCode');
+      const isRC4 = hasCA && hasFC && body.includes(keyParam);
+      const isBase64 = /atob\s*\(/.test(body) && !isRC4;
+      const isPlain = !isRC4 && !isBase64;  // just array indexing, no transform
+
+      if (!isRC4 && !isBase64 && !isPlain) continue;
+
       // ── Step 3e: correct rotation by evaluating the IIFE ──────────────
       // The rotation IIFE's while loop uses a computation that depends on
       // decoder results which change as the array rotates. Simple key%length
       // gives the wrong offset. We extract the IIFE, getter, and decoder,
       // evaluate them in a sandbox, and capture the actual rotated array.
+      // If the sandbox eval fails, Step 3f brute-forces the rotation.
+      let rotatedCorrected = false;
       const rotEvalKey = `${sa.name}_${sa.getterName || ''}`;
       if (sa.rotated && sa.getterName && !decodeObfuscatorIo._rotEvaled?.has(rotEvalKey)) {
         (decodeObfuscatorIo._rotEvaled ??= new Set()).add(rotEvalKey);
@@ -1765,14 +1802,29 @@ function decodeObfuscatorIo(src) {
               const sandboxSrc = `"use strict";${getterBody}${decoderBody}${rm2[0]};JSON.stringify(${sa.getterName}())`;
               const vm = require('vm');
               const script = new vm.Script(sandboxSrc, { timeout: 5000 });
-              const rotatedJson = script.runInNewContext({ parseInt: parseInt, String: String, Array: Array, JSON: JSON }, { timeout: 5000 });
+              const sandboxGlobals = {
+                parseInt, parseFloat, isNaN, isFinite,
+                NaN, Infinity, undefined,
+                String, Number, Boolean, Array, Object,
+                RegExp, Function, Error, TypeError,
+                RangeError, SyntaxError, ReferenceError, EvalError, URIError,
+                Date, Map, Set, WeakMap, WeakSet, Promise, Symbol,
+                Math, JSON,
+                atob: typeof atob !== 'undefined' ? atob : (s) => Buffer.from(s, 'base64').toString('binary'),
+                btoa: typeof btoa !== 'undefined' ? btoa : (s) => Buffer.from(s, 'binary').toString('base64'),
+                escape, unescape,
+                decodeURIComponent, encodeURIComponent,
+                console: { log:()=>{}, warn:()=>{}, error:()=>{}, info:()=>{}, debug:()=>{} },
+                setTimeout: (fn) => (typeof fn === 'function' ? fn() : null),
+                setInterval: () => {},
+                clearTimeout: () => {},
+                clearInterval: () => {},
+              };
+              const rotatedJson = script.runInNewContext(sandboxGlobals, { timeout: 5000, breakOnSigint: true });
               const rotatedArr = JSON.parse(rotatedJson);
               if (Array.isArray(rotatedArr) && rotatedArr.length === sa.strings.length) {
                 sa.strings = rotatedArr;
-                // Update the rotation finding with corrected value
-                const correctedBy = [...rotatedArr].reduce((idx, v, i) =>
-                  v !== sa.strings[i] ? (idx === -1 ? i : idx) : idx, -1
-                );
+                rotatedCorrected = true;
                 for (const f of findings) {
                   if (f.id === 'obfuscator-io-rotation' && f.value.includes(sa.name)) {
                     f.value = `rotated ${sa.name} (sandbox-evaluated, ${sa.strings[0].slice(0, 8)}…)`;
@@ -1796,24 +1848,22 @@ function decodeObfuscatorIo(src) {
         }
       }
 
-      // Detect built-in base offset: idxParam = idxParam OP BASE
-      // obfuscator.io often adds:  var idx = idx - 0xNNN;  at the start of decoders
-      let baseOffset = 0;
-      const offsetMatch = body.match(new RegExp(
-        `\\b${idxParam}\\s*=\\s*${idxParam}\\s*([+-])\\s*(0x[0-9a-fA-F]+|\\d+)`
-      ));
-      if (offsetMatch) {
-        baseOffset = offsetMatch[1] === '-' ? parseInt(offsetMatch[2], offsetMatch[2].startsWith('0x') ? 16 : 10) : -parseInt(offsetMatch[2], offsetMatch[2].startsWith('0x') ? 16 : 10);
+      // ── Step 3f: brute-force rotation if sandbox eval failed ─────────
+      // Tries all N offsets and picks the one that decodes the most valid strings.
+      if (!rotatedCorrected && sa.rotated && sa.strings.length < 10000) {
+        const bestOffset = rotateBruteForce(src, sa, decName, idxParam, keyParam,
+          baseOffset, isRC4, isBase64, isPlain);
+        if (bestOffset !== null && bestOffset !== false) {
+          sa.strings = sa.strings.slice(bestOffset).concat(sa.strings.slice(0, bestOffset));
+          for (const f of findings) {
+            if (f.id === 'obfuscator-io-rotation' && f.value.includes(sa.name)) {
+              f.value = `rotated ${sa.name} (brute-force, offset=${bestOffset})`;
+              f.description = `Corrected rotation via brute-force (${bestOffset} positions)`;
+              break;
+            }
+          }
+        }
       }
-
-      // Determine decoder type
-      const hasCA = body.includes('charCodeAt');
-      const hasFC = body.includes('fromCharCode');
-      const isRC4 = hasCA && hasFC && body.includes(keyParam);
-      const isBase64 = /atob\s*\(/.test(body) && !isRC4;
-      const isPlain = !isRC4 && !isBase64;  // just array indexing, no transform
-
-      if (!isRC4 && !isBase64 && !isPlain) continue;
 
       findings.push({
         id: 'obfuscator-io-decoder',
@@ -2096,6 +2146,59 @@ function rc4Decrypt(ciphertext, key) {
     result += String.fromCharCode(decodedStr.charCodeAt(n) ^ k);
   }
   return result;
+}
+
+// ── Brute-force rotation correction ─────────────────────────────────────
+// When the sandbox eval fails (Step 3e), tries all N rotation offsets and
+// picks the one that decodes the most valid-looking strings.
+// Returns the best offset or null if no offset produces meaningful results.
+function rotateBruteForce(src, sa, decName, idxParam, keyParam, baseOffset, isRC4, isBase64, isPlain) {
+  // 1. Find all decoder calls with constant args in the source
+  const callPattern = new RegExp(
+    `\\b${decName}\\s*\\(\\s*(-?0x[0-9a-fA-F]+|-?\\d+)\\s*,\\s*["']([^"']*)["']\\s*\\)`,
+    'g'
+  );
+  const callSites = [];
+  let cm;
+  while ((cm = callPattern.exec(src)) !== null) {
+    const idx = parseInt(cm[1], /^-?0x/i.test(cm[1]) ? 16 : 10);
+    callSites.push({ idx, key: cm[2] });
+  }
+  if (callSites.length < 2) return null;
+
+  // 2. For each offset, score it
+  const N = sa.strings.length;
+  let bestOffset = null;
+  let bestScore = -1;
+  const initialScore = -1;
+
+  for (let offset = 0; offset < N; offset++) {
+    const rotated = sa.strings.slice(offset).concat(sa.strings.slice(0, offset));
+    let score = 0;
+    for (const cs of callSites) {
+      const adjustedIdx = cs.idx - (baseOffset || 0);
+      if (adjustedIdx < 0 || adjustedIdx >= N) continue;
+      try {
+        const raw = rotated[adjustedIdx];
+        let decoded;
+        if (isPlain) decoded = raw;
+        else if (isBase64) decoded = Buffer.from(raw, 'base64').toString('utf8');
+        else if (isRC4) decoded = rc4Decrypt(raw, cs.key);
+        if (typeof decoded === 'string' && /^[\x20-\x7e\s]*$/.test(decoded)) {
+          score++;
+          if (isRC4 && decoded.includes('\x00')) score -= 0.5;
+        }
+      } catch (_) {}
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestOffset = offset;
+    }
+  }
+
+  // 3. Require at least 30% decoding rate to accept
+  if (bestScore < callSites.length * 0.3) return null;
+  return bestOffset;
 }
 
 

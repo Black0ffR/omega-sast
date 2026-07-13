@@ -35,7 +35,8 @@ ${extractFnSrc('rc4Decrypt')}
 ${extractFnSrc('evalConstantArith')}
 ${extractFnSrc('decodeObfuscatorIo')}
 ${extractFnSrc('evaluateConstantExpressions')}
-module.exports = { decodeObfuscatorIo, evaluateConstantExpressions, rc4Decrypt, evalConstantArith };
+${extractFnSrc('rotateBruteForce')}
+module.exports = { decodeObfuscatorIo, evaluateConstantExpressions, rc4Decrypt, evalConstantArith, rotateBruteForce };
 `;
 const tmpPath = path.join(__dirname, '_omega-extracted.js');
 fs.writeFileSync(tmpPath, moduleSrc);
