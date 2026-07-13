@@ -1068,6 +1068,78 @@ section('3.3 Brute-force rotation: returns non-null for base64 sample');
 })();
 
 // ═════════════════════════════════════════════════════════════════════════
+//  4.0 — cmd-injection coverage: bare-method pattern handles destructured
+//  require, taint engine SINKS include exec/spawn/fork
+// ═════════════════════════════════════════════════════════════════════════
+section('4.0 cmd-injection: bare-method pattern + require(child_process) ctx guard');
+
+(function () {
+  const dir = mkTmpDir();
+
+  // Test 4.1: destructured require + bare exec call — should fire
+  const cmdSrc1 = [
+    'const { exec } = require("child_process");',
+    'exec(userInput);',
+  ].join('\n');
+  const file1 = path.join(dir, 'cmd-bare-destructure.js');
+  fs.writeFileSync(file1, cmdSrc1);
+  const out1 = mkTmpDir();
+  runOmega([file1, '--security', '--report', '--quiet', '--out', out1]);
+  const r1 = readReport(out1);
+  const cmd1 = allFindings(r1).filter(f => f.id === 'cmd-injection');
+  assert('4.1: destructured require("child_process") → bare exec(userInput) fires cmd-injection',
+    cmd1.length >= 1,
+    `got ${cmd1.length} cmd-injection findings (expected >= 1)`);
+
+  // Test 4.2: bare exec() in a browser-only file (no require) — should NOT fire
+  const cmdSrc2 = [
+    'function test() {',
+    '  var re = /(a+)+/;',
+    '  exec("not dangerous");',
+    '}',
+  ].join('\n');
+  const file2 = path.join(dir, 'cmd-bare-browser.js');
+  fs.writeFileSync(file2, cmdSrc2);
+  const out2 = mkTmpDir();
+  runOmega([file2, '--security', '--report', '--quiet', '--out', out2]);
+  const r2 = readReport(out2);
+  const cmd2 = allFindings(r2).filter(f => f.id === 'cmd-injection');
+  assert('4.2: bare exec() without require("child_process") does NOT fire cmd-injection',
+    cmd2.length === 0,
+    `got ${cmd2.length} cmd-injection findings (expected 0) — value: ${(cmd2[0] || {}).value || ''}`);
+
+  // Test 4.3: module-prefixed pattern still works (regression check)
+  const cmdSrc3 = 'child_process.exec("ls");\ncp.spawn("bash");\nshell.exec("rm -rf /");\n';
+  const file3 = path.join(dir, 'cmd-prefixed.js');
+  fs.writeFileSync(file3, cmdSrc3);
+  const out3 = mkTmpDir();
+  runOmega([file3, '--security', '--report', '--quiet', '--out', out3]);
+  const r3 = readReport(out3);
+  const cmd3 = allFindings(r3).filter(f => f.id === 'cmd-injection');
+  assert('4.3: prefixed child_process.exec / cp.spawn / shell.exec still fire cmd-injection',
+    cmd3.length >= 3,
+    `got ${cmd3.length} cmd-injection findings (expected >= 3)`);
+
+  // Test 4.4: taint engine catches exec() with tainted arg via require
+  const cmdSrc4 = [
+    'const { spawn } = require("child_process");',
+    'function go() {',
+    '  var cmd = location.hash.slice(1);',
+    '  spawn(cmd);',
+    '}',
+  ].join('\n');
+  const file4 = path.join(dir, 'cmd-taint-exec.js');
+  fs.writeFileSync(file4, cmdSrc4);
+  const out4 = mkTmpDir();
+  runOmega([file4, '--security', '--report', '--quiet', '--out', out4]);
+  const r4 = readReport(out4);
+  const taint4 = allFindings(r4).filter(f => f.id === 'taint-flow' && /exec|spawn|fork/.test(f.value || ''));
+  assert('4.4: taint engine produces taint-flow for spawn(cmd) with tainted arg',
+    taint4.length >= 1,
+    `got ${taint4.length} taint-flow findings (expected >= 1) — ${taint4.map(t => t.value).join(', ')}`);
+})();
+
+// ═════════════════════════════════════════════════════════════════════════
 //  Summary
 // ═════════════════════════════════════════════════════════════════════════
 console.log(`\n${'═'.repeat(70)}`);

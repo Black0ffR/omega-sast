@@ -812,6 +812,19 @@ const SECURITY_PATTERNS = [
     ctx: m => !/placeholder|label|aria/.test(m) },
   { id:'cmd-injection',  cat:'Injection',  sev:'critical',
     re:/(?:child_process|cp|shell(?:js)?)\s*["']?\s*\)?\s*\.\s*(?:exec(?:Sync)?|spawn(?:Sync)?|fork)\s*\(/g, ctx: null },
+  { id:'cmd-injection',  cat:'Injection',  sev:'critical',
+    re:/(?<![$\w.])(?:exec(?:Sync)?|spawn(?:Sync)?|fork)\s*\(/g,
+    ctx: (snippet, src) => {
+      // Bare exec/spawn/fork calls are dangerous only in Node.js files
+      // that import child_process. This catches destructured forms like
+      // const {exec} = require("child_process"); exec(x);
+      if (!/require\s*\(\s*["']child_process["']\s*\)/.test(src)) return false;
+      // Suppress FP when the call looks like an event handler registration
+      if (/\.on\s*\(/.test(snippet)) return false;
+      // Suppress FP inside Function() / new Function() bodies
+      if (/new\s+Function/.test(snippet)) return false;
+      return true;
+    } },
   { id:'crypto-broken-entropy', cat:'Broken Crypto', sev:'critical',
     re:/btoa\s*\([^)]*\.split\s*\(\s*["']["']\s*\)\.reverse/g, ctx: null },
   { id:'crypto-weak-hash', cat:'Broken Crypto', sev:'high',
@@ -4142,6 +4155,9 @@ function scanTaintFlow(src) {
     { re:/new\s+Function\s*\(/g, name:'Function()', sev:'critical', cwe:'CWE-95' },
     { re:/(?:location\.(?:href|replace|assign)\s*=|window\.location\s*=)/g, name:'location navigation', sev:'high', cwe:'CWE-601' },
     { re:/\.setAttribute\s*\(\s*['"]on\w+['"]/g, name:'setAttribute(on*)', sev:'critical', cwe:'CWE-79' },
+    { re:/\bexec(?:Sync)?\s*\(/g, name:'exec()', sev:'critical', cwe:'CWE-78' },
+    { re:/\bspawn(?:Sync)?\s*\(/g, name:'spawn()', sev:'critical', cwe:'CWE-78' },
+    { re:/\bfork\s*\(/g, name:'fork()', sev:'critical', cwe:'CWE-78' },
   ];
 
   // Identify tainted variable names heuristically

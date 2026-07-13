@@ -2705,6 +2705,9 @@ const SINK_PATTERNS_FN = [
   { re: /\.setAttribute\s*\(\s*['"]on\w+['"]/g,      name: 'setAttribute(on*)', cwe: 'CWE-79', sev: 'critical' },
   { re: /location\.(?:href|replace|assign)\s*=/g,    name: 'location.href=',   cwe: 'CWE-601', sev: 'high' },
   { re: /\.srcdoc\s*=/g,                             name: 'srcdoc',           cwe: 'CWE-79', sev: 'critical' },
+  { re: /\bexec(?:Sync)?\s*\(/g,                     name: 'exec()',           cwe: 'CWE-78', sev: 'critical' },
+  { re: /\bspawn(?:Sync)?\s*\(/g,                     name: 'spawn()',          cwe: 'CWE-78', sev: 'critical' },
+  { re: /\bfork\s*\(/g,                               name: 'fork()',           cwe: 'CWE-78', sev: 'critical' },
 ];
 
 function computeFunctionSummaries(src, structuralIndex) {
