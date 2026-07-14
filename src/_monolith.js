@@ -4503,18 +4503,113 @@ function isVulnerable(pattern) {
 function scanReDoS(src) {
   const findings = [];
   const patterns = new Set();
-  // Strip single-line comments before extracting regex literals to prevent
-  // `// comment` from being misidentified as the start of a regex.
-  const stripped = src.replace(/\/\/.*$/gm, '');
-  const litRe = /(?<!\\)\/((?:[^\/\\]|\\.)+)\/([gimsuy]*)/g;
-  let m;
-  while ((m = litRe.exec(stripped)) !== null) {
-    const p = m[1];
-    if (p.length > 2 && p.length < 1000) patterns.add(p);
+  // Extract regex literals using a character-level state machine that tracks
+  // string/comment context, preventing false matches on slashes that appear
+  // inside strings (e.g. URLs, file paths, AWS keys).
+  const N = src.length;
+  let i = 0;
+  while (i < N) {
+    const c = src[i];
+    // Skip single-line comments
+    if (c === '/' && src[i + 1] === '/') {
+      const nl = src.indexOf('\n', i + 2);
+      i = nl >= 0 ? nl + 1 : N;
+      continue;
+    }
+    // Skip multi-line comments
+    if (c === '/' && src[i + 1] === '*') {
+      const end = src.indexOf('*/', i + 2);
+      i = end >= 0 ? end + 2 : N;
+      continue;
+    }
+    // Skip single-quoted strings
+    if (c === "'") {
+      i++;
+      while (i < N) {
+        if (src[i] === '\\') { i += 2; continue; }
+        if (src[i] === "'") break;
+        i++;
+      }
+      i++;
+      continue;
+    }
+    // Skip double-quoted strings
+    if (c === '"') {
+      i++;
+      while (i < N) {
+        if (src[i] === '\\') { i += 2; continue; }
+        if (src[i] === '"') break;
+        i++;
+      }
+      i++;
+      continue;
+    }
+    // Skip template literals
+    if (c === '`') {
+      i++;
+      while (i < N) {
+        if (src[i] === '\\') { i += 2; continue; }
+        if (src[i] === '`') break;
+        if (src[i] === '$' && src[i + 1] === '{') {
+          // Skip ${ expr } — basic brace matching
+          let depth = 1; i += 2;
+          while (i < N && depth > 0) {
+            if (src[i] === '{') depth++;
+            else if (src[i] === '}') depth--;
+            if (depth > 0) i++;
+          }
+          i++;
+          continue;
+        }
+        i++;
+      }
+      i++;
+      continue;
+    }
+    // When we see a potential regex literal start: /pattern/flags
+    // Heuristic: a `/` preceded by operator context (or start of expression)
+    // is a regex literal; preceded by value context (ident, ')', ']', '}')
+    // is division. We only need to find *potential* regex patterns; false
+    // positives in the regex body are harmless (isVulnerable will reject them).
+    if (c === '/') {
+      // Check if this is likely a regex (not division). Division context:
+      // preceded by ident, ), ], }, number, or another /.
+      const prevNonSpace = (() => {
+        let j = i - 1;
+        while (j >= 0 && (src[j] === ' ' || src[j] === '\t' || src[j] === '\n' || src[j] === '\r')) j--;
+        return j >= 0 ? src[j] : '\0';
+      })();
+      const divisionContext = /[a-zA-Z0-9_$)\]}0-9/]/.test(prevNonSpace);
+      // Also skip if this is just a lone / (not part of regex)
+      if (!divisionContext && src[i + 1] !== '/' && src[i + 1] !== '*') {
+        // Try to parse as regex: /pattern/flags
+        let j = i + 1;
+        let escaped = false;
+        let depth = 0;
+        while (j < N) {
+          if (escaped) { escaped = false; j++; continue; }
+          if (src[j] === '\\') { escaped = true; j++; continue; }
+          if (src[j] === '[') depth++;
+          if (src[j] === ']') depth--;
+          if (src[j] === '/' && depth === 0) break;
+          j++;
+        }
+        const pattern = src.slice(i + 1, j);
+        if (j < N && pattern.length > 2 && pattern.length < 1000) {
+          patterns.add(pattern);
+        }
+        i = j + 1;
+        continue;
+      }
+    }
+    i++;
   }
-  // Note: `stripped` is already defined above (comment-stripped src)
+  // Also scan new RegExp() constructor forms — use original src since our
+  // state machine already excluded string/comment content from the extracted
+  // regex patterns above.
   const ctorRe = /new\s+RegExp\s*\(\s*['"`]([^'"`]+)['"`]/g;
-  while ((m = ctorRe.exec(stripped)) !== null) {
+  let m;
+  while ((m = ctorRe.exec(src)) !== null) {
     const p = m[1].replace(/\\(.)/g, '$1');
     if (p.length > 2 && p.length < 1000) patterns.add(p);
   }
@@ -6688,7 +6783,7 @@ async function main(externalOpts) {
   // Phase 12n1 — Tag library-internal findings to reduce FP noise (uses
   // pre-beautify src so library boilerplate signatures are not disturbed
   // by the token-based beautifier).
-  tagLibraryFindings(extendedFindings, srcPreBeautify);
+  tagLibraryFindings([...credentials, ...security, ...extendedFindings], srcPreBeautify);
 
   // ── Apply severity-floor filter ────────────────────────────────────────
   // Filters out findings below the user-specified threshold before they reach
