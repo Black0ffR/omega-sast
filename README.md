@@ -1,6 +1,7 @@
 # OMEGA-5.0 — Zero-Dependency JavaScript SAST Engine
 
 [![Test Suite](https://img.shields.io/badge/tests-571%20passing-brightgreen)](test/)
+[![Ongoing Fixes](https://img.shields.io/badge/fixes-P0--P3%20complete-blue)](OMEGA-SAST-FIX-PLAN-R3.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D14.0.0-green)](package.json)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-success)](package.json)
@@ -31,13 +32,13 @@ OMEGA-5.0 analyzes a JavaScript bundle in 20 phases:
 | 1 | Escape decode | Unicode/hex/octal/HTML-entity |
 | 2 | String decode | fromCharCode, atob, base64, hex arrays (10-pass) |
 | 2b | CharCode decoder | Juice-Shop-style IIFE obfuscation |
-| 2c | obfuscator.io decoder | String-array rotation + RC4/base64 + brute-force fallback |
+| 2c | obfuscator.io decoder | String-array rotation + RC4/base64 + brute-force fallback; multi-layer pass-through + swapped-arg/double-neg wrapper inlining |
 | 2d | Constant evaluator | Safe partial evaluator for runtime strings |
 | 3-6 | Normalization | Booleans, webpack cleanup, Angular Ivy, RxJS |
 | 7 | Beautifier | Token-based formatter (arrow-safe) |
 | 8-8c | Code analysis | Cyclomatic complexity, storage keys, auth surface |
 | 9-9b | Framework detection | Regex + AST-based (Angular/Vue/React/Svelte/Next) |
-| 10-11 | Routes & credentials | API routes, 32 credential patterns |
+| 10-11 | Routes & credentials | API routes, 33+ credential patterns (generalized API key/secret regex with fpGuard) |
 | 12 | Security patterns | XSS, injection, crypto, network, storage |
 | 12b-m | Behavioral detectors | Dynamic code, business logic, WebSocket, IDOR, CVEs |
 | 12o-p | Modern scanners | JWT/WebCrypto/Node crypto, network surface |

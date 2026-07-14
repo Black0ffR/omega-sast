@@ -704,13 +704,19 @@ const CREDENTIAL_PATTERNS = [
     re:/(?:testingUsername|testingPassword|TESTING_CRED)\s*=\s*["']([^"']+)["']/gi,
     fpGuard: null },
   { name:'Hardcoded API Key',    severity:'critical',
-    re:/(?:api[_-]?key|apikey)\s*[:=]\s*["']([A-Za-z0-9_\-]{20,64})["']/gi,
-    fpGuard: null },
+    re:/(?:api[_-]?key|apikey|api[_-]?secret)\s*[:=]\s*["']([A-Za-z0-9_\-]{12,64})["']/gi,
+    fpGuard: v => /^(?:true|false|null|undefined|placeholder|example|test)/i.test(v) },
   { name:'Hardcoded API Key',    severity:'critical',
-    // JSON-style: 'apiKey':'...' or {"apiKey":"..."} where key and value are
-    // adjacent string literals (common in decoded obfuscator.io output)
-    re:/['"](?:api[_-]?key|apikey)['"]\s*[:=]\s*['"]((?:sk_live|sk_test|sk_prod)[A-Za-z0-9_\-]{16,60})['"]/gi,
-    fpGuard: null },
+    // JSON-style: 'apiKey':'...' or {"apiKey":"..."} or {'secret':'...'}
+    // where both key name and value are adjacent string literals
+    // (common in decoded obfuscator.io output and JSON config blocks).
+    // Requires value to look like a secret (≥12 chars, mixed case/digits).
+    re:/['"](?:api[_-]?key|apikey|secret|token|api[_-]?secret)['"]\s*[:=]\s*['"]([^'"]{12,})['"]/gi,
+    fpGuard: v => {
+      if (/^(?:true|false|null|undefined|placeholder|example|test)/i.test(v)) return true;
+      if (/^[a-z]+$/.test(v)) return true;
+      return false;
+    } },
   { name:'JWT Secret',           severity:'critical',
     re:/(?:jwt[_-]?secret|jwtSecret)\s*[:=]\s*["']([^"']{8,})["']/gi,
     fpGuard: null },
@@ -827,7 +833,12 @@ const SECURITY_PATTERNS = [
     } },
   { id:'sqli-concat',    cat:'Injection',  sev:'high',
     re:/(?:query|sql|exec)\s*=\s*["'][^"']*["']\s*\+/gi,
-    ctx: m => !/placeholder|label|aria/.test(m) },
+    ctx: m => {
+      if (/placeholder|label|aria/.test(m)) return false;
+      // Suppress indexOf patterns (=== -1)
+      if (/===\s*-1/.test(m)) return false;
+      return true;
+    } },
   { id:'cmd-injection',  cat:'Injection',  sev:'critical',
     re:/(?:child_process|cp|shell(?:js)?)\s*["']?\s*\)?\s*\.\s*(?:exec(?:Sync)?|spawn(?:Sync)?|fork)\s*\(/g, ctx: null },
   { id:'cmd-injection',  cat:'Injection',  sev:'critical',
@@ -992,7 +1003,13 @@ const SECURITY_PATTERNS = [
   // ── B6: Insufficient Randomness ─────────────────────────────────────────
   { id:'rand-date-token',  cat:'Broken Crypto', sev:'high',
     re:/(?:Date\.now\(\)|new\s+Date\(\)\.getTime\(\))/g,
-    ctx: m => /token|nonce|csrf|session|secret|key|nonce/i.test(m) },
+    ctx: m => {
+      const c = m.slice(0, 300);
+      if (!/token|nonce|csrf|session|secret|nonce/i.test(c)) return false;
+      // Exclude analytics/tracking/timing contexts (gtag, Google Analytics)
+      if (/ga|gtag|analytics|tracking|performance|sendHitTask|timingCategory|timingVar/i.test(c)) return false;
+      return true;
+    } },
   { id:'rand-math-token',  cat:'Broken Crypto', sev:'high',
     re:/Math\.random\(\)\s*\.\s*toString\s*\(\s*36\s*\)/g,
     ctx: m => {
@@ -1096,8 +1113,9 @@ const FRAMEWORKS = [
     },
     uniqueMarkers: [/from\s*['"]vue['"]/, /createApp\s*\(/, /defineComponent\s*\(\s*\{/, /new\s+Vue\s*\(/],
   },
-  { name:'React',     re:/React\.createElement|ReactDOM\.render|useState\s*\(|jsx-runtime/,
-    score: s => (s.match(/React\.createElement|ReactDOM\.render|useState\s*\(|useEffect\s*\(|useRef\s*\(|jsx-runtime/g)||[]).length,
+  { name:'React',     re:/React\.createElement|ReactDOM\.render|useState\s*\(|jsx-runtime|__SECRET_INTERNALS_DO_NOT_USE|_reactRootContainer/,
+    score: s => (s.match(/React\.createElement|ReactDOM\.render|useState\s*\(|useEffect\s*\(|useRef\s*\(|jsx-runtime|__SECRET_INTERNALS_DO_NOT_USE|_reactRootContainer/g)||[]).length,
+    guard: s => !/angular|vue\b|svelte/.test(s.toLowerCase().slice(0,2000)),
   },
   { name:'Express',   re:/app\.(?:get|post|put|delete|use)\s*\(\s*["']\//,
     score: s => (s.match(/app\.(?:get|post|put|delete|use)\s*\(\s*['"]/g)||[]).length,
@@ -1940,6 +1958,7 @@ function decodeObfuscatorIo(src) {
       //   same-order:   function W(a,b){return D(a OP OFFSET, b);}
       //   swapped-arg:  function W(a,b){return D(b OP OFFSET, a);}
       //   double-neg:   function W(a,b){return D(a - -OFSET, b);}  →  D(a + OFFSET, b)
+      //   pass-through: function W(a,b){return D(a,b);}
       const wrapperRe = new RegExp(
         `function\\s+([A-Za-z_$][\\w$]*)\\s*\\(\\s*([A-Za-z_$][\\w$]*)\\s*,\\s*([A-Za-z_$][\\w$]*)\\s*\\)\\s*\\{\\s*return\\s+${decName}\\s*\\(\\s*(?:\\2|\\3)\\s*(?:(?:([+-])\\s*(0x[0-9a-fA-F]+|\\d+))|-\\s*-\\s*(0x[0-9a-fA-F]+|\\d+))\\s*,\\s*(?:\\2|\\3)\\s*\\)\\s*;?\\s*\\}`,
         'g'
@@ -1958,10 +1977,31 @@ function decodeObfuscatorIo(src) {
           op,
           offset,
           isSwapped,
+          isPassthrough: false,
+        });
+      }
+      // Also detect pass-through wrappers: function W(a,b){return D(a,b);}
+      // (no arithmetic offset — just two-arg passthrough to a two-arg decoder)
+      const passthroughRe = new RegExp(
+        `function\\s+([A-Za-z_$][\\w$]*)\\s*\\(\\s*([A-Za-z_$][\\w$]*)\\s*,\\s*([A-Za-z_$][\\w$]*)\\s*\\)\\s*\\{\\s*return\\s+${decName}\\s*\\(\\s*\\2\\s*,\\s*\\3\\s*\\)\\s*;?\\s*\\}`,
+        'g'
+      );
+      while ((wm = passthroughRe.exec(src)) !== null) {
+        wrapperInfos.push({
+          wrapperName: wm[1],
+          isPassthrough: true,
         });
       }
       // ── Step 3c: inline wrapper calls into direct decoder calls ───────
       for (const wi of wrapperInfos) {
+        if (wi.isPassthrough) {
+          const passthroughCallRe = new RegExp(
+            `\\b${wi.wrapperName}\\s*\\(\\s*(-?0x[0-9a-fA-F]+|-?\\d+)\\s*,\\s*(["'])([^"']*)\\2\\s*\\)`,
+            'g'
+          );
+          src = src.replace(passthroughCallRe, `${decName}($1, $2$3$2)`);
+          continue;
+        }
         const wrapperCallRe = new RegExp(
           wi.isSwapped
             ? `\\b${wi.wrapperName}\\s*\\(\\s*(["'])([^"']*)\\1\\s*,\\s*(-?0x[0-9a-fA-F]+|-?\\d+)\\s*\\)`
@@ -2500,7 +2540,7 @@ function detectFrameworkHits(src) {
   return {
     angular: /ɵɵ|ɵcmp|ɵfac|ɵprov|ivy/.test(src),
     vue:     /__vccOpts|createElementVNode|openBlock|__vueParentComponent/.test(src),
-    react:   /React\.createElement|__reactFiber|jsx-runtime|react-dom/.test(src),
+    react:   /React\.createElement|__reactFiber|jsx-runtime|react-dom|__SECRET_INTERNALS_DO_NOT_USE|_reactRootContainer|_reactInternals/.test(src),
     svelte:  /SvelteComponent|mount_component|create_fragment|svelte\/internal/.test(src),
     nextjs:  /__NEXT_DATA__|next\/dist|_next\/static|usePathname/.test(src),
     webpack: /__webpack_require__|webpackChunk|webpackJsonp|performance\.mark\(\s*["']js-parse-end/.test(src),
@@ -3347,8 +3387,15 @@ function extractRoutes(src, charCodeFindings, rawSrc) {
   while ((m = wsRe.exec(src)) !== null) addRoute(m[0], 'WebSocket');
 
   // ── GraphQL operations ───────────────────────────────────────────────
-  const gqlRe = /(?:query|mutation|subscription)\s+\w+/g;
-  while ((m = gqlRe.exec(src)) !== null) addRoute(m[0], 'GraphQL');
+  // Require opening brace or paren after operation name — prevents matching
+  // JS variable names like `querykey`, `querykeys`, `querywhen` as GraphQL.
+  const gqlRe = /(?:query|mutation|subscription)\s+\w+\s*[({]/g;
+  while ((m = gqlRe.exec(src)) !== null) {
+    // Exclude JS property access contexts (e.g. obj.query() or const query =)
+    const ctx = src.slice(Math.max(0, m.index - 80), m.index);
+    if (/[.=]\s*$/.test(ctx)) continue; // obj.query or obj.queryKey
+    addRoute(m[0], 'GraphQL');
+  }
 
   // ── Next.js page/app routes ──────────────────────────────────────────
   const nextRouteRe = /["'](\/(?:app|pages)\/[^"'\s]{1,80})["']/g;
@@ -4687,8 +4734,9 @@ function scoreAttackSurface(allFindings, authSurface, routes, astContext) {
     // Code complexity — purely informational, low weight
     if (astContext.callGraph && astContext.callGraph.stats && astContext.callGraph.stats.callSites > 100) {
       const pts = Math.floor(astContext.callGraph.stats.callSites / 200);
-      score += pts;
-      breakdown['Code Complexity'] = pts;
+      const capped = Math.min(pts, 15);
+      score += capped;
+      breakdown['Code Complexity'] = capped;
     }
   }
 
@@ -6109,6 +6157,7 @@ async function main(externalOpts) {
   }
   if (chunked) {
     src = lines.join('\n');
+    opts._singleLineHuge = true;
     if (!opts.quiet) console.log(warn(`Input contains lines > 100 KB — chunked for regex safety`));
   }
 
@@ -6141,29 +6190,34 @@ async function main(externalOpts) {
   // Multi-pass: iterate the decoder over its own output to resolve multi-layer
   // RC4 where decoded strings contain further decoder call sites.
   // Convergence check: stop when a pass produces no *new* decoded strings.
-  if (opts.verbose) console.log(info('  Phase 2c: obfuscator.io string-array decoder…'));
-  let src2c = src;
   const obfIoFindings = [];
   const obfIoDecoded = [];
-  const decodedSet = new Set();
-  for (let pass = 0; pass < 5; pass++) {
-    const result = decodeObfuscatorIo(src2c);
-    const newStrings = result.decodedStrings.filter(d => {
-      const k = d.decoded || '';
-      if (decodedSet.has(k)) return false;
-      decodedSet.add(k);
-      return true;
-    });
-    if (newStrings.length === 0) break;
-    src2c = result.src;
-    obfIoFindings.push(...result.findings);
-    obfIoDecoded.push(...newStrings);
-    if (opts.verbose) console.log(info(`  Phase 2c pass ${pass + 2}: ${newStrings.length} new strings decoded`));
-  }
-  src = src2c;
-  if (obfIoDecoded.length && !opts.quiet) {
-    console.log(ok(`Phase 2c: obfuscator.io decoder — ${obfIoDecoded.length} strings decoded`));
-    obfIoDecoded.slice(0, 10).forEach(d => console.log(`  ${C.cyan}→${C.reset} "${d.decoded.slice(0,40)}"  (idx=${d.idx}${d.key ? ', RC4' : ''})`));
+  if (opts._singleLineHuge) {
+    if (!opts.quiet) console.log(warn('  Phase 2c: skip obfuscator.io decoder on pathological single-line input'));
+  } else {
+    if (opts.verbose) console.log(info('  Phase 2c: obfuscator.io string-array decoder…'));
+    let src2c = src;
+    const decodedSet = new Set();
+    for (let pass = 0; pass < 5; pass++) {
+      const result = decodeObfuscatorIo(src2c);
+      src2c = result.src;
+      obfIoFindings.push(...result.findings);
+      const newStrings = result.decodedStrings.filter(d => {
+        const k = d.decoded || '';
+        if (decodedSet.has(k)) return false;
+        decodedSet.add(k);
+        return true;
+      });
+      if (newStrings.length === 0) break;
+      obfIoDecoded.push(...newStrings);
+      if (opts.verbose) console.log(info(`  Phase 2c pass ${pass + 2}: ${newStrings.length} new strings decoded`));
+    }
+    src = src2c;
+    if (obfIoDecoded.length && !opts.quiet) {
+      const maxPreview = 5;
+      console.log(ok(`Phase 2c: obfuscator.io decoder — ${obfIoDecoded.length} strings decoded`));
+      obfIoDecoded.slice(0, maxPreview).forEach(d => console.log(`  ${C.cyan}→${C.reset} "${d.decoded.slice(0, 40)}"  (idx=${d.idx}${d.key ? ', RC4' : ''})`));
+    }
   }
 
   // Phase 2d — constant-expression evaluator (Stage 5)
@@ -6204,9 +6258,11 @@ async function main(externalOpts) {
   // Phase 7 — Beautify
   // Save pre-beautify src for route extraction (some patterns are cleaner before formatting)
   const srcPreBeautify = src;
-  if (opts.beautify) {
+  if (opts.beautify && !opts._singleLineHuge) {
     if (opts.verbose) console.log(info('  Phase 7: Token-based beautification…'));
     src = beautify(src);
+  } else if (opts._singleLineHuge && !opts.quiet) {
+    console.log(warn('  Phase 7: skip beautifier on pathological single-line input'));
   }
 
   const decodedPath = path.join(outDir, path.basename(inputPath, '.js') + '.decoded.js');
