@@ -1492,7 +1492,21 @@ function trackTaintAST(src, structuralIndex, callGraph) {
   for (const cs of structuralIndex.callSites) {
     if (cs.callee.kind !== 'ident') continue;
     const sink = isSinkCallee(cs.callee.text);
-    if (sink) sinks.push({ startPos: cs.startPos, endPos: cs.endPos, callee: cs.callee, meta: sink });
+    if (!sink) continue;
+    // setAttribute FP guard: only flag when first arg is a string starting with "on"
+    if (cs.callee.text.endsWith('.setAttribute')) {
+      const afterOpen = src.indexOf('(', cs.startPos);
+      if (afterOpen >= 0) {
+        const firstArgSrc = src.slice(afterOpen + 1, cs.endPos).trim();
+        const qt = firstArgSrc[0];
+        if (qt === "'" || qt === '"') {
+          const close = firstArgSrc.indexOf(qt, 1);
+          const argVal = close > 0 ? firstArgSrc.slice(1, close) : '';
+          if (!/^on[a-z]/i.test(argVal)) continue;
+        } else { continue; }
+      } else { continue; }
+    }
+    sinks.push({ startPos: cs.startPos, endPos: cs.endPos, callee: cs.callee, meta: sink });
   }
 
   // ── SSA-style taint propagation ─────────────────────────────────────────
