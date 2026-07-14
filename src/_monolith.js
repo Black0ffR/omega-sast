@@ -6313,6 +6313,12 @@ async function main(externalOpts) {
       console.log(ok(`Phase 2c: obfuscator.io decoder — ${obfIoDecoded.length} strings decoded`));
       obfIoDecoded.slice(0, maxPreview).forEach(d => console.log(`  ${C.cyan}→${C.reset} "${d.decoded.slice(0, 40)}"  (idx=${d.idx}${d.key ? ', RC4' : ''})`));
     }
+    // Update decoder findings with decoded string count (fixes test assertion)
+    for (const f of obfIoFindings) {
+      if (f.id === 'obfuscator-io-decoder') {
+        f.value += ` — ${obfIoDecoded.length} strings decoded`;
+      }
+    }
   }
 
   // Phase 2d — constant-expression evaluator (Stage 5)
@@ -6956,6 +6962,7 @@ async function main(externalOpts) {
       concat:           strStats.concat,
       aliasesResolved:  aliasCount,
       frameworkSymbols: frameworkSymStats.symbolsAnnotated,
+      obfuscatorIo:     obfIoDecoded.length,
       charCodeDecoded:  charCodeFindings.length,
     };
     generateReports({
