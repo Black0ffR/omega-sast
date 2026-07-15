@@ -6667,6 +6667,35 @@ async function main(externalOpts) {
     // Phase 16 — Obfuscator fingerprinting (Stage 5)
     if (opts.verbose) console.log(info('  Phase 16: Obfuscator fingerprinting (Stage 5)…'));
     obfuscatorFingerprint = ast.fingerprintObfuscator(astSrc);
+    if (obfuscatorFingerprint.primary === null && obfIoFindings.length > 0) {
+      const hasRotation = obfIoFindings.some(f => /rotation/i.test(f.id || ''));
+      const hasRC4 = obfIoFindings.some(f => /RC4/i.test(f.value || ''));
+      if (hasRotation && hasRC4) {
+        obfuscatorFingerprint.primary = {
+          obfuscator: 'obfuscator.io',
+          confidence: 0.85,
+          version: 'modern (decoder corroboration)',
+          matched: [{
+            signature: 'decoder-findings-corroboration',
+            pos: 0,
+            evidence: `Phase 2c found rotation + ${obfIoFindings.filter(f => /RC4/i.test(f.value)).length} RC4 decoder(s)`,
+            hint: 'decoder findings corroborate obfuscator.io despite mangled idents',
+          }],
+        };
+      } else if (hasRotation || hasRC4) {
+        obfuscatorFingerprint.primary = {
+          obfuscator: 'obfuscator.io',
+          confidence: 0.6,
+          version: 'modern (partial decoder corroboration)',
+          matched: [{
+            signature: 'decoder-findings-corroboration',
+            pos: 0,
+            evidence: `Phase 2c found ${hasRotation ? 'rotation' : ''}${hasRotation && hasRC4 ? ' + ' : ''}${hasRC4 ? 'RC4 decoder(s)' : ''}`,
+            hint: 'partial decoder findings suggest obfuscator.io',
+          }],
+        };
+      }
+    }
     if (opts.verbose && obfuscatorFingerprint.primary) {
       console.log(info(`  Obfuscator: ${obfuscatorFingerprint.primary.obfuscator} (${(obfuscatorFingerprint.primary.confidence * 100).toFixed(0)}% confidence) — ${obfuscatorFingerprint.primary.matched.length} signatures`));
     }
