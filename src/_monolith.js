@@ -1001,6 +1001,11 @@ const SECURITY_PATTERNS = [
   // Use proto-write above for write-only detection.
   { id:'proto-setproto',  cat:'Prototype Pollution', sev:'medium',
     re:/Object\.setPrototypeOf\s*\(/g, ctx: m => /Object\.prototype/.test(m) },
+  // proto-forin: for...in loop with variable-key assignment that could set __proto__
+  // Catches `for(var k in src) target[k] = src[k]` — dynamic property copy
+  { id:'proto-forin',  cat:'Prototype Pollution', sev:'medium',
+    re:/for\s*\(\s*(?:var\s+|let\s+|const\s+)?([a-zA-Z_$][\w$]*)\s+in\s+[a-zA-Z_$][\w$]*\)[\s\S]{0,200}?\1\]\s*=\s*[\s\S]{0,100}?\1\]/g,
+    ctx: () => true },
   { id:'proto-jsonparse',  cat:'Prototype Pollution', sev:'medium',
     // Negative lookahead: skip JSON.parse(JSON.stringify(x)) deep-clone pattern.
     // Bare JSON.parse(<ident>) is also skipped unless __proto__ / constructor are
@@ -2859,8 +2864,8 @@ function normaliseBooleans(src) {
     .replace(/\b!1\b/g, 'false')
     .replace(/\bvoid\s+0\b/g, 'undefined')
     .replace(/\bvoid\(0\)/g, 'undefined')
-    .replace(/\b!!\[\]/g, 'true')
-    .replace(/\b!\[\]/g, 'false')
+    .replace(/(?:\b|(?<=[\(,=!]))!!\[\]/g, 'true')
+    .replace(/(?:\b|(?<=[\(,=!]))!\[\]/g, 'false')
     .replace(/\+\[\]/g, '0');
 }
 
@@ -2895,25 +2900,26 @@ function eliminateOpaquePredicates(src) {
 
     // 1. Simplify boolean literals in if(EXPR) — already true/false from Phase 3
     // Remove `if (true) { ... }` → just `{ ... }` (keep block for semicolon safety)
-    src = src.replace(/if\s*\(\s*true\s*\)\s*\{([^}]*(?:\{[^}]*\}[^}]*)*)\s*\}/g, (full, body) => {
+    // Uses brace-matching that handles up to 2 levels of nesting (e.g. {a: {b: 1}})
+    src = src.replace(/if\s*\(\s*true\s*\)\s*\{([^{}]*(?:\{(?:[^{}]|\{[^{}]*\})*\}[^{}]*)*)\s*\}/g, (full, body) => {
       changed = true;
       return body.trim();
     });
 
     // Remove `if (false) { ... }` entirely
-    src = src.replace(/if\s*\(\s*false\s*\)\s*\{([^}]*(?:\{[^}]*\}[^}]*)*)\s*\}/g, () => {
+    src = src.replace(/if\s*\(\s*false\s*\)\s*\{([^{}]*(?:\{(?:[^{}]|\{[^{}]*\})*\}[^{}]*)*)\s*\}/g, () => {
       changed = true;
       return '';
     });
 
     // 2. if (true) { A } else { B } → A
-    src = src.replace(/if\s*\(\s*true\s*\)\s*\{([^}]*(?:\{[^}]*\}[^}]*)*)\s*\}\s*else\s*\{([^}]*(?:\{[^}]*\}[^}]*)*)\s*\}/g, (full, a) => {
+    src = src.replace(/if\s*\(\s*true\s*\)\s*\{([^{}]*(?:\{(?:[^{}]|\{[^{}]*\})*\}[^{}]*)*)\s*\}\s*else\s*\{([^{}]*(?:\{(?:[^{}]|\{[^{}]*\})*\}[^{}]*)*)\s*\}/g, (full, a) => {
       changed = true;
       return a.trim();
     });
 
     // if (false) { A } else { B } → B
-    src = src.replace(/if\s*\(\s*false\s*\)\s*\{([^}]*(?:\{[^}]*\}[^}]*)*)\s*\}\s*else\s*\{([^}]*(?:\{[^}]*\}[^}]*)*)\s*\}/g, (full, a, b) => {
+    src = src.replace(/if\s*\(\s*false\s*\)\s*\{([^{}]*(?:\{(?:[^{}]|\{[^{}]*\})*\}[^{}]*)*)\s*\}\s*else\s*\{([^{}]*(?:\{(?:[^{}]|\{[^{}]*\})*\}[^{}]*)*)\s*\}/g, (full, a, b) => {
       changed = true;
       return b.trim();
     });
@@ -5215,6 +5221,8 @@ function classifyLibrary(src) {
   if (/axios|XSRF-TOKEN/.test(src)) return 'networking';
   if (/CryptoJS|cryptojs|\bAES\b|\bSHA\d{1,3}\b|WordArray|Cipher|enc\.Utf8/.test(src)) return 'crypto';
   if (/\u0275\w+|angular\.module|ng\.|@angular\//.test(src)) return 'ui-framework';
+  // JJEncode guard: $=~[];$={___:++$ is the classic opening — prevent $ matches hitting jQuery
+  if (/^\s*(?:\$|var\s+\$)\s*=\s*~\[\]\s*;/.test(src)) return 'obfuscated';
   if (/jQuery|\$\.|\$\([^)]*\)\.(?:html|append|prepend|ready|on|click|ajax)/i.test(src)) return 'ui-framework';
   if (/React|createElement|createRoot|useState|useEffect/.test(src)) return 'ui-framework';
   if (/Vue|createApp|defineComponent|ref\s*\(/.test(src)) return 'ui-framework';

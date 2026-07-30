@@ -2574,6 +2574,33 @@ function fingerprintObfuscator(src) {
     });
   }
 
+  // ── AAEncode / Kaomoji encoding signatures ─────────────────────────────
+  // AAEncode encodes JavaScript using Japanese emoticon characters
+  // (ﾟωﾟﾉ= etc.) with the pattern: `ﾟωﾟﾉ= /｀ｍ´）ﾉ~┻━┻   ...`
+  let aaencodeScore = 0;
+  const aaencodeSigs = [];
+  const aaUnicode = (src.match(/[\u3040-\u309F\u30A0-\u30FF\uFF00-\uFFEFｦ-ﾟ]/g) || []).length;
+  // AAEncode typically has >30% Unicode kaomoji chars in the first 500 chars
+  const first500 = src.slice(0, 500);
+  const aaFirst500 = (first500.match(/[\u3040-\u309F\u30A0-\u30FF\uFF00-\uFFEFｦ-ﾟ]/g) || []).length;
+  if (aaFirst500 > 20 && aaFirst500 > first500.length * 0.15) {
+    aaencodeScore += 0.7;
+    aaencodeSigs.push({
+      signature: 'aaencode-unicode-kaomoji',
+      pos: 0,
+      evidence: `${aaFirst500} Unicode kaomoji chars in first 500 (${(aaFirst500 / first500.length * 100).toFixed(0)}%)`,
+      hint: 'AAEncode encoding — decode using character substitution table',
+    });
+  }
+  if (aaencodeScore >= 0.3) {
+    signatures.push({
+      obfuscator: 'AAEncode',
+      confidence: Math.min(aaencodeScore, 1.0),
+      version: 'classic',
+      matched: aaencodeSigs,
+    });
+  }
+
   // ── Generic obfuscation heuristic ───────────────────────────────────────
   // If no specific obfuscator detected, check for general signs:
   //   · High density of hex identifiers (>5 but <20)
