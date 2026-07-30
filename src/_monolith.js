@@ -1002,12 +1002,24 @@ const SECURITY_PATTERNS = [
   { id:'proto-setproto',  cat:'Prototype Pollution', sev:'medium',
     re:/Object\.setPrototypeOf\s*\(/g, ctx: m => /Object\.prototype/.test(m) },
   { id:'proto-jsonparse',  cat:'Prototype Pollution', sev:'medium',
-    re:/JSON\.parse\s*\([^)]+\)/g,
+    // Negative lookahead: skip JSON.parse(JSON.stringify(x)) deep-clone pattern.
+    // Bare JSON.parse(<ident>) is also skipped unless __proto__ / constructor are
+    // near the call — single-ident parses in minified bundles are almost always
+    // benign serialization/deserialization, not prototype pollution.
+    // `prototype` alone is too common in OOP code to distinguish reliably.
+    re:/JSON\.parse\s*\((?!\s*JSON\.stringify\s*\()[^)]+\)/g,
     ctx: m => {
-      // Skip deep-clone pattern JSON.parse(JSON.stringify(x)) — not pollution
-      const inner = m.replace(/^JSON\.parse\s*\(/, '').replace(/\)\s*$/, '');
-      if (/^JSON\.stringify\s*\(/.test(inner)) return false;
-      return /user|request|input|param|__proto__|constructor/i.test(m);
+      const idx = m.indexOf("JSON.parse");
+      if (idx === -1) return false;
+      // Look within 60 chars before / 80 chars after the JSON.parse call
+      const near = m.slice(Math.max(0, idx - 60), Math.min(m.length, idx + 80));
+      if (/__proto__|constructor\s*[=.]/.test(near)) return true;
+      // Complex argument (object literal, expression) may be intentional
+      const argMatch = m.slice(idx).match(/JSON\.parse\s*\(([^)]+)\)/);
+      if (!argMatch) return false;
+      const arg = argMatch[1].trim();
+      if (/^[a-zA-Z_$][\w$.]*$/.test(arg)) return false;
+      return true;
     } },
 
   // ── B5: PostMessage ─────────────────────────────────────────────────────
@@ -4716,9 +4728,11 @@ function scanTaintFlow(src) {
     { re:/(?:location\[["'](?:href|replace|assign)["']\]\s*=|window\.location\[["']href["']\]\s*=)/g, name:'location navigation', sev:'high', cwe:'CWE-601' },
     { re:/\.setAttribute\s*\(\s*['"]on\w+['"]/g, name:'setAttribute(on*)', sev:'critical', cwe:'CWE-79' },
     { re:/\[["']setAttribute["']\]\s*\(\s*['"]on\w+['"]/g, name:'setAttribute(on*)', sev:'critical', cwe:'CWE-79' },
-    { re:/\bexec(?:Sync)?\s*\(/g, name:'exec()', sev:'critical', cwe:'CWE-78' },
-    { re:/\bspawn(?:Sync)?\s*\(/g, name:'spawn()', sev:'critical', cwe:'CWE-78' },
-    { re:/\bfork\s*\(/g, name:'fork()', sev:'critical', cwe:'CWE-78' },
+    // Node-specific sinks: require child_process context to fire — prevents FPs
+    // on browser libraries that happen to have an `exec` identifier or method.
+    { re:/\bexec(?:Sync)?\s*\(/g, name:'exec()', sev:'critical', cwe:'CWE-78', nodeOnly:true },
+    { re:/\bspawn(?:Sync)?\s*\(/g, name:'spawn()', sev:'critical', cwe:'CWE-78', nodeOnly:true },
+    { re:/\bfork\s*\(/g, name:'fork()', sev:'critical', cwe:'CWE-78', nodeOnly:true },
     // ── Path Traversal sinks (CWE-22) —───────────────────────────────────
     { re:/\.(?:readFile|readFileSync)\s*\(/g, name:'readFile', sev:'high', cwe:'CWE-22' },
     { re:/\.(?:writeFile|writeFileSync)\s*\(/g, name:'writeFile', sev:'high', cwe:'CWE-22' },
@@ -4746,10 +4760,14 @@ function scanTaintFlow(src) {
   }
 
   // Check if tainted variables reach sinks
+  const hasChildProcess = /require\s*\(\s*["']child_process["']\s*\)/.test(src);
   for (const sink of SINKS) {
     const re = new RegExp(sink.re.source, 'g');
     let m;
     while ((m = re.exec(src)) !== null) {
+      // Node-only sinks (exec/spawn/fork) require child_process import — prevents
+      // FPs on browser libraries with identically named methods or identifiers.
+      if (sink.nodeOnly && !hasChildProcess) continue;
       // Look at value assigned to sink (next 120 chars)
       const after = src.slice(m.index, m.index + 120);
       // Check if any tainted variable appears in sink context
@@ -5285,6 +5303,8 @@ function scoreAttackSurface(allFindings, authSurface, routes, astContext) {
   if (hiddenRoutes.length) breakdown['Hidden Routes'] = hiddenRoutes.length * 4;
 
   // OMEGA-5.0: AST-derived bonuses
+  let libType = 'general';
+  let dangerMultiplier = 1.0;
   if (astContext) {
     // AWS / cloud metadata references are critical regardless of regex
     if (astContext.networkSurface && astContext.networkSurface.findings.some(f => f.id === 'net-cloud-metadata')) {
@@ -5302,11 +5322,12 @@ function scoreAttackSurface(allFindings, authSurface, routes, astContext) {
       breakdown['Hardcoded Password Hash'] = 25;
     }
     // Library-type calibration: reduce weight for expected API usage
-    const libType = astContext.libraryType || 'general';
-    let dangerMultiplier = 1.0;
+    libType = astContext.libraryType || 'general';
+    dangerMultiplier = 1.0;
     if (libType === 'networking') dangerMultiplier = 0.25;
     else if (libType === 'crypto') dangerMultiplier = 0.25;
     else if (libType === 'ui-framework') dangerMultiplier = 0.50;
+    else if (libType === 'utility') dangerMultiplier = 0.50;
 
     // Dangerous API calls — count unique callee names matching known sinks
     const DANGEROUS_SINKS = new Set([
@@ -5364,6 +5385,15 @@ function scoreAttackSurface(allFindings, authSurface, routes, astContext) {
       score += capped;
       breakdown['Code Complexity'] = capped;
     }
+    // Apply library-type multiplier to Taint Flow findings — browser libraries
+    // (networking, UI frameworks) should not score high on taint flows that are
+    // mostly false positives from generic method names.
+    if (dangerMultiplier < 1.0 && breakdown['Taint Flow']) {
+      const reduced = Math.round(breakdown['Taint Flow'] * dangerMultiplier);
+      score -= (breakdown['Taint Flow'] - reduced);
+      breakdown['Taint Flow'] = reduced;
+      breakdown['Taint Flow (library-adjusted)'] = reduced;
+    }
   }
 
   const risk = score >= 80 ? 'CRITICAL' : score >= 40 ? 'HIGH' : score >= 15 ? 'MEDIUM' : 'LOW';
@@ -5372,7 +5402,7 @@ function scoreAttackSurface(allFindings, authSurface, routes, astContext) {
     .slice(0,5)
     .map(([cat,pts]) => `${cat} (${pts}pts)`);
 
-  return { score, risk, breakdown, topCategories };
+  return { score, risk, breakdown, topCategories, libraryType: libType, dangerMultiplier };
 }
 
 
@@ -7447,9 +7477,10 @@ async function main(externalOpts) {
   const graph = (opts.graph || opts.report) ? buildDependencyGraph(src) : [];
 
   // Phase 12n — B14: Attack surface prioritisation (with AST-augmented scoring)
+  const libraryType = classifyLibrary(src);
   const astContext = useAst ? {
     structuralIndex, modernCrypto, networkSurface, callGraph, astFwFindings, bundlerInfo, webpackGraph,
-    libraryType: classifyLibrary(src),
+    libraryType,
   } : null;
   // Phase 12m2 — Confidence score each finding before aggregation
   const allScored = [...credentials, ...security, ...extendedFindings];
@@ -7595,6 +7626,7 @@ async function main(externalOpts) {
         size:    `${(stat.size/1024).toFixed(1)} KB`,
         sha256, date: new Date().toISOString(),
         version: VERSION,
+        libraryType,
       },
     }, outDir);
     console.log(ok(`HTML report: ${C.bold}${path.join(outDir,'report.html')}${C.reset}`));
