@@ -1133,10 +1133,10 @@ section('4.0 cmd-injection: bare-method pattern + require(child_process) ctx gua
   const out4 = mkTmpDir();
   runOmega([file4, '--security', '--report', '--quiet', '--out', out4]);
   const r4 = readReport(out4);
-  const taint4 = allFindings(r4).filter(f => f.id === 'taint-flow' && /exec|spawn|fork/.test(f.value || ''));
+  const taint4 = allFindings(r4).filter(f => (f.id === 'taint-flow' || f.id === 'taint-ast-ssa') && /exec|spawn|fork/.test(f.value || ''));
   assert('4.4: taint engine produces taint-flow for spawn(cmd) with tainted arg',
     taint4.length >= 1,
-    `got ${taint4.length} taint-flow findings (expected >= 1) — ${taint4.map(t => t.value).join(', ')}`);
+    `got ${taint4.length} taint-flow/SSA findings (expected >= 1) — ${taint4.map(t => t.value).join(', ')}`);
 })();
 
 // ═════════════════════════════════════════════════════════════════════════

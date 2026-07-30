@@ -985,29 +985,40 @@ function detectFrameworksAST(src, structuralIndex) {
     if (T[k].type === 'ident' && T[k].value === '__vccOpts') vueHits++;
   }
   findings.vue.total = vueHits;
-  // Heuristic: each `createElementVNode` call site ≈ one component or template fragment
-  // Use a more conservative divisor — count call sites with `createElementVNode` as 1 component
-  const vueCallSites = structuralIndex.callSites.filter(cs =>
-    cs.callee.kind === 'ident' && /createElement/.test(cs.callee.text)
-  ).length;
-  findings.vue.components = Math.max(1, Math.floor(vueCallSites / 3));
+  // Heuristic: estimate Vue component count from memberAccess + identifier hits.
+  // Use only Vue-specific markers (createElementVNode, createElementBlock, createVNode,
+  // openBlock, defineComponent, __vccOpts) to avoid jQuery and lodash FPs.
+  // The old approach of filtering call sites by /createElement/ was too broad and
+  // matched `T.createElement` (jQuery) and `document.createElement`.
+  findings.vue.components = vueHits > 0 ? Math.max(1, Math.floor(vueHits / 2)) : 0;
 
   // React: count createElement calls and jsx-runtime
+  // Tightened: require unambiguous React-exclusive markers first, so
+  // generic createElement in jQuery/three.js do not produce FPs.
+  const hasReactExclusive = (
+    (src && (src.includes('__SECRET_INTERNALS_DO_NOT_USE_OR_YOU_WILL_BE_FIRED') ||
+             src.includes('"react-dom"') || src.includes("'react-dom'") ||
+             src.includes('"react"') || src.includes("'react'") ||
+             /\brequire\s*\(\s*["']react["']\s*\)/.test(src))) ||
+    structuralIndex.callSites.some(cs =>
+      cs.callee.kind === 'ident' && ['forwardRef', 'jsxDEV', 'createRef', 'cloneElement',
+        'useState', 'useEffect', 'useCallback', 'useMemo', 'useRef', 'useContext',
+        'createContext', 'memo', 'Fragment', 'StrictMode', 'Suspense',
+        'useReducer', 'useLayoutEffect', 'useImperativeHandle', 'useDebugValue',
+        'unstable_batchedUpdates', 'act', 'createPortal',
+        'Profiler', 'lazy', 'createFactory',
+      ].includes(cs.callee.text))
+  );
   let reactHits = 0;
-  for (const cs of structuralIndex.callSites) {
-    if (cs.callee.kind === 'ident' &&
-        (cs.callee.text === 'createElement' || cs.callee.text.endsWith('.createElement') ||
-         cs.callee.text === 'jsx' || cs.callee.text === 'jsxs' ||
-         cs.callee.text === 'jsxDEV' || cs.callee.text === 'forwardRef')) {
-      reactHits++;
+  if (hasReactExclusive) {
+    for (const cs of structuralIndex.callSites) {
+      if (cs.callee.kind === 'ident' &&
+          (cs.callee.text === 'createElement' || cs.callee.text.endsWith('.createElement') ||
+           cs.callee.text === 'jsx' || cs.callee.text === 'jsxs' ||
+           cs.callee.text === 'jsxDEV' || cs.callee.text === 'forwardRef')) {
+        reactHits++;
+      }
     }
-  }
-  // Also check for production React bundles using the source string directly
-  if (reactHits === 0 && src && (
-    src.includes('__SECRET_INTERNALS_DO_NOT_USE_OR_YOU_WILL_BE_FIRED') ||
-    src.includes('"react-dom"') || src.includes("'react-dom'")
-  )) {
-    reactHits = 10;
   }
   // Conservative component count: every 2 createElement callsites ≈ 1 component
   findings.react.components = Math.max(0, Math.floor(reactHits / 2));
@@ -1388,11 +1399,25 @@ function trackTaintAST(src, structuralIndex, callGraph) {
       'insertAdjacentHTML':{ sev:'critical', cwe:'CWE-79', name:'insertAdjacentHTML' },
       'write':             { sev:'critical', cwe:'CWE-79', name:'document.write', needPrefix:'document.' },
       'eval':              { sev:'critical', cwe:'CWE-95', name:'eval()', isBare:true },
+      'exec':              { sev:'critical', cwe:'CWE-78', name:'exec()', isBare:true },
+      'execSync':          { sev:'critical', cwe:'CWE-78', name:'execSync()', isBare:true },
+      'spawn':             { sev:'critical', cwe:'CWE-78', name:'spawn()', isBare:true },
+      'spawnSync':         { sev:'critical', cwe:'CWE-78', name:'spawnSync()', isBare:true },
+      'fork':              { sev:'critical', cwe:'CWE-78', name:'fork()', isBare:true },
       'setAttribute':      { sev:'critical', cwe:'CWE-79', name:'setAttribute(on*)' },
       'href':              { sev:'high',     cwe:'CWE-601', name:'location.href', needPrefix:'location.' },
       'replace':           { sev:'high',     cwe:'CWE-601', name:'location.replace', needPrefix:'location.' },
       'assign':            { sev:'high',     cwe:'CWE-601', name:'location.assign', needPrefix:'location.' },
       'open':              { sev:'medium',   cwe:'CWE-79', name:'window.open' , needPrefix:'window.' },
+      // ── File-system / path-traversal sinks (CWE-22) ───────────────────
+      'readFile':          { sev:'high',     cwe:'CWE-22', name:'readFile', needPrefix:'fs.' },
+      'readFileSync':      { sev:'high',     cwe:'CWE-22', name:'readFileSync', needPrefix:'fs.' },
+      'writeFile':         { sev:'high',     cwe:'CWE-22', name:'writeFile', needPrefix:'fs.' },
+      'writeFileSync':     { sev:'high',     cwe:'CWE-22', name:'writeFileSync', needPrefix:'fs.' },
+      'appendFile':        { sev:'high',     cwe:'CWE-22', name:'appendFile', needPrefix:'fs.' },
+      'appendFileSync':    { sev:'high',     cwe:'CWE-22', name:'appendFileSync', needPrefix:'fs.' },
+      'unlink':            { sev:'high',     cwe:'CWE-22', name:'unlink', needPrefix:'fs.' },
+      'unlinkSync':        { sev:'high',     cwe:'CWE-22', name:'unlinkSync', needPrefix:'fs.' },
     };
 
     // Bare sinks: whole callee name is the sink (e.g. `eval`, `alert`).

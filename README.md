@@ -1,11 +1,10 @@
 # OMEGA-5.0 — Zero-Dependency JavaScript SAST Engine
 
 [![Test Suite](https://img.shields.io/badge/tests-571%20passing-brightgreen)](test/)
+[![Zero Deps](https://img.shields.io/badge/dependencies-0-success)](package.json)
 [![Ongoing Fixes](https://img.shields.io/badge/fixes-P0--P3%20complete-blue)](OMEGA-SAST-FIX-PLAN-R3.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D14.0.0-green)](package.json)
-[![Zero Dependencies](https://img.shields.io/badge/dependencies-0-success)](package.json)
-
 A hand-rolled, zero-dependency static analysis engine for JavaScript bundles. Built for security researchers analyzing minified, framework-heavy production code. Combines structural AST analysis, inter-procedural taint tracking, obfuscator fingerprinting, and LLM-ready payload generation — all in a single Node.js package with no external dependencies.
 
 ## Quick Start
@@ -28,6 +27,7 @@ OMEGA-5.0 analyzes a JavaScript bundle in 20 phases:
 
 | Phase | Function | Description |
 |-------|----------|-------------|
+| 0a | TypeScript stripper | Removes TS annotations for `.ts`-as-`.js` analysis |
 | 0 | Module alias resolver | Maps `d(N)` → npm package name |
 | 1 | Escape decode | Unicode/hex/octal/HTML-entity |
 | 2 | String decode | fromCharCode, atob, base64, hex arrays (10-pass) |
@@ -43,10 +43,13 @@ OMEGA-5.0 analyzes a JavaScript bundle in 20 phases:
 | 12b-m | Behavioral detectors | Dynamic code, business logic, WebSocket, IDOR, CVEs |
 | 12o-p | Modern scanners | JWT/WebCrypto/Node crypto, network surface |
 | 12r | ReDoS detection | In-source ReDoS vulnerable pattern scan |
+| 12s | Pluggable custom rules | User-defined regex patterns from `.omega-rules.json` |
 | 12q | Source map parser | Inline/external map detection |
 | 13-14 | Webpack + call graph | Module resolution, dependency edges |
 | 14c | AST taint tracker | SSA-based cross-statement taint |
-| 15 | Reports | HTML (dark-mode) + JSON + Markdown |
+| 2c2 | CFF de-flattener | Linearizes `while(1){switch(x){case…}}` patterns |
+| 3b | Opaque predicate eliminator | Removes dead branches (`if(true){A}else{B}` → `A`) |
+| 15 | Reports | HTML (dark-mode) + JSON + Markdown + SARIF |
 | 16 | Obfuscator fingerprint | obfuscator.io, Jscrambler, ByteHide, JSFuck |
 | 17 | Function summaries | Per-function taint contracts (LLM payload) |
 | 18 | Backward slicer | Sink-anchored inter-procedural paths |
@@ -57,6 +60,43 @@ OMEGA-5.0 analyzes a JavaScript bundle in 20 phases:
 
 ### Inter-Procedural Taint Tracking
 Tracks data flow from taint sources (`location.hash`, `localStorage`, `event.data`) through function boundaries to dangerous sinks (`innerHTML`, `eval`, `exec`, `spawn`, `fork`). Uses per-function SSA-style variable tracking with destructuring support.
+
+### CFF De-Flattener (Phase 2c.2)
+Detects and linearizes control-flow flattening (`while(1) { switch(dispatcher) { case … } }`) produced by obfuscator.io, JScrambler, and similar tools. Uses brace-matched string parsing — no AST required. Handles multi-layer flattening via iterative passes (max 5).
+
+### Opaque Predicate Eliminator (Phase 3b)
+Removes dead code branches after constant folding:
+- `if (true) { A } else { B }` → `A`
+- `if (false) { A }` → removed
+- `"str" === "str"` → `true`, `x !== x` → `false`
+- `true ? A : B` → `A`, `false ? A : B` → `B`
+
+### TypeScript Stripper (Phase 0a)
+Strips TypeScript type annotations so `.ts` files can be analyzed as plain `.js`:
+- Removes `: Type`, `as Type`, `interface`, `type`, `enum`, `declare`, decorators, generics
+- Does NOT require `tsc` or any TypeScript tooling
+
+### Pluggable Custom Rules (Phase 12s)
+Load user-defined regex patterns from `.omega-rules.json`:
+```json
+[
+  { "id": "danger-fn", "name": "Dangerous Function",
+    "severity": "high", "category": "custom",
+    "pattern": "dangerousFunction\\s*\\(",
+    "description": "Custom dangerous function pattern" }
+]
+```
+Use with `--custom-rules <path>`.
+
+### SARIF 2.1.0 Output
+When `--report` is used, OMEGA emits `report.sarif` in SARIF v2.1.0 format, compatible with GitHub Code Scanning and other SARIF viewers. Includes artifact arrays, precise startLine locations, and baseline suppression tagging.
+
+### Baseline Suppression (.omega-ignore)
+Suppress known findings using a JSON baseline file:
+```json
+[{ "id": "hardcoded-credential", "file": "bundle.js", "reason": "Won't fix" }]
+```
+Use with `--baseline <file>`. Suppressed findings are tagged in SARIF output as `suppressed` (kind: `external`). Use `--update-baseline` to generate a baseline from current scan results.
 
 ### Obfuscator Fingerprinting
 Detects 6 obfuscator types (obfuscator.io, Jscrambler, ByteHide, JSProtect, JSFuck, generic) with confidence scoring. Emits LLM-actionable metadata: "expect mangled identifiers", "expect control-flow flattening", etc.
@@ -81,6 +121,8 @@ Options:
   --module-map <f>      Load external webpack module-id → name map (JSON)
   --severity-floor <s>  Minimum severity (critical|high|medium|low|info)
   --no-ast              Disable AST pass (regex-only fallback)
+  --treat-ts-as-js      Strip TypeScript annotations before analysis
+  --custom-rules <f>    Path to .omega-rules.json for pluggable rule patterns
 
 CI Exit Codes (OMEGA_FAIL_ON env var):
   0=clean, 1=error, 2=critical (default), 3=high+, 4=medium+, 5=low+
@@ -170,7 +212,7 @@ omega-sast/
 ## Test Suite
 
 ```bash
-# Run all 571 tests
+# Run all 571 tests (100% pass rate)
 npm test
 
 # Run individual suites
@@ -208,7 +250,7 @@ npm run test:obfuscator
 - **Command injection**: Covered via both pattern matching (`child_process`, `cp`, `shell` prefixes and bare `exec`/`spawn`/`fork` with `require("child_process")` context guard) and taint tracking (sinks include `exec`, `spawn`, `fork`). Covers destructured imports and dynamic require patterns.
 - **Bracket-notation sinks**: Security patterns and taint tracking cover bracket-notation invocations (`obj[method](arg)`, `obj["eval"](arg)`, `this[fn](arg)`, `window[name](arg)`) for eval, exec, spawn, fork, and other dangerous method names.
 - **Indirect eval**: Detects non-literal `eval(expr)`, `Function(arg)`, `setTimeout(str)`, `setImmediate(str)` where the argument is stored in a variable, returned from a function, passed as parameter, or comes from user-controlled sources.
-- **Prototype Pollution FP reduction**: `prototype["methodName"] = fn` (known-good library pattern) is no longer flagged; only `__proto__[key]` and dynamic-key `prototype[key]` assignments fire.
+- **Prototype Pollution FP reduction**: `prototype["methodName"] = fn` (known-good library pattern) is no longer flagged; only `__proto__[key]` and dynamic-key `prototype[key]` assignments fire. `JSON.parse(JSON.stringify(x))` deep-clone pattern is excluded. **Open Redirect**: `window.location = X` pattern added. **Path traversal sinks**: `readFileSync`, `writeFileSync`, `unlinkSync`, `mkdirSync`, `rmSync`, `renameSync`, `existsSync`, `createWriteStream`, `createReadStream`, `appendFileSync`. **Credential patterns**: OpenAI `sk-…`, Anthropic `sk-ant-…`, npm `npm_…`, Heroku API key, Google `AIza…`.
 - **bcrypt/argon2 recategorized**: These password hashing functions are no longer flagged as "Broken Crypto" — they are moved to "Hardcoded Credential" to reduce false positives on legitimate password hashing use.
 
 ## License

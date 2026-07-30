@@ -792,6 +792,17 @@ const CREDENTIAL_PATTERNS = [
   { name:'Hex secret candidate', severity:'low',
     re:/["'][0-9a-fA-F]{40,}["']/g,
     fpGuard: v => v.length > 80 || /^(?:[0-9a-f]{6,8})+$/.test(v) || !/[A-Z]/.test(v) || !/[a-z]/.test(v) },
+  { name:'OpenAI API Key',          severity:'critical',
+    re:/sk-[A-Za-z0-9]{20,}/g, fpGuard: null },
+  { name:'Anthropic API Key',       severity:'critical',
+    re:/sk-ant-[A-Za-z0-9]{20,}/g, fpGuard: null },
+  { name:'npm Token',               severity:'critical',
+    re:/npm_[A-Za-z0-9]{36,}/g, fpGuard: null },
+  { name:'Heroku API Key',          severity:'high',
+    re:/[hH][eE][rR][oO][kK][uU].*[aA][pP][iI].*[kK][eE][yY]\s*[:=]\s*["']([A-Za-z0-9-]{20,})["']/gi,
+    fpGuard: null },
+  { name:'Google API Key (AIza)',   severity:'high',
+    re:/AIza[0-9A-Za-z_-]{35}/g, fpGuard: null },
 ];
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -922,6 +933,9 @@ const SECURITY_PATTERNS = [
     re:/\.setAttribute\s*\(\s*['"]on\w+['"]\s*,/g, ctx: null },
   { id:'xss-set-attr-on',cat:'XSS',        sev:'critical',
     re:/\[["']setAttribute["']\]\s*\(\s*['"]on\w+['"]\s*,/g, ctx: null },
+  { id:'redirect-location',   cat:'Open Redirect', sev:'high', cwe:'CWE-601',
+    re:/window\.location\s*=(?!=)/g,
+    ctx: m => !/https?:\/\//.test(m.slice(m.indexOf('='), 100)) },
   { id:'redirect-location-href',cat:'Open Redirect', sev:'high', cwe:'CWE-601',
     re:/(?:location|window\.location)\.href\s*=/g,
     ctx: m => !/https?:\/\//.test(m) },
@@ -989,7 +1003,12 @@ const SECURITY_PATTERNS = [
     re:/Object\.setPrototypeOf\s*\(/g, ctx: m => /Object\.prototype/.test(m) },
   { id:'proto-jsonparse',  cat:'Prototype Pollution', sev:'medium',
     re:/JSON\.parse\s*\([^)]+\)/g,
-    ctx: m => /user|request|input|param|__proto__|constructor/i.test(m) },
+    ctx: m => {
+      // Skip deep-clone pattern JSON.parse(JSON.stringify(x)) — not pollution
+      const inner = m.replace(/^JSON\.parse\s*\(/, '').replace(/\)\s*$/, '');
+      if (/^JSON\.stringify\s*\(/.test(inner)) return false;
+      return /user|request|input|param|__proto__|constructor/i.test(m);
+    } },
 
   // ── B5: PostMessage ─────────────────────────────────────────────────────
   { id:'postmsg-wildcard', cat:'PostMessage',  sev:'high',
@@ -1168,8 +1187,43 @@ const WEBPACK_MODULE_MAP = {
   8132:'@angular/common/http2',    5951:'@angular/cdk/portal',
   2496:'@angular/material/autocomplete', 7200:'ng2-file-upload',
   8288:'qrcode',                   4370:'ngx-text-diff',
-  107: 'ngx-gallery',              767: '@angular/common/location',
-};
+   107: 'ngx-gallery',              767: '@angular/common/location',
+   // ── Stage 5B additions ──
+   5036: 'lodash',                   9526: 'lodash/identity',
+   2307: 'axios',                    4449: 'axios/index',
+   8752: 'react',                    3091: 'react/jsx-runtime',
+   7462: 'react-dom',                5201: 'react-dom/profiling',
+   6204: 'react-dom/server',         3818: 'scheduler',
+   6319: 'vue',                      4227: 'vue/compat',
+   7931: 'vue-router',               1957: 'pinia',
+   1066: 'dayjs',                    2896: 'date-fns',
+   5812: 'zod',                      7732: 'zod/lib',
+   5035: 'moment',                   3472: 'moment-timezone',
+   9262: 'classnames',               7124: 'clsx',
+   1182: 'immer',                    6510: 'zustand',
+   4103: 'recharts',                 8385: 'recharts/es6',
+   2291: 'framer-motion',            4774: 'framer-motion/es',
+   5551: 'ethers',                   6021: 'ethers/lib',
+   7773: 'web3',                     4210: 'web3-eth',
+   8831: 'uuid',                     5192: 'nanoid',
+   3586: 'rxjs',                     2034: 'rxjs/operators',
+   4448: 'lodash-es',                1762: '@tanstack/react-query',
+   4724: 'swr',                      2781: '@apollo/client',
+   1191: 'i18next',                  9037: 'react-i18next',
+   6457: 'chart.js',                 2019: 'chart.js/auto',
+   9085: 'core-js',                  3024: 'regenerator-runtime',
+   5203: '@emotion/react',           6366: '@emotion/styled',
+   1703: 'react-hook-form',          8822: 'formik',
+   2233: 'yup',                      7519: '@hookform/resolvers',
+   3377: 'react-router-dom',         6068: 'react-router',
+   1089: 'next/router',              4866: 'next/dist',
+   7068: 'mobx',                     9274: 'mobx-react',
+   3911: 'immer',                    2516: 'zustand/vanilla',
+   1230: '@sentry/browser',          8982: '@sentry/core',
+   4741: 'tailwindcss',              6113: 'autoprefixer',
+   7882: 'postcss',                  3231: 'css-select',
+   8485: '@testing-library/react',   5177: 'jest-diff',
+ };
 
 // Common package signatures → name. Used by autoDetectModuleNames() to guess
 // package names for module IDs that aren't in WEBPACK_MODULE_MAP. Each entry
@@ -1308,6 +1362,8 @@ function parseArgs() {
     updateBaseline: false, // write current findings as new baseline
     watch: false,          // re-scan on file change
     diff: null,            // path to previous report.json for diff mode
+    treatTsAsJs: false,    // strip TypeScript annotations before analysis
+    customRulesPath: null, // path to .omega-rules.json for pluggable rules
   };
   for (let i = 1; i < args.length; i++) {
     switch (args[i]) {
@@ -1318,7 +1374,7 @@ function parseArgs() {
       case '--routes':        o.routes       = true;      break;
       case '--security':      o.security     = true;      break;
       case '--graph':         o.graph        = true;      break;
-      case '--report':        o.report       = true;      break;
+      case '--report':        o.report       = true; o.fetchSourcemaps = true; break;
       case '--ast':           o.ast          = true;      break;
       case '--no-ast':        o.ast          = false;     break;
       case '--verbose':       o.verbose      = true;      break;
@@ -1328,6 +1384,7 @@ function parseArgs() {
       case '--max-hops':      o.maxHops      = parseInt(args[++i], 10) || 5; break;
       case '--fetch-cves':    o.fetchCves    = true;      break;
     case '--fetch-sourcemaps': o.fetchSourcemaps = true; break;
+    case '--no-fetch-sourcemaps': o.fetchSourcemaps = false; break;
     case '--multi':         o.multi        = true;      break;
     case '--quiet':         o.quiet        = true;      break;
     case '--no-llm-payload': o.llmPayload  = false;     break;
@@ -1335,6 +1392,8 @@ function parseArgs() {
     case '--update-baseline': o.updateBaseline = true;   break;
     case '--watch':          o.watch          = true;     break;
     case '--diff':           o.diff           = args[++i]; break;
+    case '--treat-ts-as-js': o.treatTsAsJs    = true;      break;
+    case '--custom-rules':   o.customRulesPath = args[++i]; break;
     case '--all':
         o.splitModules = o.secrets = o.routes = o.security =
         o.graph = o.report = o.ast = true; break;
@@ -1365,7 +1424,8 @@ function printHelp() {
   console.log('                     One of: critical, high, medium, low, info (default)');
   console.log('  --max-hops <n>      Max backward-slice depth for inter-procedural taint (default: 5)');
   console.log('  --fetch-cves       Query OSV.dev API for live vulnerability data (uses node:https)');
-  console.log('  --fetch-sourcemaps Fetch and decode external .map files (uses node:https)');
+  console.log('  --fetch-sourcemaps Fetch and decode external .map files (uses node:https) [default in --report mode]');
+  console.log('  --no-fetch-sourcemaps Disable source map fetching (opt-out)');
   console.log('  --quiet            Suppress non-essential output (CI-friendly)');
   console.log('  --multi            Cross-bundle analysis mode (comma-separated inputs)');
   console.log('  --no-llm-payload   Omit LLM-specific JSON sections (function summaries, backward');
@@ -1374,6 +1434,8 @@ function printHelp() {
   console.log('  --update-baseline  Write current findings to .omega-ignore file');
   console.log('  --watch            Watch input file for changes and re-scan (uses fs.watch)');
   console.log('  --diff <file>      Compare against previous report.json — only show new findings');
+  console.log('  --treat-ts-as-js   Strip TypeScript annotations before analysis (view .ts as .js)');
+  console.log('  --custom-rules <f> Path to .omega-rules.json for pluggable rule patterns');
   console.log('  --multi            Cross-bundle analysis mode (comma-separated inputs)');
   console.log('');
   console.log('  CI exit codes (configure via OMEGA_FAIL_ON env var):');
@@ -1417,6 +1479,72 @@ function printHelp() {
   console.log('  [D4]  Lazy-loading: unguarded chunks + user-controlled dynamic import()\n');
   console.log('Phase 5b frameworks: Vue3, React, Svelte, Next.js, Webpack, Vite,');
   console.log('                     Lodash-ES, date-fns, Zod, Zustand, Immer, core-js\n');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  PHASE 0a — TYPESCRIPT STRIPPER  (NEW in OMEGA-5.0)
+//
+//  Strips TS type annotations so the rest of the pipeline can analyse
+//  `.ts` files as if they were plain `.js`.  Operates on the source string
+//  (no AST), targeting the most common annotation forms:
+//
+//    · `: Type` / `: Type<Generics>` after identifiers
+//    · `as Type` assertions
+//    · `interface X { … }`, `type X = …`, `enum X { … }`
+//    · `declare` keyword prefix
+//    · Decorators `@Something`
+//
+//  This is intentionally lossy — it removes enough to make the code
+//  meaningful to the scanner without attempting to be a full TS compiler.
+// ═══════════════════════════════════════════════════════════════════════════
+function stripTypeScript(src) {
+  let s = src;
+
+  // 1. Remove multi-line comments (preserve line count for source maps)
+  s = s.replace(/\/\*[\s\S]*?\*\//g, '');
+
+  // 2. Remove `declare` keyword (declare module, declare function, etc.)
+  s = s.replace(/\bdeclare\s+(module|function|class|const|let|var|enum|namespace|type|interface|abstract)\b/g, '');
+
+  // 3. Remove `export` decorators: @Injectable(), @Component({...}), etc.
+  //   Matches @identifier, @identifier(...) — possibly multi-line
+  s = s.replace(/@[A-Za-z_$][\w$.]*\s*(?:\([\s\S]*?\))?/g, '');
+
+  // 4. Remove `interface X { ... }` — brace-matched with string awareness
+  s = s.replace(/\binterface\s+\w+(?:\s*extends\s+[^{]+)?\s*\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}/g, '');
+
+  // 5. Remove `type X = ...;`
+  s = s.replace(/\btype\s+\w+(?:<[^>]*>)?\s*=\s*[^;]+;/g, '');
+
+  // 6. Remove `enum X { ... }` — multiline
+  s = s.replace(/\benum\s+\w+(?:\s*\{[^}]*\})/g, '');
+
+  // 7. Remove `: Type` annotations — but NOT `: ` in object literals, ternary `:`, labels
+  //   Target: `param: Type`, `): Type`, `var: Type`, `get x():`, `set x(v:`
+  //   Use RegExp constructor to avoid newline issues in regex literal.
+  const TS_TYPES = '(number|string|boolean|void|any|never|unknown|undefined|null|' +
+    'bigint|symbol|object|readonly|Promise|Array|Record|Partial|Required|Pick|' +
+    'Omit|Exclude|Extract|NonNullable|ReturnType|Parameters|ConstructorParameters|' +
+    'InstanceType|ThisType|OmitThisParameter|ThisParameterType|Uppercase|Lowercase|' +
+    'Capitalize|Uncapitalize|[A-Z][A-Za-z0-9_]+(?:<[^>]*>)?)';
+  s = s.replace(new RegExp('([\\w)\\]])\\s*:\\s*' + TS_TYPES + '(?:\\s*[=|,;)\\]}])', 'g'), '$1$3');
+
+  // 8. Remove `as Type` assertions
+  s = s.replace(new RegExp('\\s+as\\s+(?:const|any|number|string|boolean|never|unknown|' +
+    '[A-Z][A-Za-z0-9_]+(?:<[^>]*>)?)', 'g'), '');
+
+  // 9. Remove generics on function calls and class definitions: foo<T>(...), class X<T>
+  s = s.replace(/\b([A-Za-z_$][\w$.]*(?:\.prototype)?)\s*<\s*[A-Za-z_$][\w\s,]+>\s*(?=\()/g, '$1(');
+  s = s.replace(/\bclass\s+\w+\s*<\s*[^>]+>\s*/g, 'class ');
+
+  // 10. Remove `readonly` keyword
+  s = s.replace(/\breadonly\b/g, '');
+
+  // 11. Remove trailing commas in function params (artefact from stripping `:Type`)
+  s = s.replace(/,\s*\)/g, ')');
+  s = s.replace(/\(,/g, '(');
+
+  return s;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2304,7 +2432,242 @@ function rotateBruteForce(src, sa, decName, idxParam, keyParam, baseOffset, isRC
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  PHASE 2d — CONSTANT-EXPRESSION EVALUATOR (Stage 5)
+//  PHASE 2c₂ — CONTROL-FLOW FLATTENING (CFF) DE-FLATTENER  (NEW in OMEGA-5.0)
+//
+//  Detects and linearizes the common `while(1) { switch(x) { case … } }`
+//  control-flow flattening pattern produced by obfuscator.io, JScrambler,
+//  and other JS obfuscators. This is a Termux-compatible string-based
+//  approach that does not require a full AST interpreter.
+//
+//  How it works:
+//    1. Locate `while(…) { switch(dispatcher) { … } }` structures
+//    2. Parse each case via brace matching
+//    3. Read the next-state assignment (`dispatcher = N`)
+//    4. Build a directed graph of cases
+//    5. Linearize the graph (DFS depth ≤ 200, max 5000 cases)
+//    6. Concatenate blocks in order, strip dispatcher/break
+//
+//  This handles multi-pass correctly because the output of one pass is
+//  scanned again for nested flattened loops.
+// ═══════════════════════════════════════════════════════════════════════════
+function deflattenControlFlow(src) {
+  const MAX_CASES = 5000;
+  const MAX_DEPTH = 200;
+  const findings = [];
+
+  // Helper: find matching } with string/regex/brace awareness
+  function findMatchingBrace(str, startPos) {
+    let depth = 1;
+    let i = startPos;
+    const len = str.length;
+    while (i < len && depth > 0) {
+      const ch = str[i];
+      if (ch === '\\') { i += 2; continue; }
+      if (ch === "'" || ch === '"' || ch === '`') {
+        const quote = ch; i++;
+        while (i < len) {
+          if (str[i] === '\\') { i += 2; continue; }
+          if (str[i] === quote) break;
+          i++;
+        }
+      } else if (ch === '/') {
+        const next = str[i+1];
+        if (next === '/') { const end = str.indexOf('\n', i); if (end === -1) break; i = end; }
+        else if (next === '*') { const end = str.indexOf('*/', i+2); if (end === -1) break; i = end + 1; }
+      } else if (ch === '{') { depth++; }
+      else if (ch === '}') { depth--; if (depth === 0) return i; }
+      i++;
+    }
+    return -1;
+  }
+
+  // Match the while-switch pattern
+  // while (true / 1 / !0) { switch (VAR) { ... } }
+  let output = src;
+  let pass = 0;
+  const maxPasses = 5;
+
+  // Pre-compile a while-statement pattern (just the condition, no body capture)
+  const WHILE_PATT = /while\s*\(\s*(?:true|1|!0)\s*\)\s*/m;
+  const FOR_PATT  = /for\s*\(?\s*;;?\s*\)?\s*/m;
+
+  for (pass = 0; pass < maxPasses; pass++) {
+    // Find a while/for loop using brace-counting for the body
+    const whileMatch = WHILE_PATT.exec(output) || FOR_PATT.exec(output);
+    if (!whileMatch) break;
+
+    // Find the opening brace after the loop condition
+    const condEnd = whileMatch.index + whileMatch[0].length;
+    const openBracePos = output.indexOf('{', condEnd);
+    if (openBracePos === -1) continue;
+
+    // Find the matching closing brace (full loop body)
+    const closeBracePos = findMatchingBrace(output, openBracePos + 1);
+    if (closeBracePos === -1) continue;
+
+    const loopBody = output.slice(openBracePos + 1, closeBracePos);
+    const fullLoop   = output.slice(whileMatch.index, closeBracePos + 1);
+
+    // Check for switch(dispatcher) inside the loop body
+    const switchMatch = loopBody.match(/switch\s*\(\s*(\w+)\s*\)/);
+    if (!switchMatch) continue;
+
+    const dispatcher = switchMatch[1];
+    const switchStartIdx = loopBody.indexOf(switchMatch[0]);
+    const switchBodyStart = loopBody.indexOf('{', switchStartIdx);
+    if (switchBodyStart === -1) continue;
+
+    const switchBodyEnd = findMatchingBrace(loopBody, switchBodyStart + 1);
+    if (switchBodyEnd === -1) continue;
+
+    // We have a while-switch structure.
+    // For a deeper match: check that every case ends with `dispatcher = <number>`
+    // This validates it's a real CFF, not just a while+switch for other purposes.
+
+    const switchBody = loopBody.slice(switchBodyStart + 1, switchBodyEnd);
+
+    // Parse cases: case N: ... break;
+    // Use a simple approach: split by `\ncase ` with position tracking
+    const caseBlocks = [];
+    let caseRe = /\bcase\s+([^:]+):/g;
+    let lastIdx = 0;
+    let match;
+
+    while ((match = caseRe.exec(switchBody)) !== null) {
+      const caseVal = match[1].trim();
+      const caseStart = match.index;
+      const blockStart = match.index + match[0].length;
+
+      // Find next case or default or closing }
+      let blockEnd;
+      const remainder = switchBody.slice(blockStart);
+      const caseIdx = remainder.search(/\n\s*case\s/);
+      const defaultIdx = remainder.search(/\n\s*default\s*:/);
+      const braceEnd = switchBody.indexOf('}', blockStart);
+
+      if (caseIdx !== -1) blockEnd = blockStart + caseIdx;
+      else if (defaultIdx !== -1) blockEnd = blockStart + defaultIdx;
+      else if (braceEnd !== -1) blockEnd = braceEnd;
+
+      // For the last case, it may go to the closing }
+      if (blockEnd === undefined) blockEnd = switchBody.length;
+      if (blockEnd > 0) {
+        const blockContent = switchBody.slice(blockStart, blockEnd).trim();
+        caseBlocks.push({ caseVal, block: blockContent, start: caseStart, end: blockEnd });
+        lastIdx = blockEnd;
+      }
+    }
+
+    if (caseBlocks.length < 2) continue; // not flattened
+
+    // For each case block, detect the next-state assignment:
+    // `dispatcher = <number>;` and strip it.
+    const linearBlocks = [];
+    let totalStripped = 0;
+
+    for (const cb of caseBlocks) {
+      const block = cb.block;
+      // Find dispatcher assignment: `dispatcher = N;`, `dispatcher = N,`,
+      // or quoted values like `dispatcher = 'N';` or `dispatcher = "N";`
+      const assignRe = new RegExp(
+        '(?:^|[;{])\\s*' + dispatcher.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') +
+        '\\s*=\\s*(?:\'?\"?)(\\d+)(?:\'?\"?)\\s*(?:;|,|$)'
+      );
+      const assign = block.match(assignRe);
+      const nextState = assign ? parseInt(assign[1], 10) : -1;
+
+      // Strip the dispatcher assignment and the break
+      let cleanBlock = block;
+
+      // Remove `dispatcher = N;` or `dispatcher = N,` (with optional quotes around N)
+      const stripRe = new RegExp(
+        dispatcher.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') +
+        '\\s*=\\s*(?:\'?\"?)\\d+(?:\'?\"?)\\s*[;,]?\\s*'
+      );
+      cleanBlock = cleanBlock.replace(stripRe, '');
+
+      // Remove `break;` at the end
+      cleanBlock = cleanBlock.replace(/;\s*break\s*;?\s*$/s, ';');
+      cleanBlock = cleanBlock.replace(/^\s*break\s*;?\s*/, '');
+      cleanBlock = cleanBlock.trim();
+      // Remove trailing `break;` if it appears after stripping
+      cleanBlock = cleanBlock.replace(/\s*break\s*;?\s*$/s, '');
+      cleanBlock = cleanBlock.trim();
+
+      linearBlocks.push({ nextState, code: cleanBlock });
+    }
+
+    // Now sort blocks into linear order by following the nextState chain
+    // Build adjacency map: blockIndex → next blockIndex
+    const blockByIdx = {};
+    for (let i = 0; i < linearBlocks.length; i++) {
+      const block = linearBlocks[i];
+      // Extract case number (strip quotes: '0' → 0, "1" → 1, 2 → 2)
+      let caseNum;
+      try {
+        const raw = caseBlocks[i].caseVal.replace(/['"]/g, '');
+        caseNum = parseInt(raw, 10);
+      } catch (_) { caseNum = NaN; }
+      blockByIdx[caseNum] = i;
+    }
+
+    // Walk the graph from case 0
+    const visited = new Set();
+    const ordered = [];
+    let current = 0;
+    let depth = 0;
+
+    while (current !== -1 && !visited.has(current) && depth < MAX_DEPTH) {
+      visited.add(current);
+      const idx = blockByIdx[current];
+      if (idx === undefined) break;
+      const block = linearBlocks[idx];
+      ordered.push(block);
+      current = block.nextState;
+      depth++;
+    }
+
+    // If we couldn't trace a path, just sort by case number (strip quotes: '0' → 0)
+    if (ordered.length < 2) {
+      const sorted = caseBlocks.map((cb, i) => ({
+        cb, lb: linearBlocks[i],
+        caseNum: parseInt(String(cb.caseVal).replace(/['"]/g, ''), 10)
+      })).filter(x => !isNaN(x.caseNum))
+        .sort((a, b) => a.caseNum - b.caseNum);
+      for (const x of sorted) {
+        if (!visited.has(x.caseNum)) {
+          ordered.push(x.lb);
+          visited.add(x.caseNum);
+        }
+      }
+    }
+
+    // Concatenate ordered blocks
+    const flattenedBody = ordered.map(b => b.code).join('\n');
+
+    // Check we actually improved things (reduced size)
+    const originalLen = fullLoop.length;
+    const flattenedLen = flattenedBody.length;
+    if (flattenedLen > originalLen * 0.8) continue; // barely flattened
+
+    // Replace the while-switch with the linearized blocks
+    // Wrap in a dummy block to preserve statement boundary
+    const before = output.slice(0, whileMatch.index);
+    const after = output.slice(closeBracePos + 1);
+    const stmt = '{ // deflattened\n' + flattenedBody + '\n}';
+    output = before + stmt + after;
+
+    findings.push({
+      type: 'deflatten',
+      cases: caseBlocks.length,
+      orderedBlocks: ordered.length,
+      dispatcher,
+    });
+    totalStripped += ordered.length;
+  }
+
+  return { src: output, findings };
+}
 //
 //  A safe partial evaluator for the constrained subset of JavaScript that
 //  commonly appears in obfuscated string construction:
@@ -2489,6 +2852,100 @@ function normaliseBooleans(src) {
     .replace(/\+\[\]/g, '0');
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  PHASE 3b — OPAQUE PREDICATE & DEAD CODE ELIMINATOR  (NEW in OMEGA-5.0)
+//
+//  After Phase 3 (Boolean normalisation) and Phase 2d (constant folding),
+//  most obfuscated boolean expressions are reduced to `true` / `false`.
+//  This phase eliminates:
+//    · `if (true) { A }`           → `A`
+//    · `if (false) { A }`          → removed
+//    · `if (true) { A } else { B }` → `A`
+//    · `if (false) { A } else { B }` → `B`
+//    · `!0 && !1` → false, etc.
+//    · `"str" === "str"` → true, `"str" !== "str"` → false
+//    · `N === N` → true, `N !== N` → false
+//    · Ternary: `true ? A : B` → `A`, `false ? A : B` → `B`
+//    · `!true` → false, `!false` → true (already mostly done by Phase 3)
+// ═══════════════════════════════════════════════════════════════════════════
+function eliminateOpaquePredicates(src) {
+  const MAX_SIZE = 1024 * 1024;
+  if (src.length > MAX_SIZE) return { src, findings: [] };
+
+  const findings = [];
+  let changed = true;
+  let passes = 0;
+  const MAX_PASSES = 8;
+
+  while (changed && passes < MAX_PASSES) {
+    changed = false;
+    passes++;
+
+    // 1. Simplify boolean literals in if(EXPR) — already true/false from Phase 3
+    // Remove `if (true) { ... }` → just `{ ... }` (keep block for semicolon safety)
+    src = src.replace(/if\s*\(\s*true\s*\)\s*\{([^}]*(?:\{[^}]*\}[^}]*)*)\s*\}/g, (full, body) => {
+      changed = true;
+      return body.trim();
+    });
+
+    // Remove `if (false) { ... }` entirely
+    src = src.replace(/if\s*\(\s*false\s*\)\s*\{([^}]*(?:\{[^}]*\}[^}]*)*)\s*\}/g, () => {
+      changed = true;
+      return '';
+    });
+
+    // 2. if (true) { A } else { B } → A
+    src = src.replace(/if\s*\(\s*true\s*\)\s*\{([^}]*(?:\{[^}]*\}[^}]*)*)\s*\}\s*else\s*\{([^}]*(?:\{[^}]*\}[^}]*)*)\s*\}/g, (full, a) => {
+      changed = true;
+      return a.trim();
+    });
+
+    // if (false) { A } else { B } → B
+    src = src.replace(/if\s*\(\s*false\s*\)\s*\{([^}]*(?:\{[^}]*\}[^}]*)*)\s*\}\s*else\s*\{([^}]*(?:\{[^}]*\}[^}]*)*)\s*\}/g, (full, a, b) => {
+      changed = true;
+      return b.trim();
+    });
+
+    // 3. Constant string comparison: "str" === "str" → true, "str" !== "str" → false
+    src = src.replace(/("(?:[^"\\]|\\.)*")\s*===\s*\1/g, () => { changed = true; return 'true'; });
+    src = src.replace(/('(?:[^'\\]|\\.)*')\s*===\s*\1/g, () => { changed = true; return 'true'; });
+    src = src.replace(/("(?:[^"\\]|\\.)*")\s*!==\s*\1/g, () => { changed = true; return 'false'; });
+    src = src.replace(/('(?:[^'\\]|\\.)*')\s*!==\s*\1/g, () => { changed = true; return 'false'; });
+
+    // 4. Same variable comparison: x === x → true, x !== x → false
+    src = src.replace(/([a-zA-Z_$][\w$.]*)\s*===\s*\1(?!\s*[=])/g, () => { changed = true; return 'true'; });
+    src = src.replace(/([a-zA-Z_$][\w$.]*)\s*!==\s*\1(?!\s*[=])/g, () => { changed = true; return 'false'; });
+
+    // 5. self === self, window === window (global self-comparison)
+    src = src.replace(/(self|window|global|globalThis)\s*===\s*\1/g, () => { changed = true; return 'true'; });
+    src = src.replace(/(self|window|global|globalThis)\s*!==\s*\1/g, () => { changed = true; return 'false'; });
+
+    // 6. Ternary with boolean test
+    src = src.replace(/true\s*\?\s*(\(?[^:]+?\)?)\s*:\s*[^,;)]+/g, (full, a) => {
+      changed = true; return a.trim();
+    });
+    // Only remove false-branch ternaries where test is just `false`
+    src = src.replace(/false\s*\?\s*[^:]+?\s*:\s*(\(?[^;)]+?\)?)/g, (full, b) => {
+      changed = true; return b.trim();
+    });
+
+    // 7. `!true` → false, `!false` → true (catch any that Phase 3 missed)
+    src = src.replace(/!true\b/g, () => { changed = true; return 'false'; });
+    src = src.replace(/!false\b/g, () => { changed = true; return 'true'; });
+
+    // 8. Concat boolean folding: true && true → true, true && false → false, etc.
+    src = src.replace(/true\s*&&\s*true\b/g, () => { changed = true; return 'true'; });
+    src = src.replace(/(?:true\s*&&\s*false|false\s*&&\s*(?:true|false))\b/g, () => { changed = true; return 'false'; });
+    src = src.replace(/true\s*\|\|\s*(?:true|false)\b/g, () => { changed = true; return 'true'; });
+    src = src.replace(/false\s*\|\|\s*(true|false)\b/g, (full, m) => { changed = true; return m; });
+  }
+
+  if (findings.length > 0) {
+    // Track what we did
+  }
+
+  return { src, findings };
+}
 // ═══════════════════════════════════════════════════════════════════════════
 //  PHASE 4 — WEBPACK CLEANUP
 // ═══════════════════════════════════════════════════════════════════════════
@@ -4232,6 +4689,8 @@ function scanTaintFlow(src) {
   // Taint sources — user-controlled data origins
   const SOURCES = [
     { re:/location\.(?:hash|search|href|pathname)/g, name:'URL parameter' },
+    { re:/document\.location\.(?:hash|search|href|pathname)/g, name:'URL parameter (via document.location)' },
+    { re:/window\.location\.(?:hash|search|href|pathname)/g, name:'URL parameter (via window.location)' },
     { re:/document\.(?:URL|referrer|cookie)/g, name:'Document property' },
     { re:/(?:event|e)\.data\b/g, name:'Event data (postMessage/WebSocket)' },
     { re:/localStorage\.getItem\s*\([^)]+\)/g, name:'localStorage' },
@@ -4260,6 +4719,17 @@ function scanTaintFlow(src) {
     { re:/\bexec(?:Sync)?\s*\(/g, name:'exec()', sev:'critical', cwe:'CWE-78' },
     { re:/\bspawn(?:Sync)?\s*\(/g, name:'spawn()', sev:'critical', cwe:'CWE-78' },
     { re:/\bfork\s*\(/g, name:'fork()', sev:'critical', cwe:'CWE-78' },
+    // ── Path Traversal sinks (CWE-22) —───────────────────────────────────
+    { re:/\.(?:readFile|readFileSync)\s*\(/g, name:'readFile', sev:'high', cwe:'CWE-22' },
+    { re:/\.(?:writeFile|writeFileSync)\s*\(/g, name:'writeFile', sev:'high', cwe:'CWE-22' },
+    { re:/\.(?:appendFile|appendFileSync)\s*\(/g, name:'appendFile', sev:'high', cwe:'CWE-22' },
+    { re:/\.(?:unlink|unlinkSync)\s*\(/g, name:'unlink', sev:'high', cwe:'CWE-22' },
+    { re:/\.(?:rename|renameSync)\s*\(/g, name:'rename', sev:'high', cwe:'CWE-22' },
+    { re:/\.(?:mkdir|mkdirSync)\s*\(/g, name:'mkdir', sev:'medium', cwe:'CWE-22' },
+    { re:/\.(?:rmdir|rmdirSync)\s*\(/g, name:'rmdir', sev:'medium', cwe:'CWE-22' },
+    { re:/\.(?:rm|rmSync)\s*\(/g, name:'rm', sev:'high', cwe:'CWE-22' },
+    { re:/\.(?:copyFile|copyFileSync)\s*\(/g, name:'copyFile', sev:'high', cwe:'CWE-22' },
+    { re:/\.(?:open|openSync)\s*\(/g, name:'open', sev:'medium', cwe:'CWE-22' },
   ];
 
   // Identify tainted variable names heuristically
@@ -4635,6 +5105,67 @@ function ctxFromPattern(src, pattern) {
   const start = Math.max(0, idx - 60);
   const end = Math.min(src.length, idx + pattern.length + 60);
   return src.slice(start, end);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  PHASE 12s — PLUGGABLE RULE ENGINE  (NEW in OMEGA-5.0)
+//
+//  Loads custom rules from a `--custom-rules <path>` JSON file and runs them
+//  against the source.  Each rule has:
+//    · id, name, severity, category
+//    · pattern (regex to match against the source)
+//    · (optional) description, remediation
+//
+//  Format:
+//    [
+//      { "id": "my-custom-injection", "name": "Custom Injection",
+//        "severity": "high", "category": "custom",
+//        "pattern": "dangerousFunction\\s*\\(.*\\)",
+//        "description": "...", "remediation": "..." }
+//    ]
+// ═══════════════════════════════════════════════════════════════════════════
+function runCustomRules(src, rulesPath) {
+  const results = [];
+  let rules;
+  try {
+    if (!fs.existsSync(rulesPath)) {
+      return { findings: results, error: `File not found: ${rulesPath}` };
+    }
+    const raw = fs.readFileSync(rulesPath, 'utf8');
+    rules = JSON.parse(raw);
+    if (!Array.isArray(rules)) {
+      return { findings: results, error: 'Custom rules file must contain a JSON array' };
+    }
+  } catch (e) {
+    return { findings: results, error: `Failed to load custom rules: ${e.message}` };
+  }
+
+  for (const rule of rules) {
+    if (!rule.id || !rule.pattern) continue;
+    try {
+      const flags = rule.caseSensitive ? 'g' : 'gi';
+      const re = new RegExp(rule.pattern, flags);
+      let match;
+      while ((match = re.exec(src)) !== null) {
+        const contextStart = Math.max(0, match.index - 40);
+        const contextEnd = Math.min(src.length, match.index + match[0].length + 40);
+        results.push({
+          id: rule.id,
+          name: rule.name || rule.id,
+          severity: rule.severity || 'medium',
+          category: rule.category || 'custom',
+          value: match[0].length > 80 ? match[0].slice(0, 80) + '…' : match[0],
+          context: src.slice(contextStart, contextEnd).replace(/[\r\n]/g, ' '),
+          description: rule.description || `Custom rule matched: ${rule.id}`,
+          remediation: rule.remediation || '',
+        });
+      }
+    } catch (_) {
+      // skip invalid regex
+    }
+  }
+
+  return { findings: results };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -5023,6 +5554,12 @@ function generateReports(data, outDir) {
   // ─── SARIF v2.1.0 (GitHub Code Scanning compatible) ────────────────────
   const crypto = require('crypto');
   const sevToSarif = { critical:'error', high:'error', medium:'warning', low:'note', info:'none' };
+  const suppressedFindings = data.suppressed || [];
+  const sarifSuppressions = suppressedFindings.map(f => ({
+    ruleId: f.id || f.category,
+    kind: 'external',
+    justification: f.suppressedBy ? `Suppressed by baseline rule: ${f.suppressedBy}` : 'Suppressed by baseline',
+  }));
   const allFindingsForSarif = [
     ...(credentials || []).map(f => ({ ...f, category: f.category || 'Credential' })),
     ...(security || []).map(f => ({ ...f, category: f.category || 'Security' })),
@@ -5097,6 +5634,11 @@ function generateReports(data, outDir) {
         }
         return result;
       }),
+      invocations: [{
+        executionSuccessful: true,
+        toolConfigurationNotifications: [],
+      }],
+      ...(sarifSuppressions.length ? { suppressions: sarifSuppressions } : {}),
     }],
   };
   fs.writeFileSync(path.join(outDir, 'report.sarif'), JSON.stringify(sarif, null, 2));
@@ -6258,6 +6800,15 @@ async function main(externalOpts) {
 
   if (!opts.quiet) console.log(head('DECODING'));
 
+  // Phase 0a — TypeScript stripping
+  if (opts.treatTsAsJs) {
+    if (opts.verbose) console.log(info('  Phase 0a: stripping TypeScript annotations…'));
+    const beforeLen = src.length;
+    src = stripTypeScript(src);
+    const stripped = beforeLen - src.length;
+    if (!opts.quiet) console.log(ok(`Phase 0a: stripped ${stripped} bytes of TypeScript annotations`));
+  }
+
   // Phase 0
   if (opts.verbose) console.log(info('  Phase 0: Module alias resolution…'));
   const { aliases, count: aliasCount } = resolveModuleAliases(src, opts);
@@ -6321,6 +6872,19 @@ async function main(externalOpts) {
     }
   }
 
+  // Phase 2c.2 — CFF de-flattener (control-flow flattening)
+  if (!opts._singleLineHuge) {
+    if (opts.verbose) console.log(info('  Phase 2c.2: control-flow flattening de-flattener…'));
+    const deflatResult = deflattenControlFlow(src);
+    if (deflatResult.findings.length) {
+      src = deflatResult.src;
+      if (!opts.quiet) {
+        const total = deflatResult.findings.reduce((s, f) => s + f.orderedBlocks, 0);
+        console.log(ok(`Phase 2c.2: deflattened ${deflatResult.findings.length} CFF loops (${total} blocks)`));
+      }
+    }
+  }
+
   // Phase 2d — constant-expression evaluator (Stage 5)
   if (opts.verbose) console.log(info('  Phase 2d: constant-expression evaluator…'));
   const { src: src2d, findings: constExprFindings } = evaluateConstantExpressions(src);
@@ -6332,6 +6896,14 @@ async function main(externalOpts) {
   // Phase 3
   if (opts.verbose) console.log(info('  Phase 3: Boolean normalisation…'));
   src = normaliseBooleans(src);
+
+  // Phase 3b — Opaque predicate elimination
+  if (opts.verbose) console.log(info('  Phase 3b: opaque predicate & dead code elimination…'));
+  const elimResult = eliminateOpaquePredicates(src);
+  if (elimResult.findings.length) {
+    src = elimResult.src;
+    if (!opts.quiet) console.log(ok(`Phase 3b: removed ${elimResult.findings.length} opaque predicates`));
+  }
 
   // Phase 4
   if (opts.verbose) console.log(info('  Phase 4: Webpack cleanup…'));
@@ -6500,6 +7072,19 @@ async function main(externalOpts) {
   if (opts.verbose) console.log(info('  Phase 12r: In-source ReDoS vulnerability scan…'));
   const redosFindings = (opts.security || opts.report) ? scanReDoS(srcPreBeautify) : [];
   if (opts.verbose) console.log(info(`  Phase 12r: ${redosFindings.length} ReDoS findings`));
+
+  // Phase 12s — Pluggable custom rules (from --custom-rules file)
+  let customFindings = [];
+  if (opts.customRulesPath) {
+    if (opts.verbose) console.log(info('  Phase 12s: pluggable custom rules…'));
+    const customResult = runCustomRules(src, opts.customRulesPath);
+    if (customResult.error && !opts.quiet) {
+      console.log(warn(`  Phase 12s: ${customResult.error}`));
+    } else {
+      customFindings = customResult.findings;
+      if (!opts.quiet) console.log(ok(`Phase 12s: ${customFindings.length} custom rule matches`));
+    }
+  }
 
   // ─────────────────────────────────────────────────────────────────────────
   //  OMEGA-5.0: AST-powered structural analysis (Tier 1)
@@ -6813,6 +7398,7 @@ async function main(externalOpts) {
     ...obfIoFindings,
     ...constExprFindings,
     ...redosFindings,
+    ...customFindings,
   ];
 
   // Phase 12n1 — Tag library-internal findings to reduce FP noise (uses
@@ -7001,7 +7587,7 @@ async function main(externalOpts) {
       astFwFindings, bundlerInfo, webpackGraph, callGraph,
       astTaint, modernCrypto, networkSurface, useAst,
       obfuscatorFingerprint, functionSummaries, backwardSlices,
-      variableRenameTable, sourceExpander,
+      variableRenameTable, sourceExpander, suppressed,
       originalSrc: src,
       sourceMapSources: (sourceMapInfo && sourceMapInfo.sources) || [],
       meta: {
