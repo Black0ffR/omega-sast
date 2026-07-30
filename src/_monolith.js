@@ -5214,11 +5214,13 @@ function classifyLibrary(src) {
   if (/socket\.io|socket\.io/i.test(src)) return 'networking';
   if (/axios|XSRF-TOKEN/.test(src)) return 'networking';
   if (/CryptoJS|cryptojs|\bAES\b|\bSHA\d{1,3}\b|WordArray|Cipher|enc\.Utf8/.test(src)) return 'crypto';
+  if (/\u0275\w+|angular\.module|ng\.|@angular\//.test(src)) return 'ui-framework';
   if (/jQuery|\$\.|\$\([^)]*\)\.(?:html|append|prepend|ready|on|click|ajax)/i.test(src)) return 'ui-framework';
-  if (/lodash|underscore/.test(src)) return 'utility';
-  if (/Moment|Dayjs|dayjs|date-fns/.test(src)) return 'utility';
   if (/React|createElement|createRoot|useState|useEffect/.test(src)) return 'ui-framework';
   if (/Vue|createApp|defineComponent|ref\s*\(/.test(src)) return 'ui-framework';
+  if (/d3\.\w+\(/.test(src)) return 'ui-framework';
+  if (/lodash|underscore/.test(src)) return 'utility';
+  if (/Moment|Dayjs|dayjs|date-fns/.test(src)) return 'utility';
   if (/express|koa|fastify|hapi/.test(src)) return 'backend';
   return 'general';
 }
