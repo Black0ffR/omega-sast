@@ -1399,11 +1399,11 @@ function trackTaintAST(src, structuralIndex, callGraph) {
       'insertAdjacentHTML':{ sev:'critical', cwe:'CWE-79', name:'insertAdjacentHTML' },
       'write':             { sev:'critical', cwe:'CWE-79', name:'document.write', needPrefix:'document.' },
       'eval':              { sev:'critical', cwe:'CWE-95', name:'eval()', isBare:true },
-      'exec':              { sev:'critical', cwe:'CWE-78', name:'exec()', isBare:true },
-      'execSync':          { sev:'critical', cwe:'CWE-78', name:'execSync()', isBare:true },
-      'spawn':             { sev:'critical', cwe:'CWE-78', name:'spawn()', isBare:true },
-      'spawnSync':         { sev:'critical', cwe:'CWE-78', name:'spawnSync()', isBare:true },
-      'fork':              { sev:'critical', cwe:'CWE-78', name:'fork()', isBare:true },
+      'exec':              { sev:'critical', cwe:'CWE-78', name:'exec()', isBare:true, nodeOnly:true },
+      'execSync':          { sev:'critical', cwe:'CWE-78', name:'execSync()', isBare:true, nodeOnly:true },
+      'spawn':             { sev:'critical', cwe:'CWE-78', name:'spawn()', isBare:true, nodeOnly:true },
+      'spawnSync':         { sev:'critical', cwe:'CWE-78', name:'spawnSync()', isBare:true, nodeOnly:true },
+      'fork':              { sev:'critical', cwe:'CWE-78', name:'fork()', isBare:true, nodeOnly:true },
       'setAttribute':      { sev:'critical', cwe:'CWE-79', name:'setAttribute(on*)' },
       'href':              { sev:'high',     cwe:'CWE-601', name:'location.href', needPrefix:'location.' },
       'replace':           { sev:'high',     cwe:'CWE-601', name:'location.replace', needPrefix:'location.' },
@@ -1421,7 +1421,11 @@ function trackTaintAST(src, structuralIndex, callGraph) {
     };
 
     // Bare sinks: whole callee name is the sink (e.g. `eval`, `alert`).
-    if (SINKS[text] && SINKS[text].isBare) return SINKS[text];
+    if (SINKS[text] && SINKS[text].isBare) {
+      // Node-only sinks (exec/spawn/fork) require child_process import
+      if (SINKS[text].nodeOnly && !/require\s*\(\s*["']child_process["']\s*\)/.test(sourceCode)) return null;
+      return SINKS[text];
+    }
 
     // Dotted sinks: callee like `document.write`, `location.href`, etc.
     if (!text.includes('.')) return null;
@@ -1431,6 +1435,7 @@ function trackTaintAST(src, structuralIndex, callGraph) {
     const prop = parts[parts.length - 1];
     const sink = SINKS[prop];
     if (!sink) return null;
+    if (sink.nodeOnly && !/require\s*\(\s*["']child_process["']\s*\)/.test(sourceCode)) return null;
     if (sink.needPrefix) {
       const expected = sink.needPrefix.replace(/\.$/, '');
       if (obj !== expected) return null;
