@@ -1,0 +1,13 @@
+bundle	size_bytes	exit_code	duration_ms	peak_rss_kb
+01_original	211	0	221	61008
+02_jsfuck	2542	0	175	62544
+03_aaencode	3309	0	178	62332
+04_jjencode	940	0	214	61700
+05_packer_dean_edwards	713	2	168	61188
+06_obfuscator_io_style	3819	5	227	62356
+07_hex_unicode_strings	336	0	166	60336
+08_string_array_mapping	459	5	166	60984
+09_minified_terser_style	196	0	167	60864
+10_control_flow_flattening	629	0	160	60848
+11_dead_code_injection	494	0	167	60620
+12_webpack_like_bundle	1379	0	167	61620

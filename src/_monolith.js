@@ -882,7 +882,7 @@ const SECURITY_PATTERNS = [
     re:/https?:\/\/[^\s"']+/g,
     ctx: m => {
       // Skip known documentation / CDN / package-homepage / citation URLs
-      const skipDomains = /(?:accounts\.google|cdnjs\.cloudflare|openstreetmap|github\.com|developer\.mozilla\.org|w3\.org|npmjs\.com|angular\.io|vuejs\.org|reactjs\.org|typescriptlang\.org|babeljs\.io|webpack\.js|nodejs\.org|mit\.edu|apache\.org|opensource\.org|creativecommons\.org|unlicense\.org|jquery\.com|lodash\.com|d3js\.org|chartjs\.org|threejs\.org|greensock\.com|gsap\.com|preactjs\.com|axios\.http|cryptojs\.git|momentjs\.com|day\.js|eastus\.data\.tables\.net|paas[0-9]+\.southeastasia\.project|yarnpkg\.com|jsdelivr\.net|unpkg\.com|bundlephobia\.com|stackoverflow\.com|stackexchange\.com|wikipedia\.org|arxiv\.org|ieee\.org|acm\.org|springer\.com|linkedin\.com|twitter\.com|facebook\.com|youtube\.com|medium\.com|sitepoint\.com|smashingmagazine\.com|css-tricks\.com|hackernews\.com|reddit\.com|stackblitz\.com|codesandbox\.io|replit\.com)/;
+      const skipDomains = /(?:accounts\.google|cdnjs\.cloudflare|openstreetmap|github\.com|developer\.mozilla\.org|w3\.org|npmjs\.com|angular\.io|vuejs\.org|reactjs\.org|typescriptlang\.org|babeljs\.io|webpack\.js|nodejs\.org|mit\.edu|apache\.org|opensource\.org|creativecommons\.org|unlicense\.org|jquery\.com|lodash\.com|underscorejs\.org|d3js\.org|chartjs\.org|threejs\.org|greensock\.com|gsap\.com|preactjs\.com|axios\.http|cryptojs\.git|momentjs\.com|momentjs\.cn|day\.js|eastus\.data\.tables\.net|paas[0-9]+\.southeastasia\.project|yarnpkg\.com|jsdelivr\.net|unpkg\.com|bundlephobia\.com|stackoverflow\.com|stackexchange\.com|wikipedia\.org|arxiv\.org|ieee\.org|acm\.org|springer\.com|linkedin\.com|twitter\.com|facebook\.com|youtube\.com|medium\.com|sitepoint\.com|smashingmagazine\.com|css-tricks\.com|hackernews\.com|reddit\.com|stackblitz\.com|codesandbox\.io|replit\.com)/;
       if (skipDomains.test(m)) return false;
       // Skip URLs that look like license/copyright headers in comments
       if (/license|licence|copyright|\(c\)|released under|MIT|Apache|BSD|CC BY|CC0/i.test(m) && m.length < 120) return false;
@@ -1002,10 +1002,18 @@ const SECURITY_PATTERNS = [
   { id:'proto-setproto',  cat:'Prototype Pollution', sev:'medium',
     re:/Object\.setPrototypeOf\s*\(/g, ctx: m => /Object\.prototype/.test(m) },
   // proto-forin: for...in loop with variable-key assignment that could set __proto__
-  // Catches `for(var k in src) target[k] = src[k]` — dynamic property copy
+  // Catches `for(var k in src) target[k] = src[k]` — dynamic property copy.
+  // Severity: medium when the iterated source is taint-sourced (JSON.parse,
+  // getParam, location, request data) — high-risk pattern; info otherwise
+  // (unguarded internal copy in lib code — low risk without attacker keys).
   { id:'proto-forin',  cat:'Prototype Pollution', sev:'medium',
     re:/for\s*\(\s*(?:var\s+|let\s+|const\s+)?([a-zA-Z_$][\w$]*)\s+in\s+[a-zA-Z_$][\w$]*\)[\s\S]{0,200}?\1\]\s*=\s*[\s\S]{0,100}?\1\]/g,
-    ctx: () => true },
+    ctx: (m, src) => {
+      // Look backwards up to ~500 chars for attacker-influenced data sources.
+      const idx = src.indexOf(m);
+      const before = idx === -1 ? '' : src.slice(Math.max(0, idx - 500), idx);
+      return /JSON\.parse|getParam|location\b|document\.(?:referrer|cookie)|window\.name|fetch\s*\(|XMLHttpRequest|req(?:uest)?\.(?:body|params|query|headers)|params\b|query\b|decodeURIComponent|atob\s*\(|postMessage\s*\(/.test(before);
+    } },
   { id:'proto-jsonparse',  cat:'Prototype Pollution', sev:'medium',
     // Negative lookahead: skip JSON.parse(JSON.stringify(x)) deep-clone pattern.
     // Bare JSON.parse(<ident>) is also skipped unless __proto__ / constructor are
@@ -2864,8 +2872,8 @@ function normaliseBooleans(src) {
     .replace(/\b!1\b/g, 'false')
     .replace(/\bvoid\s+0\b/g, 'undefined')
     .replace(/\bvoid\(0\)/g, 'undefined')
-    .replace(/(?:\b|(?<=[\(,=!]))!!\[\]/g, 'true')
-    .replace(/(?:\b|(?<=[\(,=!]))!\[\]/g, 'false')
+    .replace(/(?:\b|(?<=[\(\s,=!]))!!\[\]/g, 'true')
+    .replace(/(?:\b|(?<=[\(\s,=!]))!\[\]/g, 'false')
     .replace(/\+\[\]/g, '0');
 }
 
@@ -2951,11 +2959,31 @@ function eliminateOpaquePredicates(src) {
     src = src.replace(/!true\b/g, () => { changed = true; return 'false'; });
     src = src.replace(/!false\b/g, () => { changed = true; return 'true'; });
 
-    // 8. Concat boolean folding: true && true → true, true && false → false, etc.
-    src = src.replace(/true\s*&&\s*true\b/g, () => { changed = true; return 'true'; });
-    src = src.replace(/(?:true\s*&&\s*false|false\s*&&\s*(?:true|false))\b/g, () => { changed = true; return 'false'; });
-    src = src.replace(/true\s*\|\|\s*(?:true|false)\b/g, () => { changed = true; return 'true'; });
-    src = src.replace(/false\s*\|\|\s*(true|false)\b/g, (full, m) => { changed = true; return m; });
+    // 8. Double-negation folding: !!1 → true, !!0 → false, !0 → true, !1 → false
+    src = src.replace(/!!1\b/g, () => { changed = true; return 'true'; });
+    src = src.replace(/!!0\b/g, () => { changed = true; return 'false'; });
+    src = src.replace(/!0\b/g, () => { changed = true; return 'true'; });
+    src = src.replace(/!1\b/g, () => { changed = true; return 'false'; });
+
+    // 9. Boolean compound folding — short-circuit elimination
+    // Word-boundary and operator-aware: EXPR1 && false → false
+    // Supports identifiers, comparisons (both sides), number literals, and calls.
+    const identLike = /[a-zA-Z_$][\w$.]*/.source;
+    const numLike = /\d+(?:\.\d+)?/.source;
+    const anyOperand = `(?:${identLike}|${numLike})`;
+    const comparison = `${anyOperand}\\s*(?:===?|!==?|[<>]=?|in|instanceof)\\s*${anyOperand}`;
+    const callOrIdent = `${identLike}(?:\\s*\\([^)]*\\))?`;
+    const expr = `(?:${comparison}|${callOrIdent})`;
+    src = src.replace(new RegExp(`${expr}\\s*&&\\s*false\\b`, 'g'), () => { changed = true; return 'false'; });
+    src = src.replace(/false\s*&&\s*(?:[a-zA-Z_$][\w$.]*(?:\s*\([^)]*\))?|\([^)]+\))/g, () => { changed = true; return 'false'; });
+    // true && EXPR → EXPR (capture the right-hand expression)
+    src = src.replace(/true\s*&&\s*((?:[a-zA-Z_$][\w$.]*(?:\s*\([^)]*\))?|\([^)]+\)))/g, (full, m) => { changed = true; return m.trim(); });
+    // EXPR || true → true, true || EXPR → true
+    src = src.replace(new RegExp(`${expr}\\s*\\|\\|\\s*true\\b`, 'g'), () => { changed = true; return 'true'; });
+    src = src.replace(/true\s*\|\|\s*(?:[a-zA-Z_$][\w$.]*(?:\s*\([^)]*\))?|\([^)]+\))/g, () => { changed = true; return 'true'; });
+    // false || EXPR → EXPR, EXPR || false → EXPR
+    src = src.replace(/false\s*\|\|\s*((?:[a-zA-Z_$][\w$.]*(?:\s*\([^)]*\))?|\([^)]+\)))/g, (full, m) => { changed = true; return m.trim(); });
+    src = src.replace(new RegExp(`(${expr})\\s*\\|\\|\\s*false\\b`, 'g'), (full, m) => { changed = true; return m.trim(); });
   }
 
   if (findings.length > 0) {
@@ -6814,6 +6842,7 @@ async function main(externalOpts) {
   }
 
   let src = fs.readFileSync(inputPath, 'utf8');
+  const srcRaw = src;  // preserve original raw source for obfuscator fingerprinting
 
   // Chunk single lines > 100 KB to prevent regex backtracking hangs in decode
   // phases. Real bundles have line breaks even when minified (frameworks inject
@@ -6940,8 +6969,8 @@ async function main(externalOpts) {
   // Phase 3b — Opaque predicate elimination
   if (opts.verbose) console.log(info('  Phase 3b: opaque predicate & dead code elimination…'));
   const elimResult = eliminateOpaquePredicates(src);
+  src = elimResult.src;
   if (elimResult.findings.length) {
-    src = elimResult.src;
     if (!opts.quiet) console.log(ok(`Phase 3b: removed ${elimResult.findings.length} opaque predicates`));
   }
 
@@ -7266,21 +7295,31 @@ async function main(externalOpts) {
             description: 'External source map fetched and decoded — source structure recovered',
           });
           // Flag sensitive paths in the fetched map too
+          // (collapsed — one finding max to avoid hundreds of duplicates)
           const sensitivePatterns = [
             { re: /\/(?:src|app|lib|server|backend|internal)\//i, sev: 'high', desc: 'Internal source path disclosed' },
             { re: /\/(?:test|spec|__tests__)\//i, sev: 'medium', desc: 'Test file paths disclosed' },
             { re: /\.(?:env|key|pem|p12|crt)$/, sev: 'critical', desc: 'Sensitive file (env/key/cert) in source map' },
           ];
+          const pathMatches = [];
           for (const srcPath of fetched.sources) {
             for (const p of sensitivePatterns) {
               if (p.re.test(srcPath)) {
-                sourceMapInfo.findings.push({
-                  id: 'sourcemap-sensitive-path', category: 'Source Map', severity: p.sev,
-                  value: srcPath.slice(0, 100), context: `source: ${srcPath}`,
-                  description: p.desc,
-                });
+                pathMatches.push({ path: srcPath, severity: p.sev, desc: p.desc });
               }
             }
+          }
+          if (pathMatches.length > 0) {
+            const worst = pathMatches.reduce((a, b) => {
+              const order = { critical: 4, high: 3, medium: 2, low: 1 };
+              return order[a.severity] >= order[b.severity] ? a : b;
+            }, pathMatches[0]);
+            sourceMapInfo.findings.push({
+              id: 'sourcemap-sensitive-path', category: 'Source Map', severity: worst.severity,
+              value: `${pathMatches.length} sensitive paths leaked (worst: ${worst.path.slice(0, 80)})`,
+              context: `worst: ${worst.path}`,
+              description: `${pathMatches.length} sensitive source paths disclosed in source map (${worst.desc})`,
+            });
           }
           if (opts.verbose) console.log(info(`  Fetched source map: ${fetched.sourceCount} sources recovered`));
         } else {
@@ -7363,6 +7402,17 @@ async function main(externalOpts) {
       }
     }
   } // end if (useAst)
+
+  // Fallback obfuscator fingerprint: re-run with original raw source if
+  // AST-phase produced a null primary (e.g. raw source fingerprint gets
+  // destroyed by normaliseBooleans/eliminateOpaquePredicates before Phase 16).
+  if ((!obfuscatorFingerprint || !obfuscatorFingerprint.primary) && (opts.report || opts.security)) {
+    if (!opts.quiet) console.log(info('  Phase 16b: Obfuscator fingerprint (raw source fallback)…'));
+    obfuscatorFingerprint = ast.fingerprintObfuscator(srcRaw);
+    if (opts.verbose && obfuscatorFingerprint && obfuscatorFingerprint.primary) {
+      console.log(info(`  Obfuscator: ${obfuscatorFingerprint.primary.obfuscator} (${(obfuscatorFingerprint.primary.confidence * 100).toFixed(0)}% confidence)`));
+    }
+  }
 
   // ── Dedup taint findings between regex Phase 12j and AST Phase 14c ────
   // FIX: previously both scanners ran and produced overlapping findings for

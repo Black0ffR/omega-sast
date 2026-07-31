@@ -2233,22 +2233,33 @@ function parseSourceMap(src) {
         });
 
         // Flag specific source paths that reveal internal structure
+        // (collapsed into one finding to avoid hundreds of duplicates)
         const sensitivePatterns = [
           { re: /\/(?:src|app|lib|server|backend|internal)\//i, sev: 'high', desc: 'Internal source path disclosed' },
           { re: /\/(?:test|spec|__tests__)\//i, sev: 'medium', desc: 'Test file paths disclosed' },
           { re: /\/node_modules\//, sev: 'low', desc: 'node_modules path disclosed' },
           { re: /\.(?:env|key|pem|p12|crt)$/, sev: 'critical', desc: 'Sensitive file (env/key/cert) in source map' },
         ];
+        const pathMatches = [];
         for (const srcPath of sources) {
           for (const p of sensitivePatterns) {
             if (p.re.test(srcPath)) {
-              findings.push({
-                id: 'sourcemap-sensitive-path', category: 'Source Map', severity: p.sev,
-                value: srcPath.slice(0, 100), context: `source: ${srcPath}`,
-                description: p.desc,
-              });
+              pathMatches.push({ path: srcPath, severity: p.sev, desc: p.desc });
             }
           }
+        }
+        // Emit at most one sensitive-path finding (highest severity) with a count
+        if (pathMatches.length > 0) {
+          const worst = pathMatches.reduce((a, b) => {
+            const order = { critical: 4, high: 3, medium: 2, low: 1 };
+            return order[a.severity] >= order[b.severity] ? a : b;
+          }, pathMatches[0]);
+          findings.push({
+            id: 'sourcemap-sensitive-path', category: 'Source Map', severity: worst.severity,
+            value: `${pathMatches.length} sensitive paths leaked (worst: ${worst.path.slice(0, 80)})`,
+            context: `worst: ${worst.path}`,
+            description: `${pathMatches.length} sensitive source paths disclosed in source map (${worst.desc})`,
+          });
         }
 
         // Decode VLQ mappings for position remapping
@@ -2549,20 +2560,29 @@ function fingerprintObfuscator(src) {
   }
 
   // ── JSFuck signatures ───────────────────────────────────────────────────
-  // JSFuck encodes everything as []()!+
+  // JSFuck encodes everything as []()!+ — minimal alphanumeric characters
   let jsfuckScore = 0;
   const jsfuckSigs = [];
 
-  // Signature: long runs of []()!+ characters
-  const jsfuckRuns = src.match(/\[[\[\]()!+]{50,}\]/g) || [];
-  if (jsfuckRuns.length > 0) {
-    jsfuckScore += Math.min(0.3 * jsfuckRuns.length, 0.8);
-    jsfuckSigs.push({
-      signature: 'jsfuck-encoding',
-      pos: src.search(/\[[\[\]()!+]{50,}\]/),
-      evidence: `${jsfuckRuns.length} JSFuck-style runs`,
-      hint: 'JSFuck encoding — evaluate with safe interpreter',
-    });
+  // Strip comments and measure the code body
+  const codeBody = src.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').trim();
+  // JSFuck uses only: [ ] ( ) ! +  (plus whitespace and the occasional . or ,)
+  const jsfuckChars = (codeBody.match(/[\[\]\(\)!\+]/g) || []).length;
+  const alphaNum = (codeBody.match(/[a-zA-Z0-9]/g) || []).length;
+  const totalBody = codeBody.length;
+  if (totalBody > 50) {
+    const jsfuckRatio = jsfuckChars / totalBody;
+    const alphaRatio = alphaNum / totalBody;
+    // JSFuck has very high symbol density (>70%) and near-zero alphanumeric (<5%)
+    if (jsfuckRatio > 0.7 && alphaRatio < 0.05) {
+      jsfuckScore += Math.min(0.8, jsfuckRatio);
+      jsfuckSigs.push({
+        signature: 'jsfuck-symbol-density',
+        pos: codeBody.search(/[\[\]\(\)!\+]{10,}/),
+        evidence: `JSFuck symbol ratio: ${(jsfuckRatio * 100).toFixed(0)}%, alpha ratio: ${(alphaRatio * 100).toFixed(0)}%`,
+        hint: 'JSFuck encoding — evaluate with safe interpreter',
+      });
+    }
   }
 
   if (jsfuckScore >= 0.3) {
@@ -2575,29 +2595,93 @@ function fingerprintObfuscator(src) {
   }
 
   // ── AAEncode / Kaomoji encoding signatures ─────────────────────────────
-  // AAEncode encodes JavaScript using Japanese emoticon characters
+  // AAEncode encodes JavaScript using Japanese emoticon + Greek characters
   // (ﾟωﾟﾉ= etc.) with the pattern: `ﾟωﾟﾉ= /｀ｍ´）ﾉ~┻━┻   ...`
   let aaencodeScore = 0;
   const aaencodeSigs = [];
-  const aaUnicode = (src.match(/[\u3040-\u309F\u30A0-\u30FF\uFF00-\uFFEFｦ-ﾟ]/g) || []).length;
-  // AAEncode typically has >30% Unicode kaomoji chars in the first 500 chars
-  const first500 = src.slice(0, 500);
-  const aaFirst500 = (first500.match(/[\u3040-\u309F\u30A0-\u30FF\uFF00-\uFFEFｦ-ﾟ]/g) || []).length;
-  if (aaFirst500 > 20 && aaFirst500 > first500.length * 0.15) {
-    aaencodeScore += 0.7;
+
+  // AAEncode-specific bootstrap: ﾟωﾟﾉ=  at the start
+  if (/ﾟωﾟﾉ\s*=|\(ﾟωﾟﾉ/.test(src)) {
+    aaencodeScore += 0.9;
     aaencodeSigs.push({
-      signature: 'aaencode-unicode-kaomoji',
-      pos: 0,
-      evidence: `${aaFirst500} Unicode kaomoji chars in first 500 (${(aaFirst500 / first500.length * 100).toFixed(0)}%)`,
+      signature: 'aaencode-bootstrap',
+      pos: src.search(/ﾟωﾟﾉ\s*=|\(ﾟωﾟﾉ/),
+      evidence: 'AAEncode bootstrap: ﾟωﾟﾉ= pattern detected',
       hint: 'AAEncode encoding — decode using character substitution table',
     });
   }
+
+  // Heuristic: high density of kaomoji + Greek chars (ﾟωﾟﾉ style)
+  if (aaencodeScore < 0.5) {
+    const aaUnicode = (src.match(/[\u3040-\u309F\u30A0-\u30FF\uFF00-\uFFEF\u0370-\u03FFｦ-ﾟ]/g) || []).length;
+    // AAEncode typically has >30% Unicode chars in the first 500 chars
+    const first500 = src.slice(0, 500);
+    const aaFirst500 = (first500.match(/[\u3040-\u309F\u30A0-\u30FF\uFF00-\uFFEF\u0370-\u03FFｦ-ﾟ]/g) || []).length;
+    if (aaFirst500 > 20 && aaFirst500 > first500.length * 0.15 && aaUnicode > 0) {
+      aaencodeScore += 0.7;
+      aaencodeSigs.push({
+        signature: 'aaencode-unicode-kaomoji',
+        pos: 0,
+        evidence: `${aaFirst500} Unicode kaomoji chars in first 500 (${(aaFirst500 / first500.length * 100).toFixed(0)}%)`,
+        hint: 'AAEncode encoding — decode using character substitution table',
+      });
+    }
+  }
+
   if (aaencodeScore >= 0.3) {
     signatures.push({
       obfuscator: 'AAEncode',
       confidence: Math.min(aaencodeScore, 1.0),
       version: 'classic',
       matched: aaencodeSigs,
+    });
+  }
+
+  // ── JJEncode signatures ─────────────────────────────────────────────────
+  // JJEncode encodes JavaScript using only 6 characters: $, _, [, ], (, ), +, !, ., ~
+  // Classic opening: $=~[];$={___:++$,$$$:(![]+"")[$],...};$
+  let jjencodeScore = 0;
+  const jjencodeSigs = [];
+
+  // Signature 1: JJEncode bootstrap pattern
+  const jjMatch = src.match(/^\s*(?:\$|var\s+\$)\s*=\s*~\[\]\s*;\s*(?:\$|var\s+\$)\s*=\s*\{___:\+\+\$/m);
+  if (jjMatch) {
+    jjencodeScore += 0.8;
+    jjencodeSigs.push({
+      signature: 'jjencode-bootstrap',
+      pos: jjMatch.index,
+      evidence: 'classic JJEncode bootstrap: $=~[];$={___:++$',
+      hint: 'JJEncode — evaluate with safe interpreter (no eval)',
+    });
+  }
+
+  // Signature 2: JJEncode character — high density of $ and _ operators
+  // JJEncode output has very few alphanumeric chars and heavy $, _, [, ] usage.
+  // Requires $ or _ presence to distinguish from JSFuck (which is []()!+ only).
+  if (jjencodeScore < 0.5) {
+    const hasDollarOrUnderscore = /[\$_]/.test(src);
+    const nonAlphaRatio = (src.match(/[\$\_\[\]\(\)\+!\.~]/g) || []).length / Math.max(src.length, 1);
+    if (hasDollarOrUnderscore && nonAlphaRatio > 0.3 && src.length > 50 && src.length < 50000) {
+      const alphaCount = (src.match(/[a-zA-Z0-9]/g) || []).length;
+      const alphaRatio = alphaCount / Math.max(src.length, 1);
+      if (alphaRatio < 0.2) {
+        jjencodeScore += Math.min(0.6, nonAlphaRatio);
+        jjencodeSigs.push({
+          signature: 'jjencode-high-symbol-density',
+          pos: 0,
+          evidence: `Non-alpha ratio: ${(nonAlphaRatio * 100).toFixed(0)}%, alpha ratio: ${(alphaRatio * 100).toFixed(0)}%`,
+          hint: 'likely JJEncode encoding — all logic encoded as $()[]!+~',
+        });
+      }
+    }
+  }
+
+  if (jjencodeScore >= 0.3) {
+    signatures.push({
+      obfuscator: 'JJEncode',
+      confidence: Math.min(jjencodeScore, 1.0),
+      version: null,
+      matched: jjencodeSigs,
     });
   }
 

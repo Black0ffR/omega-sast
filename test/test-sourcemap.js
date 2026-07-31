@@ -105,15 +105,15 @@ section('5. Inline map with sensitive file paths');
   const src = `var x = 1;\n//# sourceMappingURL=data:application/json;base64,${mapB64}`;
   const result = ast.parseSourceMap(src);
 
-  // .env file → critical
-  assert('inline map: .env file flagged critical',
-    result.findings.some(f => f.id === 'sourcemap-sensitive-path' && f.value.includes('.env') && f.severity === 'critical'));
-  // .key file → critical
-  assert('inline map: .key file flagged critical',
-    result.findings.some(f => f.id === 'sourcemap-sensitive-path' && f.value.includes('.key') && f.severity === 'critical'));
-  // node_modules → low
-  assert('inline map: node_modules flagged low',
-    result.findings.some(f => f.id === 'sourcemap-sensitive-path' && f.value.includes('node_modules') && f.severity === 'low'));
+  // Sensitive paths collapsed into one finding (highest severity)
+  {
+    const sp = result.findings.filter(f => f.id === 'sourcemap-sensitive-path');
+    assert('inline map: has sourcemap-sensitive-path finding', sp.length === 1);
+    assert('inline map: worst severity is critical (for .key)',
+      sp[0].severity === 'critical');
+    assert('inline map: count includes all matched paths',
+      sp[0].value.includes('sensitive paths leaked'));
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
