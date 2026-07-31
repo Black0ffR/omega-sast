@@ -198,6 +198,40 @@ section('6. decoder-driven XSS surfaces (string-array hides innerHTML sink)');
     `findings=${all.map(f => f.id).join(',')}`);
 }
 
+// ═════════════════════════════════════════════════════════════════════════
+section('7. chained string arrays resolve via fixpoint (analysis FINAL §6.1)');
+{
+  // Layer 2: _0xb's literal references _0xa[2] — not string-only, so Step 1
+  // skips it and nothing decodes. After the fixpoint, round 1 resolves
+  // _0xa[2] -> 'innerHTML' inside the literal, round 2 decodes D(0x66) → 1
+  // → 'innerHTML', and the XSS surfaces.
+  const src = [
+    "var _0xa=['hello','world','innerHTML'];",
+    "var _0xb=['x',_0xa[2],'y','z'];",
+    'function D(_0x3b3a,_0x37ef6e){',
+    'return D=function(_0x338a69,_0x39ad79){',
+    '_0x338a69=_0x338a69-(0x1939+-0xf*0x1f3+0x1*0x469);',
+    'var _0x2b223=_0xb[_0x338a69];',
+    'return _0x2b223;',
+    '}(_0x3b3a,_0x37ef6e);',
+    '}',
+    "document.body[D(0x66)]=location.hash;",
+  ].join('\n');
+  const r = scanTmpFixture(src);
+  assert('chained fixture: report produced', !!r && !r._parseError, r && r._parseError);
+  assert('chained fixture: decoder decoded strings (round 2 fired)',
+    r && r.decodeStats && r.decodeStats.obfuscatorIo >= 1,
+    `obfuscatorIo=${r && r.decodeStats && r.decodeStats.obfuscatorIo}`);
+  const all = [
+    ...(r && r.security ? r.security : []),
+    ...(r && r.extendedFindings ? r.extendedFindings : []),
+  ];
+  const xss = all.filter(f => /xss|innerhtml/i.test(f.id || ''));
+  assert('chained fixture: XSS surfaces via chained string-array sink',
+    xss.length > 0,
+    `findings=${all.map(f => f.id).join(',')}`);
+}
+
 // ── Summary ───────────────────────────────────────────────────────────────
 console.log(`\n  TOTAL: ${total}   PASSED: ${passed}   FAILED: ${failed}`);
 if (failed > 0) {
