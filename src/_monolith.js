@@ -1411,6 +1411,7 @@ function parseArgs() {
       case '--fetch-cves':    o.fetchCves    = true;      break;
     case '--fetch-sourcemaps': o.fetchSourcemaps = true; break;
     case '--no-fetch-sourcemaps': o.fetchSourcemaps = false; break;
+    case '--strict-sourcemaps': o.strictSourcemaps = true; break;
     case '--multi':         o.multi        = true;      break;
     case '--quiet':         o.quiet        = true;      break;
     case '--no-llm-payload': o.llmPayload  = false;     break;
@@ -1453,6 +1454,7 @@ function printHelp() {
   console.log('  --fetch-cves       Query OSV.dev API for live vulnerability data (uses node:https)');
   console.log('  --fetch-sourcemaps Fetch and decode external .map files (uses node:https) [default in --report mode]');
   console.log('  --no-fetch-sourcemaps Disable source map fetching (opt-out)');
+  console.log('  --strict-sourcemaps Keep CDN source-map URLs at medium severity (default: info)');
   console.log('  --quiet            Suppress non-essential output (CI-friendly)');
   console.log('  --multi            Cross-bundle analysis mode (comma-separated inputs)');
   console.log('  --no-llm-payload   Omit LLM-specific JSON sections (function summaries, backward');
@@ -7898,7 +7900,7 @@ async function main(externalOpts) {
 
     // Phase 12q — Source map awareness (Stage 3E)
     if (opts.verbose) console.log(info('  Phase 12q: Source map parser (Stage 3E)…'));
-    sourceMapInfo = ast.parseSourceMap(astSrc);
+    sourceMapInfo = ast.parseSourceMap(astSrc, { strictSourcemaps: !!opts.strictSourcemaps });
     if (opts.verbose && sourceMapInfo.found) {
       console.log(info(`  Source map: ${sourceMapInfo.isInline ? 'inline' : sourceMapInfo.isExternal ? 'external' : 'unknown'}, ${sourceMapInfo.sourceCount} sources, ${sourceMapInfo.findings.length} findings`));
       // If external and fetch-sourcemaps is enabled, fetch and decode

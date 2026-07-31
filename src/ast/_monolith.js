@@ -2184,7 +2184,8 @@ function mapSourcePosition(genLine, genCol, decodedLines, sources, sourceRoot) {
 //  structure and file paths.
 // ═══════════════════════════════════════════════════════════════════════════
 
-function parseSourceMap(src) {
+function parseSourceMap(src, opts) {
+  const strict = !!(opts && opts.strictSourcemaps);
   const findings = [];
   const ctx = (i, r=120) => src.slice(Math.max(0, i - r/2), i + r/2).replace(/\n/g, ' ');
 
@@ -2195,17 +2196,25 @@ function parseSourceMap(src) {
   const SOURCEMAP_RE = /\/\/[#@]\s*sourceMappingURL\s*=\s*(\S+)|\/\*#\s*sourceMappingURL\s*=\s*(\S+)\s*\*\//g;
   let m;
   let mapRef = null;
+  let dataMatch = null;
   while ((m = SOURCEMAP_RE.exec(src)) !== null) {
     const url = m[1] || m[2];
     mapRef = { url, pos: m.index, isInline: false, isExternal: false };
-    const sev = mapRef.url.startsWith('data:') ? 'medium' :
-                mapRef.url.startsWith('http://') ? 'high' :
-                mapRef.url.startsWith('https://') ? 'low' : 'low';
-    findings.push({
-      id: 'sourcemap-ref', category: 'Source Map', severity: sev,
-      value: url.slice(0, 100), context: ctx(m.index),
-      description: 'sourceMappingURL reference in production bundle — original source structure leaked',
-    });
+    const isDataUri = url.startsWith('data:');
+    const isExtShape = url.startsWith('http://') || url.startsWith('https://') || url.endsWith('.map');
+    dataMatch = isDataUri ? url.match(/^data:application\/json;(?:charset=utf-8;)?base64,(.+)$/) : null;
+    // sourcemap-ref is a fallback only: canonical findings
+    // (sourcemap-external / sourcemap-inline-decoded / sourcemap-decode-failed)
+    // supersede it, so one sourceMappingURL yields exactly one finding.
+    // Keep it only for references that produce nothing else (bare URLs,
+    // non-base64 data URIs).
+    if (!isExtShape && !(isDataUri && dataMatch)) {
+      findings.push({
+        id: 'sourcemap-ref', category: 'Source Map', severity: 'low',
+        value: url.slice(0, 100), context: ctx(m.index),
+        description: 'sourceMappingURL reference in production bundle — original source structure leaked',
+      });
+    }
     break;  // only one source map reference per file
   }
 
@@ -2217,7 +2226,6 @@ function parseSourceMap(src) {
   if (mapRef.url.startsWith('data:')) {
     mapRef.isInline = true;
     // Try to decode the inline map
-    const dataMatch = mapRef.url.match(/^data:application\/json;(?:charset=utf-8;)?base64,(.+)$/);
     if (dataMatch) {
       try {
         const decoded = Buffer.from(dataMatch[1], 'base64').toString('utf8');
@@ -2288,8 +2296,11 @@ function parseSourceMap(src) {
   } else if (mapRef.url.startsWith('http://') || mapRef.url.startsWith('https://') ||
              mapRef.url.endsWith('.map')) {
     mapRef.isExternal = true;
+    const isHttp = mapRef.url.startsWith('http://') || mapRef.url.startsWith('https://');
+    // CDN source-map lines are default info; --strict-sourcemaps keeps medium.
     findings.push({
-      id: 'sourcemap-external', category: 'Source Map', severity: 'medium',
+      id: 'sourcemap-external', category: 'Source Map',
+      severity: isHttp ? (strict ? 'medium' : 'info') : 'medium',
       value: mapRef.url.slice(0, 100), context: ctx(mapRef.pos),
       description: 'External source map URL — fetching it would expose original source code',
     });

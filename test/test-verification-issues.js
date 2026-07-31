@@ -876,10 +876,10 @@ var x = D(-0x100, 'k');`;
 
 // ═════════════════════════════════════════════════════════════════════════
 //  ISSUE 1.3h — Source map finding de-duplication
-//  After removing redundant sourcemap-ref regex rule, source map leaks
-//  should produce at most 2 findings (ref + external), not 3.
+//  Residual 3: sourcemap-ref is folded into the canonical finding, so one
+//  sourceMappingURL produces exactly 1 finding (sourcemap-external).
 // ═════════════════════════════════════════════════════════════════════════
-section('1.3h Source map dedup: at most 2 findings per leak');
+section('1.3h Source map dedup: exactly 1 finding per leak');
 
 (function () {
   const dir = mkTmpDir();
@@ -893,8 +893,8 @@ section('1.3h Source map dedup: at most 2 findings per leak');
   const r = readReport(out);
   const sourceMapFinds = allFindings(r).filter(f =>
     f.id && f.id.startsWith('sourcemap'));
-  assert('Source map leak produces at most 2 findings (was 3)',
-    sourceMapFinds.length <= 2,
+  assert('Source map leak produces exactly 1 finding (was 2: ref + external)',
+    sourceMapFinds.length === 1,
     `got ${sourceMapFinds.length}: ${sourceMapFinds.map(f => `${f.id}(${f.severity})`).join(', ')}`);
   const extFindings = sourceMapFinds.filter(f => f.id === 'sourcemap-external');
   assert('sourcemap-external finding is present for .map URL',

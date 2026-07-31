@@ -40,12 +40,77 @@ section('2. External .map URL reference');
   assert('external URL: isExternal=true', result.isExternal === true);
   assert('external URL: isInline=false', result.isInline === false);
   assert('external URL: mapUrl captured', result.mapUrl === 'app.bundle.js.map');
-  assert('external URL: has findings', result.findings.length >= 2,
-    `findings=${result.findings.length}`);
-  assert('external URL: sourcemap-ref finding present',
-    result.findings.some(f => f.id === 'sourcemap-ref'));
+  // Residual 3: one canonical finding per URL — sourcemap-ref is folded into
+  // sourcemap-external (relative .map keeps medium severity)
+  assert('external URL: exactly 1 finding', result.findings.length === 1,
+    `findings=${result.findings.map(f=>`${f.id}(${f.severity})`).join(',')}`);
+  assert('external URL: sourcemap-ref folded into canonical finding',
+    !result.findings.some(f => f.id === 'sourcemap-ref'));
   assert('external URL: sourcemap-external finding present',
     result.findings.some(f => f.id === 'sourcemap-external'));
+  assert('external URL: relative .map severity is medium',
+    result.findings[0].severity === 'medium',
+    `sev=${result.findings[0] && result.findings[0].severity}`);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+section('2a. CDN https source map URL — default info, strict medium');
+{
+  const src = 'var x = 1;\n//# sourceMappingURL=https://cdn.example.com/maps/app.js.map';
+  const result = ast.parseSourceMap(src);
+  assert('https URL: found=true', result.found === true);
+  assert('https URL: isExternal=true', result.isExternal === true);
+  assert('https URL: exactly 1 finding', result.findings.length === 1,
+    `findings=${result.findings.length}`);
+  assert('https URL: default severity is info',
+    result.findings[0].severity === 'info' && result.findings[0].id === 'sourcemap-external',
+    `id=${result.findings[0].id} sev=${result.findings[0].severity}`);
+  const strictResult = ast.parseSourceMap(src, { strictSourcemaps: true });
+  assert('https URL: --strict-sourcemaps keeps medium',
+    strictResult.findings[0].severity === 'medium',
+    `sev=${strictResult.findings[0].severity}`);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+section('2b. Inline map: sourcemap-ref folded into inline-decoded');
+{
+  const map = {
+    version: 3,
+    sources: ['webpack:///./src/app.js'],
+    names: [], mappings: 'AAAA',
+  };
+  const mapB64 = Buffer.from(JSON.stringify(map)).toString('base64');
+  const src = `var x = 1;\n//# sourceMappingURL=data:application/json;base64,${mapB64}`;
+  const result = ast.parseSourceMap(src);
+  assert('inline map: no sourcemap-ref when decoded',
+    !result.findings.some(f => f.id === 'sourcemap-ref'),
+    `ids: ${result.findings.map(f=>f.id).join(',')}`);
+  assert('inline map: sourcemap-inline-decoded present',
+    result.findings.some(f => f.id === 'sourcemap-inline-decoded'));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+section('2c. Malformed inline map: sourcemap-ref folded into decode-failed');
+{
+  const src = 'var x = 1;\n//# sourceMappingURL=data:application/json;base64,!!!notvalidbase64!!!';
+  const result = ast.parseSourceMap(src);
+  assert('malformed inline: no sourcemap-ref when decode-failed fires',
+    !result.findings.some(f => f.id === 'sourcemap-ref'),
+    `ids: ${result.findings.map(f=>f.id).join(',')}`);
+  assert('malformed inline: sourcemap-decode-failed present',
+    result.findings.some(f => f.id === 'sourcemap-decode-failed'));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+section('2d. Bare reference (no canonical branch): sourcemap-ref fallback');
+{
+  const src = 'var x = 1;\n//# sourceMappingURL=app.bundle.js';
+  const result = ast.parseSourceMap(src);
+  assert('bare URL: sourcemap-ref fallback fires',
+    result.findings.some(f => f.id === 'sourcemap-ref'),
+    `ids: ${result.findings.map(f=>f.id).join(',')}`);
+  assert('bare URL: exactly 1 finding', result.findings.length === 1,
+    `findings=${result.findings.length}`);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
