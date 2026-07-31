@@ -1389,6 +1389,7 @@ function parseArgs() {
     diff: null,            // path to previous report.json for diff mode
     treatTsAsJs: false,    // strip TypeScript annotations before analysis
     customRulesPath: null, // path to .omega-rules.json for pluggable rules
+    decodeEsoteric: false, // opt-in esoteric decode (JSFuck/AAEncode/JJEncode)
   };
   for (let i = 1; i < args.length; i++) {
     switch (args[i]) {
@@ -1419,6 +1420,7 @@ function parseArgs() {
     case '--diff':           o.diff           = args[++i]; break;
     case '--treat-ts-as-js': o.treatTsAsJs    = true;      break;
     case '--custom-rules':   o.customRulesPath = args[++i]; break;
+    case '--decode-esoteric': o.decodeEsoteric = true; break;
     case '--all':
         o.splitModules = o.secrets = o.routes = o.security =
         o.graph = o.report = o.ast = true; break;
@@ -1461,6 +1463,10 @@ function printHelp() {
   console.log('  --diff <file>      Compare against previous report.json — only show new findings');
   console.log('  --treat-ts-as-js   Strip TypeScript annotations before analysis (view .ts as .js)');
   console.log('  --custom-rules <f> Path to .omega-rules.json for pluggable rule patterns');
+  console.log('  --decode-esoteric  Opt-in decode of esoteric shells (JSFuck / AAEncode /');
+  console.log('                     JJEncode) in an isolated worker — payload recovered');
+  console.log('                     without execution and fed into the full pipeline;');
+  console.log('                     writes <name>.decoded.js + decodeStats.esoteric');
   console.log('  --multi            Cross-bundle analysis mode (comma-separated inputs)');
   console.log('');
   console.log('  CI exit codes (configure via OMEGA_FAIL_ON env var):');
@@ -5133,6 +5139,223 @@ function scanConfigDrivenBehaviour(src) {
 // ═══════════════════════════════════════════════════════════════════════════
 //  PHASE 12m — D4: LAZY-LOADING ROUTE SECURITY ANALYZER
 // ═══════════════════════════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE 12n — CSRF ANALYZER (hybrid regex/context + auth-context classifier)
+// Report-only: findings are NOT merged into the fail-gates / attackScore.
+//   class 1: state-changing requests without CSRF token (severity by auth ctx)
+//   class 2: cookie attribute weaknesses (SameSite / Secure)
+//   class 3: JSONP legacy patterns
+//   class 4: token mishandling (token in URL, localStorage-only, client compare)
+//   class 5: positive protections → suppression + posture 'protected'
+function scanCsrf(src) {
+  const findings  = [];
+  const surfaces  = [];
+  const tok       = new Set();
+  const cookieAuth = /document\.cookie|Cookies\.(?:get|set)\(|XSRF-TOKEN|PHPSESSID|connect\.sid|JSESSIONID|sameSite\s*[:=]/i.test(src);
+  const bearerAuth = /(?:['"]\s*Authorization\s*['"]\s*:|Authorization\s*[:=])\s*['"]?\s*Bearer\s|['"]Bearer\s+[A-Za-z0-9._~+/=-]+['"]|x-access-token\s*:|x-auth-token\s*:/i.test(src);
+
+  // ── class 5 signals (positive protections → suppression) ────────────────
+  const hasMetaCsrf      = /<meta\b[^>]*name\s*=\s*['"]csrf-token['"]/i.test(src);
+  const hasAngularXsrf   = /HttpXsrfInterceptor|XsrfCookieName\s*[,:]|withXsrfToken/i.test(src);
+  const hasDjangoToken   = /\{%\s*csrf_token\s*%\}|csrfmiddlewaretoken/i.test(src);
+  const hasGenericHeader = /['"]X-(?:CSRF|XSRF)-TOKEN['"]\s*:\s*[^,\n}]{1,80}/i.test(src);
+  const axiosXsrfConf    = /axios\.defaults\.xsrf(?:Cookie|Header)Name\s*=\s*['"][^'"]+['"]/i.test(src);
+  const bundleProtected  = hasMetaCsrf || hasAngularXsrf || hasDjangoToken || hasGenericHeader || axiosXsrfConf;
+
+  // ── state-changing call inventory ────────────────────────────────────────
+  const calls = [];
+  const addCall = (idx, kind, method, surface) => {
+    if (typeof idx !== 'number') return;
+    if (calls.some(c => Math.abs(c.idx - idx) < 10 && c.kind === kind)) return;
+    calls.push({ idx, kind, method, surface: surface || '(unknown)' });
+  };
+  const verbRe = /['"](POST|PUT|PATCH|DELETE)['"]/i;
+
+  let m;
+  const fetchRe = /fetch\s*\(\s*['"]([^'"]+)['"]\s*,\s*\{[\s\S]{0,400}?method\s*:\s*['"](POST|PUT|PATCH|DELETE)['"]/gi;
+  while ((m = fetchRe.exec(src))) addCall(m.index, 'fetch', m[2].toUpperCase(), m[1]);
+  const axiosRe = /axios\.(post|put|patch|delete)\s*\(\s*['"]([^'"]+)['"]/gi;
+  while ((m = axiosRe.exec(src))) addCall(m.index, 'axios', m[1].toUpperCase(), m[2]);
+  const axiosObjRe = /axios\s*\(\s*\{[\s\S]{0,300}?method\s*:\s*['"](POST|PUT|PATCH|DELETE)['"][\s\S]{0,200}?url\s*:\s*['"]([^'"]+)['"]/gi;
+  while ((m = axiosObjRe.exec(src))) addCall(m.index, 'axios', m[1].toUpperCase(), m[2]);
+  const jqPostRe = /(?:jQuery|\$)\.post\s*\(\s*['"]([^'"]+)['"]/gi;
+  while ((m = jqPostRe.exec(src))) addCall(m.index, 'jq', 'POST', m[1]);
+  const jqAjaxRe = /\$\.ajax\s*\(\s*\{[\s\S]{0,400}?(?:type|method)\s*:\s*['"](POST|PUT|PATCH|DELETE)['"][\s\S]{0,200}?url\s*:\s*['"]([^'"]+)['"]/gi;
+  while ((m = jqAjaxRe.exec(src))) addCall(m.index, 'jq', m[1].toUpperCase(), m[2]);
+  const xhrRe = /\.open\s*\(\s*['"](POST|PUT|PATCH|DELETE)['"]\s*,\s*['"]([^'"]+)['"]/gi;
+  while ((m = xhrRe.exec(src))) addCall(m.index, 'xhr', m[1].toUpperCase(), m[2]);
+  const genRe = /(?<!axios)(?<![A-Za-z$])\.(post|put|patch|delete)\s*\(\s*['"]([^'"]+)['"]/gi;
+  while ((m = genRe.exec(src))) {
+    const pre = src.slice(Math.max(0, m.index - 24), m.index);
+    if (/\b(?:router|app|express|server|apiServer)\.\s*$/.test(pre)) continue;
+    addCall(m.index, 'client', m[1].toUpperCase(), m[2]);
+  }
+
+  // ── class 1: at-risk state-changing calls ────────────────────────────────
+  let atRisk = 0, protectedCalls = 0;
+  for (const c of calls) {
+    const window = src.slice(c.idx, c.idx + 240);
+    const inWindowToken = /['"]X-(?:CSRF|XSRF)-TOKEN['"]\s*:\s*[^,\n}]{1,80}/i.test(window) ||
+                          /\b(?:csrf|xsrf)[A-Za-z0-9_]*\s*(?:getAttribute|\.value)\s*\(\s*['"]content['"]\s*\)/i.test(window);
+    const protected_ = inWindowToken || bundleProtected || (c.kind === 'axios' && axiosXsrfConf);
+    c.protected = !!protected_;
+    if (protected_) protectedCalls++;
+    else {
+      atRisk++;
+      const sev = cookieAuth ? 'medium' : 'info';
+      findings.push({
+        id: 'csrf-state-change-no-token',
+        category: 'CSRF',
+        severity: sev,
+        value: `${c.method} ${c.surface}`,
+        context: 'csrf',
+        csrfSurface: c.surface,
+        method: c.method,
+        description: cookieAuth
+          ? `State-changing ${c.method} to ${c.surface} is sent with cookie-based auth but carries no CSRF token (no X-CSRF*/X-XSRF* header in the call) — cross-site request forgery enabled by same-site session cookies.`
+          : `State-changing ${c.method} to ${c.surface} is sent without a visible CSRF token; bearer/unknown auth context, lower confidence.`,
+      });
+    }
+    surfaces.push({ surface: c.surface, method: c.method, protected: !!protected_ });
+  }
+  for (const h of ['X-CSRF-TOKEN','X-XSRF-TOKEN','X-CSRFToken','X-Csrf-Token','csrf-token','_csrf']) {
+    if (new RegExp(h.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i').test(src)) tok.add(h);
+  }
+  if (hasMetaCsrf) tok.add('meta[name="csrf-token"]');
+  if (axiosXsrfConf) tok.add('axios xsrf defaults');
+  if (hasAngularXsrf) tok.add('Angular HttpXsrfInterceptor');
+  if (hasDjangoToken) tok.add('Django csrf_token');
+  if (hasGenericHeader) tok.add('X-CSRF*/X-XSRF* header attach');
+
+  // ── class 2: cookie attribute weaknesses ─────────────────────────────────
+  const cookieWrites = /document\.cookie\s*=\s*['"]([^'"]+)['"]/gi;
+  while ((m = cookieWrites.exec(src))) {
+    const cs = m[1];
+    const name = (cs.match(/^([^=;\s]+)/) || [,''])[1];
+    const authish = /auth|session|sid|token|csrf|xsrf|jwt|connect|sess/i.test(name);
+    if (!/sameSite\s*=/i.test(cs)) {
+      findings.push({
+        id: 'csrf-cookie-samesite-missing',
+        category: 'CSRF',
+        severity: authish ? 'medium' : 'low',
+        value: `cookie '${name}'`,
+        context: 'csrf',
+        csrfSurface: name,
+        description: `Cookie '${name}' is written via document.cookie without a SameSite attribute — CSRF-relevant${authish ? ' (auth-named cookie)' : ''}.`,
+      });
+    } else if (/sameSite\s*=\s*(none|['"]none['"])/i.test(cs) && !/\bSecure\b/i.test(cs)) {
+      findings.push({
+        id: 'csrf-cookie-samesite-none-insecure',
+        category: 'CSRF',
+        severity: 'medium',
+        value: `cookie '${name}'`,
+        context: 'csrf',
+        csrfSurface: name,
+        description: `Cookie '${name}' uses SameSite=None without the Secure flag — it will be sent on cross-site requests and over plain HTTP.`,
+      });
+    }
+  }
+  const jsCookieRe = /Cookies\.set\s*\(\s*['"]([^'"]+)['"][\s\S]{0,200}?\)/gi;
+  while ((m = jsCookieRe.exec(src))) {
+    const name = m[1];
+    const opts = m[0];
+    if (/sameSite\s*[:=]/i.test(opts)) continue;
+    const authish = /auth|session|sid|token|csrf|xsrf|jwt|connect|sess/i.test(name);
+    findings.push({
+      id: 'csrf-cookie-samesite-missing',
+      category: 'CSRF',
+      severity: authish ? 'medium' : 'low',
+      value: `cookie '${name}' (js-cookie)`,
+      context: 'csrf',
+      csrfSurface: name,
+      description: `Cookie '${name}' is written via Cookies.set() without a sameSite option — CSRF-relevant${authish ? ' (auth-named cookie)' : ''}.`,
+    });
+  }
+
+  // ── class 3: JSONP legacy patterns ───────────────────────────────────────
+  const jsonpRe = /src\s*=\s*['"]([^'"]*\?(?:callback|jsonp|cbfn)=[^'"]*)['"]/gi;
+  while ((m = jsonpRe.exec(src))) {
+    const sev = cookieAuth ? 'medium' : 'low';
+    findings.push({
+      id: 'csrf-jsonp',
+      category: 'CSRF',
+      severity: sev,
+      value: m[1],
+      context: 'csrf',
+      csrfSurface: m[1],
+      description: `JSONP-style script load with a callback parameter (${m[1]}) — legacy pattern that bypasses CORS/CSRF same-origin expectations${cookieAuth ? '' : '; low confidence without cookie auth'}.`,
+    });
+  }
+  const jsonpAjaxRe = /\$\.ajax\s*\(\s*\{[\s\S]{0,300}?dataType\s*:\s*['"]jsonp['"]/gi;
+  while ((m = jsonpAjaxRe.exec(src))) {
+    const sev = cookieAuth ? 'medium' : 'low';
+    findings.push({
+      id: 'csrf-jsonp',
+      category: 'CSRF',
+      severity: sev,
+      value: '$ .ajax dataType:jsonp',
+      context: 'csrf',
+      csrfSurface: '$.ajax(jsonp)',
+      description: `jQuery JSONP request (dataType: 'jsonp') — callback-style cross-domain data fetch that bypasses CSRF/CORS semantics${cookieAuth ? '' : '; low confidence without cookie auth'}.`,
+    });
+  }
+
+  // ── class 4: token mishandling ───────────────────────────────────────────
+  const urlTokenRe = /['"][^'"]{0,160}?\?(?:token|csrf|csrf_token|_csrf)=[^'"&]*['"]/gi;
+  while ((m = urlTokenRe.exec(src))) {
+    findings.push({
+      id: 'csrf-token-in-url',
+      category: 'CSRF',
+      severity: 'low',
+      value: m[0],
+      context: 'csrf',
+      csrfSurface: m[0],
+      description: 'CSRF token appears in a URL query string — leaks into logs/referrers and defeats token secrecy.',
+    });
+  }
+  const lsRe = /localStorage\.(getItem|setItem)\s*\(\s*['"]([^'"]{0,40})['"]\s*\)/gi;
+  while ((m = lsRe.exec(src))) {
+    const key = m[2];
+    if (!/(?:csrf|xsrf|_token|token)/i.test(key)) continue;
+    if (/(?:access|refresh|id_token|api[_-]?key|secret)/i.test(key)) continue;
+    if (bundleProtected) continue;
+    findings.push({
+      id: 'csrf-token-localstorage-only',
+      category: 'CSRF',
+      severity: 'low',
+      value: `localStorage key '${key}'`,
+      context: 'csrf',
+      csrfSurface: key,
+      description: `A token-like value is stored in localStorage ('${key}') but no code path attaches it as a CSRF/XSRF header — token may never reach requests or is exposed to any XSS reader.`,
+    });
+  }
+  const cmpRe = /(?:csrf|xsrf)[A-Za-z0-9_]*\s*[!=]==?\s*[^;\n]{0,40}(?:csrf|xsrf|token)[A-Za-z0-9_]*|\b(?:token)[A-Za-z0-9_]*\s*[!=]==?\s*[^;\n]{0,40}(?:csrf|xsrf)[A-Za-z0-9_]*/gi;
+  while ((m = cmpRe.exec(src))) {
+    findings.push({
+      id: 'csrf-client-side-compare',
+      category: 'CSRF',
+      severity: 'low',
+      value: m[0].slice(0, 80),
+      context: 'csrf',
+      csrfSurface: m[0].slice(0, 40),
+      description: 'CSRF token is compared client-side — token validation logic in the browser is attacker-visible and never a substitute for server-side checks.',
+    });
+  }
+
+  return {
+    findings,
+    posture: {
+      cookieAuth,
+      bearerAuth,
+      tokenMechanism: tok.size ? [...tok] : null,
+      stateChangingRequests: calls.length,
+      protectedRequests: protectedCalls,
+      atRiskRequests: atRisk,
+      surfaces,
+    },
+  };
+}
+
 function scanLazyLoading(src) {
   const findings = [];
   const ctx = (i, r=250) => src.slice(Math.max(0,i-r/2), i+r/2).replace(/\n/g,' ');
@@ -5695,7 +5918,7 @@ function generateReports(data, outDir) {
           astFwFindings, bundlerInfo, webpackGraph, callGraph,
           astTaint, modernCrypto, networkSurface, useAst,
           obfuscatorFingerprint, functionSummaries, backwardSlices,
-          variableRenameTable, sourceExpander, originalSrc, sourceMapSources } = data;
+          variableRenameTable, sourceExpander, originalSrc, sourceMapSources, csrf } = data;
 
   const ext = extendedFindings || [];
   const sev_order = { critical:0, high:1, medium:2, low:3, info:4 };
@@ -5713,6 +5936,7 @@ function generateReports(data, outDir) {
     })),
     credentials, security,
     extendedFindings: ext,
+    csrf: csrf || { findings: [], posture: null },
     routes,
     dependencyGraph: graph,
     // OMEGA-5.0 AST-augmented output
@@ -6077,6 +6301,19 @@ function generateReports(data, outDir) {
     `## Routes & Endpoints (${routes.length})`,
     ...routes.slice(0,30).map(r => `- \`[${r.type}${r.guarded?' GUARDED':''}]\` ${r.path}${r.note?' *('+r.note+')*':''}`),
     routes.length > 30 ? `\n_...and ${routes.length-30} more. See routes.txt_` : '',
+    '',
+    `## CSRF Posture (Phase 12n — report-only)`,
+    csrf && csrf.posture ? [
+      `**Auth context:** ${csrf.posture.cookieAuth ? 'cookie' : ''}${csrf.posture.bearerAuth ? ' bearer' : ''}${!csrf.posture.cookieAuth && !csrf.posture.bearerAuth ? ' unknown' : ''}`,
+      `**Token mechanism:** ${csrf.posture.tokenMechanism ? csrf.posture.tokenMechanism.join(', ') : '_none detected_'}`,
+      `**State-changing requests:** ${csrf.posture.stateChangingRequests}  (protected: ${csrf.posture.protectedRequests}, at-risk: ${csrf.posture.atRiskRequests})`,
+      ...(csrf.posture.surfaces.length
+        ? [`**Surfaces:**`, ...csrf.posture.surfaces.map(s => `- \`[${s.method}]\` ${s.surface} — ${s.protected ? 'PROTECTED' : '**AT RISK**'}`)]
+        : ['_No state-changing call surfaces detected_']),
+      ...(csrf.findings.length
+        ? [`**Findings (${csrf.findings.length}):**`, ...csrf.findings.map(f => `- **[${f.severity.toUpperCase()}]** ${f.id} — ${f.value} — ${(f.description || '').slice(0, 110)}`)]
+        : ['_No CSRF findings — requests are protected or none are state-changing._']),
+    ] : ['_CSRF analysis not run_'],
     '',
     `## Decode Statistics`,
     Object.entries(decodeStats).map(([k,v]) => `- ${k}: ${v}`).join('\n'),
@@ -6478,6 +6715,27 @@ ${useAst && astFwFindings ? `
     ${Object.entries(decodeStats).map(([k,v])=>`<tr><td>${k}</td><td>${v}</td></tr>`).join('')}
   </table>
 </section>
+
+${csrf && csrf.posture ? `
+<section>
+  <h2>CSRF Posture (Phase 12n &mdash; report-only)</h2>
+  <p style="color:var(--dim);font-size:11px">Auth context: ${csrf.posture.cookieAuth?'cookie':'—'} ${csrf.posture.bearerAuth?'bearer':''} &nbsp;|&nbsp; Token mechanism: ${(csrf.posture.tokenMechanism||['none detected']).join(', ')}</p>
+  <table>
+    <tr><th>Method</th><th>Surface</th><th>Status</th></tr>
+    ${csrf.posture.surfaces.length ? csrf.posture.surfaces.map(s=>`<tr><td>${s.method}</td><td class="code">${s.surface.replace(/</g,'&lt;')}</td><td>${s.protected?'<span class="badge badge-low">PROTECTED</span>':'<span class="badge badge-critical">AT RISK</span>'}</td></tr>`).join('') : '<tr><td colspan="3" style="color:var(--dim)">No state-changing call surfaces detected</td></tr>'}
+  </table>
+  ${csrf.findings.length ? `
+  <table>
+    <tr><th>Severity</th><th>ID</th><th>Value</th><th>Description</th></tr>
+    ${csrf.findings.map(f=>`
+    <tr>
+      <td><span class="badge badge-${f.severity||'info'}">${f.severity||'info'}</span></td>
+      <td style="color:var(--accent);font-size:11px">${f.id}</td>
+      <td class="code">${(f.value||'').replace(/</g,'&lt;').slice(0,100)}</td>
+      <td style="color:var(--dim);font-size:11px">${(f.description||'').slice(0,120)}</td>
+    </tr>`).join('')}
+  </table>` : '<p style="color:var(--green)">No CSRF findings &mdash; requests are protected or none are state-changing.</p>'}
+</section>` : ''}
 
 ${ext.length ? `
 <section>
@@ -6963,6 +7221,141 @@ function diffFindings(current, previous) {
   return current.filter(f => !prevSet.has(`${f.id || f.category}::${f.value || ''}`));
 }
 
+// ── Phase 2e: esoteric decode (JSFuck / AAEncode / JJEncode) ─────────────
+// Opt-in (--decode-esoteric). Sniffs esoteric shells by charset density +
+// bootstrap motifs, then recovers the encoded payload WITHOUT executing it:
+//   · JSFuck: overwrite the context-global `eval` with a capture shim — the
+//     shell's Function("return eval")() resolves to the shim, which records
+//     the payload string and returns undefined (Function.toString() untouched,
+//     so the shell's key arithmetic stays intact).
+//   · AAEncode/JJEncode: patch Function.prototype.constructor to capture the
+//     `return"…"` body; the string literal is then recovered by evaluating
+//     `(function(){<body>})()` in a fresh, empty realm (pure literal, no side
+//     effects, octal escapes unescaped).
+// Runs inside a worker_threads Worker (terminated afterwards) with an
+// in-process vm fallback. All reachable values live in the sandbox realm, so
+// escapes like `return process` dead-end in ReferenceError → decode fails.
+
+function sniffEsoteric(src) {
+  const input = String(src).replace(/^(?:\/\/[^\n]*\n)+/, '');
+  const nonWs = input.replace(/\s+/g, '');
+  if (nonWs.length < 80) return null;
+  let jsfuckChars = 0;
+  for (let i = 0; i < nonWs.length; i++) {
+    if ('[]()!+'.indexOf(nonWs[i]) !== -1) jsfuckChars++;
+  }
+  if (jsfuckChars / nonWs.length >= 0.6 &&
+      (nonWs.indexOf('[][') !== -1 || nonWs.indexOf('[![]') !== -1 || nonWs.indexOf('[[]') !== -1)) {
+    return 'jsfuck';
+  }
+  if (/[ﾟДεΘωΔ∇]/.test(nonWs) && nonWs.indexOf('(ﾟ') !== -1) return 'aaencode';
+  if (nonWs.indexOf('$=~[]') !== -1) return 'jjencode';
+  if (nonWs.indexOf('~[]') !== -1 && nonWs.indexOf(';') !== -1 && nonWs.indexOf('![]') !== -1) return 'jjencode';
+  return null;
+}
+
+async function decodeEsoteric(src, opts) {
+  opts = opts || {};
+  const timeoutMs = opts.timeoutMs || 3000;
+  const input = String(src).replace(/^(?:\/\/[^\n]*\n)+/, '');
+  const type = opts.skipSniff ? (opts.forceType || 'jsfuck') : sniffEsoteric(input);
+  if (!type) return null;
+  const strategies = type === 'jsfuck' ? ['eval-shim'] : ['patch'];
+
+  // Canonical capture machinery — executed inside a Worker or a vm context.
+  // Every line is indented so extraction-based unit tests can slice it.
+  const M = [
+    'var vm = (typeof __vmModule !== "undefined") ? __vmModule : require("vm");',
+    'function __tryShell(code, strategy, timeoutMs) {',
+    '  var sandbox = Object.create(null);',
+    '  var prelude = [',
+    '    "var __caps = [];",',
+    '    "var __ce = function(c){ if (arguments.length) __caps.push(String(c)); return undefined; };",',
+    '    (strategy === "patch" ? "Function.prototype.constructor = function(s){ var x = String(s); __caps.push(x); return function(){ return s; }; };" : ""),',
+    '    "this.eval = __ce;"',
+    '  ].filter(Boolean).join(";");',
+    '  try {',
+    '    vm.runInNewContext(prelude, sandbox, { timeout: timeoutMs });',
+    '    vm.runInNewContext(code, sandbox, { timeout: timeoutMs });',
+    '  } catch (e) { /* captures persist across shell errors */ }',
+    '  return sandbox.__caps || [];',
+    '}',
+    'function __decode(src, strategy, timeoutMs) {',
+    '  var cap = __tryShell(src, strategy, timeoutMs);',
+    '  if (!cap || !cap.length) return null;',
+    '  if (strategy === "patch") {',
+    '    var picked = null;',
+    '    for (var i = 0; i < cap.length; i++) {',
+    '      var c = cap[i];',
+    '      if (typeof c === "string" && /^return\\s*["\']/.test(c)) picked = c;',
+    '    }',
+    '    if (picked === null) return null;',
+    '    try {',
+    '      var unescaped = vm.runInNewContext("(function(){" + picked + "})()", Object.create(null), { timeout: timeoutMs });',
+    '      return (typeof unescaped === "string" && unescaped.length) ? unescaped : null;',
+    '    } catch (e) {',
+    '      return null;',
+    '    }',
+    '  }',
+    '  return (typeof cap[0] === "string" && cap[0].length) ? cap[0] : null;',
+    '}',
+  ].join('\n');
+  const tail = 'onmessage = function(e){ var r = __decode(e.data.src, e.data.strategy, e.data.timeoutMs); postMessage(r); };';
+
+  async function runInWorker(code, strategy, ms) {
+    let worker = null;
+    try {
+      const { Worker } = require('worker_threads');
+      worker = new Worker(M + '\n' + tail, { eval: true });
+      worker.unref();
+      const result = await new Promise((resolve) => {
+        let done = false;
+        const finish = (v) => { if (!done) { done = true; resolve(v); } };
+        const timer = setTimeout(() => { finish(null); if (worker) worker.terminate().catch(() => {}); }, ms + 500);
+        worker.once('message', (m) => { clearTimeout(timer); finish(m); });
+        worker.once('error', () => { clearTimeout(timer); finish(null); });
+        worker.once('exit', () => { clearTimeout(timer); finish(null); });
+        worker.postMessage({ src: code, strategy, timeoutMs: ms });
+      });
+      return result;
+    } catch (e) {
+      return null;
+    } finally {
+      if (worker) { worker.terminate().catch(() => {}); }
+    }
+  }
+
+  function runInVm(code, strategy, ms) {
+    const vm = require('vm');
+    const sandbox = Object.create(null);
+    sandbox.__esoSrc = code;
+    sandbox.__esoStrategy = strategy;
+    sandbox.__esoTimeout = ms;
+    sandbox.__vmModule = vm;
+    try {
+      const out = vm.runInNewContext(M + '\n' + '__decode(__esoSrc, __esoStrategy, __esoTimeout);', sandbox, { timeout: ms + 500 });
+      return (typeof out === 'string' && out.length) ? out : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  for (let i = 0; i < strategies.length; i++) {
+    const strategy = strategies[i];
+    let result = null;
+    if (!opts.forceVm) {
+      try { result = await runInWorker(input, strategy, timeoutMs); } catch (e) { result = null; }
+    }
+    if (result === null || typeof result !== 'string' || !result.length) {
+      result = runInVm(input, strategy, timeoutMs);
+    }
+    if (result !== null && typeof result === 'string' && result.length && result.length <= 1048576) {
+      return { decoded: result, type, chars: result.length };
+    }
+  }
+  return null;
+}
+
 async function main(externalOpts) {
   const opts = externalOpts || parseArgs();
   const t0   = Date.now();
@@ -7146,6 +7539,31 @@ async function main(externalOpts) {
     console.log(ok(`Phase 2d: ${constExprFindings.length} constant expressions evaluated`));
   }
 
+  // Phase 2e — esoteric decode (JSFuck / AAEncode / JJEncode), opt-in.
+  // Operates on the pristine raw source (earlier phases would damage the
+  // delicate shells) and, on success, replaces the working source so every
+  // downstream phase analyses the recovered payload. The obfuscator
+  // fingerprint (Phase 16b, raw-source fallback) is unaffected.
+  let esotericResult = null;
+  const preEsoSrc = src;
+  if (opts.decodeEsoteric) {
+    if (opts.verbose) console.log(info('  Phase 2e: esoteric decode…'));
+    try {
+      esotericResult = await decodeEsoteric(srcRaw, { timeoutMs: 3000 });
+    } catch (e) {
+      esotericResult = null;
+      if (opts.verbose) console.log(warn(`  Phase 2e: decoder error — ${e.message}`));
+    }
+    if (esotericResult) {
+      src = esotericResult.decoded;
+      if (!opts.quiet) {
+        console.log(ok(`Phase 2e: esoteric decode — ${esotericResult.chars} chars recovered (${esotericResult.type})`));
+      }
+    } else if (!opts.quiet) {
+      console.log(warn('Phase 2e: no esoteric payload recovered'));
+    }
+  }
+
   // Phase 3
   if (opts.verbose) console.log(info('  Phase 3: Boolean normalisation…'));
   src = normaliseBooleans(src);
@@ -7318,6 +7736,12 @@ async function main(externalOpts) {
   // Phase 12m — D4: Lazy-loading security
   if (opts.verbose) console.log(info('  Phase 12m: Lazy-loading route security…'));
   const lazyFindings     = (opts.security || opts.report) ? scanLazyLoading(src) : [];
+
+  // Phase 12n — CSRF analyzer (report-only: findings never feed fail-gates)
+  const csrfResult       = (opts.security || opts.report)
+    ? scanCsrf(src)
+    : { findings: [], posture: null };
+  if (opts.verbose) console.log(info(`  Phase 12n: CSRF — ${csrfResult.findings.length} findings (${csrfResult.posture ? csrfResult.posture.atRiskRequests : 0} at-risk)`));
 
   // Phase 12r — In-source ReDoS vulnerability detection (uses pre-beautify src
   // so that regex literal formatting is preserved — the beautifier inserts
@@ -7854,6 +8278,7 @@ async function main(externalOpts) {
       frameworkSymbols: frameworkSymStats.symbolsAnnotated,
       obfuscatorIo:     obfIoDecoded.length,
       charCodeDecoded:  charCodeFindings.length,
+      esoteric:         esotericResult ? esotericResult.chars : 0,
     };
     generateReports({
       analysis, credentials, security, extendedFindings, routes, frameworks,
@@ -7862,8 +8287,9 @@ async function main(externalOpts) {
       astFwFindings, bundlerInfo, webpackGraph, callGraph,
       astTaint, modernCrypto, networkSurface, useAst,
       obfuscatorFingerprint, functionSummaries, backwardSlices,
-      variableRenameTable, sourceExpander, suppressed,
-      originalSrc: src,
+      variableRenameTable, sourceExpander,       suppressed,
+      originalSrc: preEsoSrc,
+      csrf: csrfResult,
       sourceMapSources: (sourceMapInfo && sourceMapInfo.sources) || [],
       meta: {
         file:    path.basename(inputPath),
@@ -7968,5 +8394,8 @@ module.exports = {
   parseArgs,
   printHelp,
   scanReDoS,
+  sniffEsoteric,
+  decodeEsoteric,
+  scanCsrf,
 };
 
