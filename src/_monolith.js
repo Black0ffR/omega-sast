@@ -7537,11 +7537,13 @@ async function main(externalOpts) {
   }
 
   // Phase 2c.2 — CFF de-flattener (control-flow flattening)
+  let cffLoopCount = 0;
   if (!opts._singleLineHuge) {
     if (opts.verbose) console.log(info('  Phase 2c.2: control-flow flattening de-flattener…'));
     const deflatResult = deflattenControlFlow(src);
     if (deflatResult.findings.length) {
       src = deflatResult.src;
+      cffLoopCount = deflatResult.findings.length;
       if (!opts.quiet) {
         const total = deflatResult.findings.reduce((s, f) => s + f.orderedBlocks, 0);
         console.log(ok(`Phase 2c.2: deflattened ${deflatResult.findings.length} CFF loops (${total} blocks)`));
@@ -7986,6 +7988,11 @@ async function main(externalOpts) {
         };
       }
     }
+    // Sync llmHints with decoder evidence (Residual 4): the fingerprint was
+    // computed on the pre-decode source, so string-array / CFF activity only
+    // proven by the decoder passes must be reflected in the hints.
+    const llmHints = obfuscatorFingerprint.llmHints || (obfuscatorFingerprint.llmHints = {});
+
     if (opts.verbose && obfuscatorFingerprint.primary) {
       console.log(info(`  Obfuscator: ${obfuscatorFingerprint.primary.obfuscator} (${(obfuscatorFingerprint.primary.confidence * 100).toFixed(0)}% confidence) — ${obfuscatorFingerprint.primary.matched.length} signatures`));
     }
@@ -8038,6 +8045,20 @@ async function main(externalOpts) {
     if (opts.verbose && obfuscatorFingerprint && obfuscatorFingerprint.primary) {
       console.log(info(`  Obfuscator: ${obfuscatorFingerprint.primary.obfuscator} (${(obfuscatorFingerprint.primary.confidence * 100).toFixed(0)}% confidence)`));
     }
+  }
+
+  // Sync llmHints with decoder evidence (Residual 4): the fingerprint was
+  // computed on the pre-decode source, so string-array / CFF activity only
+  // proven by the decoder passes must be reflected in the hints. Runs after
+  // the Phase 16b fallback so a raw-source recompute cannot clobber it.
+  if (obfuscatorFingerprint) {
+    const llmHints = obfuscatorFingerprint.llmHints || (obfuscatorFingerprint.llmHints = {});
+    if (obfIoDecoded.length > 0 || obfIoFindings.length > 0) llmHints.expectStringArrayIndirection = true;
+    if (cffLoopCount > 0) llmHints.expectControlFlowFlattening = true;
+    const passes = new Set(Array.isArray(llmHints.recommendedDecoderPasses) ? llmHints.recommendedDecoderPasses : []);
+    if (obfIoDecoded.length > 0) passes.add('string-array-rotation');
+    if (cffLoopCount > 0) passes.add('control-flow-flattening');
+    llmHints.recommendedDecoderPasses = [...passes];
   }
 
   // ── Dedup taint findings between regex Phase 12j and AST Phase 14c ────
