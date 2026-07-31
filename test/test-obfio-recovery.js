@@ -127,6 +127,64 @@ section('3. Clean sample: hints stay false (no unconditional flag-setting)');
     `hint=${fp && fp.llmHints && fp.llmHints.expectStringArrayIndirection}`);
 }
 
+// ═════════════════════════════════════════════════════════════════════════
+section('4. obfuscator.io sample: decoder evidence boosts confidence');
+{
+  const r = scanSample('06_obfuscator_io_style.js');
+  assert('06 sample: report produced', !!r && !r._parseError, r && r._parseError);
+  const primary = r && r.obfuscatorFingerprint && r.obfuscatorFingerprint.primary;
+  assert('06 sample: primary is obfuscator.io', primary && primary.obfuscator === 'obfuscator.io');
+  assert('06 sample: confidence >= 0.5 when 10+ strings inlined',
+    primary && typeof primary.confidence === 'number' && primary.confidence >= 0.5,
+    `confidence=${primary && primary.confidence}`);
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+section('5. post-decode second security pass contract');
+{
+  const r = scanSample('06_obfuscator_io_style.js');
+  assert('06 sample: report produced', !!r && !r._parseError, r && r._parseError);
+  const sp = r && r.decodeStats && r.decodeStats.secondPass;
+  assert('06 sample: decodeStats.secondPass.ran === true (hook ran)',
+    sp && sp.ran === true, `secondPass=${JSON.stringify(sp)}`);
+  assert('06 sample: decodeStats.secondPass.merged is a number',
+    sp && typeof sp.merged === 'number', `merged=${sp && sp.merged}`);
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+section('6. decoder-driven XSS surfaces (string-array hides innerHTML sink)');
+{
+  // Minimal self-reassigning decoder shape (mirrors 06 sample). The sink
+  // document.body[...]=location.hash only becomes XSS once D() is inlined
+  // by Phase 2c — regression-guards the decoder→security-finding path.
+  // NOTE (honest limitation): opaque-gated array mutations (`_0xarr[1]=_0xop?
+  // 'innerHTML':'textContent'`) are NOT propagated by the decoder — the
+  // inlined call resolves to the pre-mutation value. The deterministic hook
+  // contract is decodeStats.secondPass (section 5); this fixture asserts the
+  // surface path the hook exists to re-verify.
+  const src = [
+    "var _0x9947=['a','innerHTML','c'];",
+    'function _0x33e4(_0x1809b5,_0x37ef6e){',
+    'return _0x33e4=function(_0x338a69,_0x39ad79){',
+    '_0x338a69=_0x338a69-(0x1939+-0xf*0x1f3+0x1*0x469);',
+    'var _0x2b223=_0x9947[_0x338a69];',
+    'return _0x2b223;',
+    '}(_0x1809b5,_0x37ef6e);',
+    '}',
+    "document.body[_0x33e4(0x66)]=location.hash;",
+  ].join('\n');
+  const r = scanTmpFixture(src);
+  assert('fixture: report produced', !!r && !r._parseError, r && r._parseError);
+  const all = [
+    ...(r && r.security ? r.security : []),
+    ...(r && r.extendedFindings ? r.extendedFindings : []),
+  ];
+  const xss = all.filter(f => /xss|innerhtml/i.test(f.id || ''));
+  assert('fixture: XSS finding surfaces (innerHTML sink via string array)',
+    xss.length > 0,
+    `findings=${all.map(f => f.id).join(',')}`);
+}
+
 // ── Summary ───────────────────────────────────────────────────────────────
 console.log(`\n  TOTAL: ${total}   PASSED: ${passed}   FAILED: ${failed}`);
 if (failed > 0) {

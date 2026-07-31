@@ -8059,6 +8059,22 @@ async function main(externalOpts) {
     if (obfIoDecoded.length > 0) passes.add('string-array-rotation');
     if (cffLoopCount > 0) passes.add('control-flow-flattening');
     llmHints.recommendedDecoderPasses = [...passes];
+
+    // Residual 2 (Part A): successful inlining of 10+ strings corroborates
+    // the obfuscator.io fingerprint — raise confidence off the static-only
+    // ~0.35 floor. Runs after Phase 16b so a raw-source recompute cannot
+    // clobber the boost either.
+    if (obfuscatorFingerprint.primary &&
+        obfuscatorFingerprint.primary.obfuscator === 'obfuscator.io' &&
+        obfIoDecoded.length >= 10) {
+      obfuscatorFingerprint.primary.confidence = Math.max(obfuscatorFingerprint.primary.confidence, 0.6);
+      const matched = obfuscatorFingerprint.primary.matched || (obfuscatorFingerprint.primary.matched = []);
+      matched.push({
+        signature: 'decoder-inlining-corroboration', pos: 0,
+        evidence: `Phase 2c inlined ${obfIoDecoded.length} strings (rotation + RC4)`,
+        hint: 'decoder corroboration raises confidence',
+      });
+    }
   }
 
   // ── Dedup taint findings between regex Phase 12j and AST Phase 14c ────
@@ -8142,6 +8158,37 @@ async function main(externalOpts) {
   // pre-beautify src so library boilerplate signatures are not disturbed
   // by the token-based beautifier).
   tagLibraryFindings([...credentials, ...security, ...extendedFindings], srcPreBeautify);
+
+  // Phase 12s — Post-decode second security pass (Residual 2)
+  // The pre-decode passes run before opaque-elimination (Phase 12f) and the
+  // final inlining round, so sinks that only materialize on the fully decoded
+  // buffer (e.g. string-array mutations, CFF-deflattened calls) are missed.
+  // Re-run decode → eliminate → scan on the decoded source and merge only
+  // non-duplicate findings (same id + value + near position = dup).
+  let secondPassStats = null;
+  if ((obfIoDecoded.length > 0 || cffLoopCount > 0) && (opts.security || opts.report)) {
+    const t0 = Date.now();
+    const p2 = decodeObfuscatorIo(src);
+    const p2Elim = eliminateOpaquePredicates(p2.src);
+    const p2Taint = scanTaintFlow(p2Elim.src);
+    const p2Sec = analyseSecurity(p2Elim.src, opts.maxHops);
+    const pool = [...security, ...credentials, ...extendedFindings, ...taintAll];
+    const seen = new Set(pool.map(f => `${f.id}|${f.value}`));
+    let merged = 0;
+    for (const f of [...p2Taint, ...p2Sec]) {
+      const key = `${f.id}|${f.value}`;
+      const dup = pool.some(e =>
+        (e.id === f.id && e.value === f.value) ||
+        (e.id === f.id && typeof e.pos === 'number' && typeof f.pos === 'number' &&
+          Math.abs(e.pos - f.pos) <= 30));
+      if (seen.has(key) || dup) continue;
+      seen.add(key);
+      extendedFindings.push(f);
+      merged++;
+    }
+    secondPassStats = { ran: true, decodedStrings: p2.decodedStrings.length, merged };
+    if (opts.verbose) console.log(info(`  Phase 12s: second pass — ${p2.decodedStrings.length} strings, ${merged} new findings (${Date.now() - t0}ms)`));
+  }
 
   // ── Apply severity-floor filter ────────────────────────────────────────
   // Filters out findings below the user-specified threshold before they reach
@@ -8318,6 +8365,7 @@ async function main(externalOpts) {
       obfuscatorIo:     obfIoDecoded.length,
       charCodeDecoded:  charCodeFindings.length,
       esoteric:         esotericResult ? esotericResult.chars : 0,
+      secondPass:       secondPassStats || { ran: false },
     };
     generateReports({
       analysis, credentials, security, extendedFindings, routes, frameworks,
