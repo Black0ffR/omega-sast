@@ -4967,7 +4967,11 @@ function scanTaintFlow(src) {
     { re:/\.(?:rmdir|rmdirSync)\s*\(/g, name:'rmdir', sev:'medium', cwe:'CWE-22' },
     { re:/\.(?:rm|rmSync)\s*\(/g, name:'rm', sev:'high', cwe:'CWE-22' },
     { re:/\.(?:copyFile|copyFileSync)\s*\(/g, name:'copyFile', sev:'high', cwe:'CWE-22' },
-    { re:/\.(?:open|openSync)\s*\(/g, name:'open', sev:'medium', cwe:'CWE-22' },
+    // fs.open/fs.openSync are Node filesystem APIs — require an fs context
+    // (same idea as the exec/child_process gate) and exclude XHR-shaped calls.
+    { re:/\.openSync\s*\(/g, name:'fs.openSync', sev:'high', cwe:'CWE-22', fsOnly:true },
+    { re:/\.open\s*\(/g, name:'fs.open', sev:'medium', cwe:'CWE-22', fsOnly:true, xhrExclude:true },
+    { re:/window\.open\s*\(/g, name:'window.open', sev:'medium', cwe:'CWE-79' },
   ];
 
   // Identify tainted variable names heuristically
@@ -4985,6 +4989,8 @@ function scanTaintFlow(src) {
 
   // Check if tainted variables reach sinks
   const hasChildProcess = /require\s*\(\s*["']child_process["']\s*\)/.test(src);
+  const hasFs = /require\s*\(\s*["']fs(?:["'/])/.test(src) || /\bfrom\s*["']fs(?:["'/])/.test(src);
+  const HTTP_VERB = /^['"](?:get|post|put|delete|head|options|patch|connect|trace)['"]$/i;
   for (const sink of SINKS) {
     const re = new RegExp(sink.re.source, 'g');
     let m;
@@ -4992,8 +4998,18 @@ function scanTaintFlow(src) {
       // Node-only sinks (exec/spawn/fork) require child_process import — prevents
       // FPs on browser libraries with identically named methods or identifiers.
       if (sink.nodeOnly && !hasChildProcess) continue;
+      if (sink.fsOnly && !hasFs) continue;
       // Look at value assigned to sink (next 120 chars)
       const after = src.slice(m.index, m.index + 120);
+      // fs.open only: exclude XHR-shaped calls — XMLHttpRequest#open(method, url, async)
+      if (sink.xhrExclude) {
+        const args = after.slice(after.indexOf('(') + 1).match(/^([^)]*)/);
+        if (args) {
+          const parts = args[1].split(',').map(s => s.trim());
+          if (parts.length >= 2 && parts.length <= 3 &&
+              (HTTP_VERB.test(parts[0]) || /method/i.test(parts[0]))) continue;
+        }
+      }
       // Check if any tainted variable appears in sink context
       let taintSource = null;
       for (const v of taintedVars) {
