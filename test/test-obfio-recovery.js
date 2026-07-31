@@ -170,11 +170,11 @@ section('6. decoder-driven XSS surfaces (string-array hides innerHTML sink)');
   // Minimal self-reassigning decoder shape (mirrors 06 sample). The sink
   // document.body[...]=location.hash only becomes XSS once D() is inlined
   // by Phase 2c — regression-guards the decoder→security-finding path.
-  // NOTE (honest limitation): opaque-gated array mutations (`_0xarr[1]=_0xop?
-  // 'innerHTML':'textContent'`) are NOT propagated by the decoder — the
-  // inlined call resolves to the pre-mutation value. The deterministic hook
-  // contract is decodeStats.secondPass (section 5); this fixture asserts the
-  // surface path the hook exists to re-verify.
+  // NOTE: opaque-gated constant mutations (`_0xarr[1]=_0xop?'innerHTML':
+  // 'textContent'`) are now folded by Step 4m (may-set semantics) — see
+  // section 8. The deterministic hook contract is decodeStats.secondPass
+  // (section 5); this fixture asserts the surface path the hook exists to
+  // re-verify.
   const src = [
     "var _0x9947=['a','innerHTML','c'];",
     'function _0x33e4(_0x1809b5,_0x37ef6e){',
@@ -229,6 +229,67 @@ section('7. chained string arrays resolve via fixpoint (analysis FINAL §6.1)');
   const xss = all.filter(f => /xss|innerhtml/i.test(f.id || ''));
   assert('chained fixture: XSS surfaces via chained string-array sink',
     xss.length > 0,
+    `findings=${all.map(f => f.id).join(',')}`);
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+section('8. constant array mutations applied (analysis FINAL §6.1, closes known-work 2b)');
+{
+  // Opaque-gated mutation shape (Task 4 §6 documented limitation): the slot
+  // is rewritten under an opaque predicate, so a naive decoder resolves the
+  // pre-mutation value. The mutation scanner treats `L ? 'a' : 'b'` as a
+  // may-set {a, b} (predicate never evaluated) and the inliner emits the
+  // first candidate — 'innerHTML' here — which surfaces the XSS.
+  const opaqueSrc = [
+    "var _0x9947=['a','b','c'];",
+    'var _0xop = !![];',
+    "_0x9947[1]=_0xop?'innerHTML':'textContent';",
+    'function _0x33e4(_0x1809b5,_0x37ef6e){',
+    'return _0x33e4=function(_0x338a69,_0x39ad79){',
+    '_0x338a69=_0x338a69-(0x1939+-0xf*0x1f3+0x1*0x469);',
+    'var _0x2b223=_0x9947[_0x338a69];',
+    'return _0x2b223;',
+    '}(_0x1809b5,_0x37ef6e);',
+    '}',
+    "document.body[_0x33e4(0x66)]=location.hash;",
+  ].join('\n');
+  const r1 = scanTmpFixture(opaqueSrc);
+  assert('mutation fixture: report produced', !!r1 && !r1._parseError, r1 && r1._parseError);
+  assert('mutation fixture: decoder decoded strings',
+    r1 && r1.decodeStats && r1.decodeStats.obfuscatorIo >= 1,
+    `obfuscatorIo=${r1 && r1.decodeStats && r1.decodeStats.obfuscatorIo}`);
+  let all = [
+    ...(r1 && r1.security ? r1.security : []),
+    ...(r1 && r1.extendedFindings ? r1.extendedFindings : []),
+  ];
+  assert('mutation fixture: XSS surfaces (opaque-gated ternary resolved as may-set)',
+    all.some(f => /xss|innerhtml/i.test(f.id || '')),
+    `findings=${all.map(f => f.id).join(',')}`);
+  assert('mutation fixture: may-set documented in an obfuscator-io-mutation finding',
+    all.some(f => f.id === 'obfuscator-io-mutation'),
+    `findings=${all.map(f => f.id).join(',')}`);
+
+  // Single-literal mutation: unconditional overwrite.
+  const literalSrc = [
+    "var _0x9947=['a','b','c'];",
+    "_0x9947[1]='innerHTML';",
+    'function _0x33e4(_0x1809b5,_0x37ef6e){',
+    'return _0x33e4=function(_0x338a69,_0x39ad79){',
+    '_0x338a69=_0x338a69-(0x1939+-0xf*0x1f3+0x1*0x469);',
+    'var _0x2b223=_0x9947[_0x338a69];',
+    'return _0x2b223;',
+    '}(_0x1809b5,_0x37ef6e);',
+    '}',
+    "document.body[_0x33e4(0x66)]=location.hash;",
+  ].join('\n');
+  const r2 = scanTmpFixture(literalSrc);
+  assert('literal-mutation fixture: report produced', !!r2 && !r2._parseError, r2 && r2._parseError);
+  all = [
+    ...(r2 && r2.security ? r2.security : []),
+    ...(r2 && r2.extendedFindings ? r2.extendedFindings : []),
+  ];
+  assert('literal-mutation fixture: XSS surfaces (constant assignment applied)',
+    all.some(f => /xss|innerhtml/i.test(f.id || '')),
     `findings=${all.map(f => f.id).join(',')}`);
 }
 

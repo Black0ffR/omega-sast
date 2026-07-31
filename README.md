@@ -1,6 +1,6 @@
 # OMEGA-5.0 — Zero-Dependency JavaScript SAST Engine
 
-[![Test Suite](https://img.shields.io/badge/tests-696%20passing-brightgreen)](test/)
+[![Test Suite](https://img.shields.io/badge/tests-702%20passing-brightgreen)](test/)
 [![Zero Deps](https://img.shields.io/badge/dependencies-0-success)](package.json)
 [![Ongoing Fixes](https://img.shields.io/badge/fixes-P0--P3%20complete-blue)](OMEGA-SAST-FIX-PLAN-R3.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -68,6 +68,9 @@ Detects and linearizes control-flow flattening (`while(1) { switch(dispatcher) {
 
 ### Chained String-Array Fixpoint (Phase 2c)
 Multi-layer obfuscator.io string arrays — `var _0xb = ['x', _0xa[2], 'y']` — are resolved via a bounded fixpoint loop (max 4 rounds): each round extracts string arrays, decodes constant-index calls, then folds `KNOWNARR[CONST]` references inside array literals so the referencing array becomes extractable in the next round. Per-name idempotency prevents double-rotation on re-extraction; single-layer runs complete in one round with no behavior change.
+
+### Constant Array Mutation Resolution (Phase 2c.3)
+Obfuscator.io custom protectors rewrite string-array slots at runtime — `_0xarr[1] = _0xop ? 'innerHTML' : 'textContent'` — hiding sink property names behind opaque predicates. Step 4m folds constant-index mutations into the decoded array before call inlining: literal/numeric right-hand sides are applied unconditionally; decoder calls resolve through a cross-array decoder registry; ternary/`||` of literals become a **may-set** candidate list (the predicate is never evaluated) — the first candidate is inlined downstream while the full set is recorded in an `obfuscator-io-mutation` finding.
 
 ### Post-Decode Second Security Pass (Phase 12s)
 When Phase 2c (string-array) or 2c.2 (CFF de-flattener) actually decoded code, OMEGA re-runs the decode → opaque-elimination → taint/security scans on the fully decoded buffer and merges only findings that did not already surface (dedup by id + value + position). Catches sinks that materialize only after full inlining — e.g. `document.body[...] = location.hash` where the property name is hidden in a string array. `decodeStats.secondPass` reports `{ ran, decodedStrings, merged }`.
@@ -230,7 +233,7 @@ omega-sast/
 │   ├── test-csrf.js               # CSRF analyzer tests (41)
 │   ├── test-sourcemap.js          # Source map parser tests (40)
 │   ├── test-open-disambiguation.js # fs.open vs XHR vs window.open (9)
-│   ├── test-obfio-recovery.js     # Decoder evidence: hints, boost sync, fixpoint, second pass (26)
+│   ├── test-obfio-recovery.js     # Decoder evidence: hints, boost sync, fixpoint, mutations, second pass (32)
 │   └── fixtures/
 │       └── sample-bundle.js  # Test fixture
 ├── bundles/                    # 21 real-world library bundles (regression corpus)
@@ -248,7 +251,7 @@ omega-sast/
 ## Test Suite
 
 ```bash
-# Run all 696 tests (100% pass rate)
+# Run all 702 tests (100% pass rate)
 npm test
 
 # Run individual suites

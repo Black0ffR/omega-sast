@@ -1815,6 +1815,9 @@ function decodeCharCodeObfuscation(src) {
 function decodeObfuscatorIo(src) {
   const findings = [];
   const decodedStrings = [];
+  // Decoder registry (name → decoder info), accumulated across arrays and
+  // fixpoint rounds so mutation RHS decoder calls can resolve cross-array.
+  const decoderMap = new Map();
 
   // Brace-matching helper: walks from startPos, tracking {/} with string/regex awareness.
   // Returns position of matching } or src.length-1 if unbalanced.
@@ -2082,6 +2085,9 @@ function decodeObfuscatorIo(src) {
         const isPlain = !isRC4 && !isBase64;  // just array indexing, no transform
   
         if (!isRC4 && !isBase64 && !isPlain) continue;
+
+      // Register this decoder so later arrays' mutation RHS calls can use it.
+      decoderMap.set(decName, { sa, isRC4, isBase64, isPlain, baseOffset });
   
         // ── Step 3e: correct rotation by evaluating the IIFE ──────────────
         // The rotation IIFE's while loop uses a computation that depends on
@@ -2347,6 +2353,84 @@ function decodeObfuscatorIo(src) {
           if (nextCh === '[' || nextCh === '.') continue;
           aliases.add(am[1]);
         }
+        for (const alias of aliases) {
+          decoderMap.set(alias, { sa, isRC4, isBase64, isPlain, baseOffset });
+        }
+
+        // ── Step 4m: fold constant array mutations ────────────────────────
+        // Custom protectors rewrite slots at runtime:
+        //   ARR[i] = 'literal';               → unconditional
+        //   ARR[i] = PRED ? 'a' : 'b';       → may-set {a, b}; the predicate
+        //                                      is opaque and never evaluated
+        //   ARR[i] = DEC(CONST[, 'key']);    → decoded via a known decoder
+        // Applied BEFORE Step 4 so inlined calls resolve post-mutation
+        // values (previously the §6 documented limitation). May-sets emit
+        // their first candidate downstream; the full set is recorded in the
+        // mutation finding.
+        {
+          const mutRe = new RegExp(
+            `\\b${sa.name}\\s*\\[\\s*(-?0x[0-9a-fA-F]+|-?\\d+)\\s*\\]\\s*=\\s*([^;]+?)\\s*;`,
+            'g'
+          );
+          const applied = [];
+          let mm;
+          const unesc = (s) => s.replace(/\\'/g, "'").replace(/\\"/g, '"').replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+          while ((mm = mutRe.exec(src)) !== null) {
+            const idx = parseInt(mm[1], /^-?0x/i.test(mm[1]) ? 16 : 10);
+            if (idx < 0 || idx >= sa.strings.length) continue;
+            const rhs = mm[2].trim();
+            // (a) single string literal
+            let m = rhs.match(/^(["'])((?:\\.|(?!\1).)*)\1$/);
+            if (m) {
+              sa.strings[idx] = unesc(m[2]);
+              applied.push({ idx, value: sa.strings[idx] });
+              continue;
+            }
+            // (b) numeric literal
+            if ((m = rhs.match(/^(-?0x[0-9a-fA-F]+|-?\d+)$/))) {
+              sa.strings[idx] = String(parseInt(m[1], /^0x|-0x/i.test(m[1]) ? 16 : 10));
+              applied.push({ idx, value: sa.strings[idx] });
+              continue;
+            }
+            // (c) ternary of string literals: may-set {L1, L2}
+            if ((m = rhs.match(/^(?:[^?|]*?)\?\s*(["'])((?:\\.|(?!\1).)*)\1\s*:\s*(["'])((?:\\.|(?!\3).)*)\3$/))) {
+              sa.strings[idx] = [unesc(m[2]), unesc(m[4])];
+              applied.push({ idx, candidates: [unesc(m[2]), unesc(m[4])] });
+              continue;
+            }
+            // (d) X || 'lit': union may-set (cap 2 variants)
+            if ((m = rhs.match(/^(?:[^?|]*?)\|\|\s*(["'])((?:\\.|(?!\1).)*)\1$/))) {
+              const cur = Array.isArray(sa.strings[idx]) ? sa.strings[idx] : [sa.strings[idx]];
+              sa.strings[idx] = [...cur, unesc(m[2])].slice(0, 2);
+              applied.push({ idx, candidates: [...cur, unesc(m[2])].slice(0, 2) });
+              continue;
+            }
+            // (e) decoder call with constant args (decoder must be known)
+            if ((m = rhs.match(/^([A-Za-z_$][\w$]*)\s*\(\s*(-?0x[0-9a-fA-F]+|-?\d+)(?:\s*,\s*["']([^"']*)["'])?\s*\)$/))) {
+              const target = decoderMap.get(m[1]);
+              if (!target) continue;  // decoder not yet discovered — a later round's Step 4 inlines it
+              const aIdx = parseInt(m[2], /^0x|-0x/i.test(m[2]) ? 16 : 10) - target.baseOffset;
+              if (aIdx < 0 || aIdx >= target.sa.strings.length) continue;
+              let v = target.sa.strings[aIdx];
+              if (Array.isArray(v)) v = v[0];
+              if (target.isBase64) v = Buffer.from(v, 'base64').toString('utf8');
+              else if (target.isRC4) v = rc4Decrypt(v, m[3] || '');
+              if (typeof v !== 'string' || !/^[\x20-\x7e\s]*$/.test(v)) continue;
+              sa.strings[idx] = v;
+              applied.push({ idx, value: v });
+            }
+          }
+          if (applied.length > 0) {
+            findings.push({
+              id: 'obfuscator-io-mutation',
+              category: 'Obfuscator.io Decoder',
+              severity: 'info',
+              value: `applied ${applied.length} constant mutation(s) on ${sa.name}`,
+              context: applied.map(a => a.candidates ? `${a.idx} ∈ {${a.candidates.join(' | ')}}` : `${a.idx} → ${a.value}`).join(', '),
+              description: 'Constant-index array mutations folded into the decoded array (may-set semantics for opaque predicates)',
+            });
+          }
+        }
   
         // ── Step 4: find all calls to this decoder with constant args ──────
         // Supports direct calls, .call(), .apply(), and indirect (0, fn)() patterns
@@ -2395,10 +2479,12 @@ function decodeObfuscatorIo(src) {
             const idx = parseInt(idxStr, /^-?0x/i.test(idxStr) ? 16 : 10);
             const adjustedIdx = idx - baseOffset;
             if (adjustedIdx < 0 || adjustedIdx >= sa.strings.length) return full;
-  
+
             let decoded;
+            let rawSet = null;  // may-set from Step 4m (opaque predicate)
             try {
-              const raw = sa.strings[adjustedIdx];
+              let raw = sa.strings[adjustedIdx];
+              if (Array.isArray(raw)) { rawSet = raw; raw = raw[0]; }
               if (isPlain) {
                 decoded = raw;
               } else if (isBase64) {
@@ -2409,20 +2495,21 @@ function decodeObfuscatorIo(src) {
             } catch (_) {
               return full;
             }
-  
+
             if (typeof decoded !== 'string') return full;
             if (!/^[\x20-\x7e\s]*$/.test(decoded)) return full;
-  
+
             const escaped = decoded.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n').replace(/\r/g, '\\r');
             replacedCount++;
-  
+
             decodedStrings.push({
               call: full,
               decoded,
               idx: adjustedIdx,
               key: isRC4 ? key : null,
+              candidates: rawSet,
             });
-  
+
             return `'${escaped}'`;
           });
         }
@@ -2456,8 +2543,10 @@ function decodeObfuscatorIo(src) {
           const adjustedIdx = idx - baseOffset;
           if (adjustedIdx < 0 || adjustedIdx >= sa.strings.length) return full;
           let decoded;
+          let rawSet = null;  // may-set from Step 4m (opaque predicate)
           try {
-            const raw = sa.strings[adjustedIdx];
+            let raw = sa.strings[adjustedIdx];
+            if (Array.isArray(raw)) { rawSet = raw; raw = raw[0]; }
             if (isPlain) decoded = raw;
             else if (isBase64) decoded = Buffer.from(raw, 'base64').toString('utf8');
             else if (isRC4) decoded = rc4Decrypt(raw, key);
@@ -2466,7 +2555,7 @@ function decodeObfuscatorIo(src) {
           if (!/^[\x20-\x7e\s]*$/.test(decoded)) return full;
           const escaped = decoded.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n').replace(/\r/g, '\\r');
           replacedCount++;
-          decodedStrings.push({ call: full, decoded, idx: adjustedIdx, key: isRC4 ? key : null });
+          decodedStrings.push({ call: full, decoded, idx: adjustedIdx, key: isRC4 ? key : null, candidates: rawSet });
           return `'${escaped}'`;
         };
         const allNames = [decName, ...aliases];
@@ -2535,7 +2624,8 @@ function decodeObfuscatorIo(src) {
       src = src.replace(refRe, (full, idxStr) => {
         const idx = parseInt(idxStr, /^-?0x/i.test(idxStr) ? 16 : 10);
         if (idx < 0 || idx >= sa.strings.length) return full;
-        const v = sa.strings[idx];
+        let v = sa.strings[idx];
+        if (Array.isArray(v)) v = v[0];  // may-set from Step 4m → first candidate
         if (typeof v !== 'string' || !/^[\x20-\x7e\s]*$/.test(v)) return full;
         const escaped = v.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n').replace(/\r/g, '\\r');
         return `'${escaped}'`;
