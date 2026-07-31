@@ -137,6 +137,19 @@ section('4. obfuscator.io sample: decoder evidence boosts confidence');
   assert('06 sample: confidence >= 0.5 when 10+ strings inlined',
     primary && typeof primary.confidence === 'number' && primary.confidence >= 0.5,
     `confidence=${primary && primary.confidence}`);
+  // Item A (analysis FINAL §6.2): the fingerprint finding text/severity are
+  // built from the static signature confidence — a post-hoc decoder boost
+  // must be mirrored into the finding, or the report shows "35%" while
+  // primary.confidence is 0.6.
+  const fpFinding = (r && r.extendedFindings || []).find(f => f.id === 'obfuscator-obfuscator-io');
+  assert('06 sample: fingerprint finding present in extendedFindings', !!fpFinding,
+    `extendedFindings=${(r && r.extendedFindings || []).map(f => f.id).join(',')}`);
+  assert('06 sample: fingerprint finding value reflects boosted confidence (contains "60%")',
+    fpFinding && typeof fpFinding.value === 'string' && fpFinding.value.includes('60%'),
+    `value=${fpFinding && fpFinding.value}`);
+  assert('06 sample: fingerprint finding severity is medium (0.6 → medium threshold)',
+    fpFinding && fpFinding.severity === 'medium',
+    `severity=${fpFinding && fpFinding.severity}`);
 }
 
 // ═════════════════════════════════════════════════════════════════════════

@@ -8074,6 +8074,19 @@ async function main(externalOpts) {
         evidence: `Phase 2c inlined ${obfIoDecoded.length} strings (rotation + RC4)`,
         hint: 'decoder corroboration raises confidence',
       });
+
+      // Analysis FINAL §6.2: the fingerprint finding's value/severity were
+      // built from the static signature confidence (0.35 → "35%", low) in
+      // fingerprintObfuscator. Mirror the boost into the finding so the
+      // report text matches primary.confidence. Runs post-16b so neither a
+      // raw-source recompute nor the AST-phase findings can clobber it.
+      for (const f of (obfuscatorFingerprint.findings || [])) {
+        if (f.id === 'obfuscator-obfuscator-io') {
+          const conf = obfuscatorFingerprint.primary.confidence;
+          f.severity = conf >= 0.7 ? 'high' : conf >= 0.4 ? 'medium' : 'low';
+          f.value = `${obfuscatorFingerprint.primary.obfuscator} (confidence: ${(conf * 100).toFixed(0)}%)${obfuscatorFingerprint.primary.version ? ' v' + obfuscatorFingerprint.primary.version : ''}`;
+        }
+      }
     }
   }
 

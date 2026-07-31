@@ -1,6 +1,6 @@
 # OMEGA-5.0 — Zero-Dependency JavaScript SAST Engine
 
-[![Test Suite](https://img.shields.io/badge/tests-690%20passing-brightgreen)](test/)
+[![Test Suite](https://img.shields.io/badge/tests-693%20passing-brightgreen)](test/)
 [![Zero Deps](https://img.shields.io/badge/dependencies-0-success)](package.json)
 [![Ongoing Fixes](https://img.shields.io/badge/fixes-P0--P3%20complete-blue)](OMEGA-SAST-FIX-PLAN-R3.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -70,7 +70,7 @@ Detects and linearizes control-flow flattening (`while(1) { switch(dispatcher) {
 When Phase 2c (string-array) or 2c.2 (CFF de-flattener) actually decoded code, OMEGA re-runs the decode → opaque-elimination → taint/security scans on the fully decoded buffer and merges only findings that did not already surface (dedup by id + value + position). Catches sinks that materialize only after full inlining — e.g. `document.body[...] = location.hash` where the property name is hidden in a string array. `decodeStats.secondPass` reports `{ ran, decodedStrings, merged }`.
 
 ### Obfuscator Fingerprinting + Confidence Corroboration
-Fingerprints obfuscator.io, JSFuck, AAEncode, JJEncode, and packers from structural signatures. When Phase 2c inlines 10+ strings from an obfuscator.io string array, the fingerprint confidence is raised (≥ 0.6) with a `decoder-inlining-corroboration` signature, and `llmHints` are synced with decoder evidence (`expectStringArrayIndirection`, `expectControlFlowFlattening`, `recommendedDecoderPasses`).
+Fingerprints obfuscator.io, JSFuck, AAEncode, JJEncode, and packers from structural signatures. When Phase 2c inlines 10+ strings from an obfuscator.io string array, the fingerprint confidence is raised (≥ 0.6) with a `decoder-inlining-corroboration` signature, `llmHints` are synced with decoder evidence (`expectStringArrayIndirection`, `expectControlFlowFlattening`, `recommendedDecoderPasses`), and the fingerprint finding's text/severity are re-synced to the boosted confidence (no more "35%" text next to a 0.6 confidence).
 
 ### Opaque Predicate Eliminator (Phase 3b)
 Removes dead code branches after constant folding:
@@ -227,7 +227,7 @@ omega-sast/
 │   ├── test-csrf.js               # CSRF analyzer tests (41)
 │   ├── test-sourcemap.js          # Source map parser tests (40)
 │   ├── test-open-disambiguation.js # fs.open vs XHR vs window.open (9)
-│   ├── test-obfio-recovery.js     # Decoder evidence: hints + second pass (20)
+│   ├── test-obfio-recovery.js     # Decoder evidence: hints, boost sync, second pass (23)
 │   └── fixtures/
 │       └── sample-bundle.js  # Test fixture
 ├── bundles/                    # 21 real-world library bundles (regression corpus)
@@ -245,7 +245,7 @@ omega-sast/
 ## Test Suite
 
 ```bash
-# Run all 690 tests (100% pass rate)
+# Run all 693 tests (100% pass rate)
 npm test
 
 # Run individual suites
