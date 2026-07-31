@@ -468,6 +468,72 @@ var b=_0xdec(0x1,'x');
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+section('13. obfuscator.io checksum rotation — compound key + comma chain + self-reassigning decoder');
+{
+  // Real-world obfuscator.io shape (from 06_obfuscator_io_style.js):
+  //   · rotation key is a compound arithmetic expression
+  //   · rotation IIFE is the first member of a comma chain
+  //   · checksum loop uses decoder calls (parseInt + ===), so key%len is wrong
+  //   · decoder self-reassigns; base offset is a parenthesized compound expr
+  //   · call sites are ONE-ARG via a local alias
+  const src = [
+    `var _0x9947 = ['map','log','foo\\x20','bvmqO','133039ViRMWR','xPfLC','ytpdx','1243717qSZCyh','2|7|4|6|9|','1ErtbCr','1608314VKvthn','1ZRaFKN','XBoAA','423266kQOYHV','3|0|5|8|1','235064xPNdKe','13RUDZfG','157gNPQGm','1639212MvnHZL','rDjOa','iBHph','9926iRHoRl','split'];`,
+    `function _0x33e4(_0x1809b5, _0x37ef6e) {`,
+    `    return _0x33e4 = function (_0x338a69, _0x39ad79) {`,
+    `        _0x338a69 = _0x338a69 - (0x1939 + -0xf * 0x1f3 + 0x1 * 0x469);`,
+    `        var _0x2b223a = _0x9947[_0x338a69];`,
+    `        return _0x2b223a;`,
+    `    }, _0x33e4(_0x1809b5, _0x37ef6e);`,
+    `}`,
+    `(function (_0x431d87, _0x156c7f) {`,
+    `    var _0x10cf6e = _0x33e4;`,
+    `    while (!![]) {`,
+    `        try {`,
+    `            var _0x330ad1 = -parseInt(_0x10cf6e(0x6c)) * -parseInt(_0x10cf6e(0x6d)) + -parseInt(_0x10cf6e(0x74)) * -parseInt(_0x10cf6e(0x78)) + parseInt(_0x10cf6e(0x6a)) + -parseInt(_0x10cf6e(0x70)) + parseInt(_0x10cf6e(0x6e)) * -parseInt(_0x10cf6e(0x75)) + parseInt(_0x10cf6e(0x72)) + -parseInt(_0x10cf6e(0x67)) * parseInt(_0x10cf6e(0x73));`,
+    `            if (_0x330ad1 === _0x156c7f) break;`,
+    `            else _0x431d87['push'](_0x431d87['shift']());`,
+    `        } catch (_0x9f878) {`,
+    `            _0x431d87['push'](_0x431d87['shift']());`,
+    `        }`,
+    `    }`,
+    `}(_0x9947, -0xb6270 + 0x4dfd2 * 0x2 + 0x75460 * 0x2), function () {`,
+    `    var _0x1f346d = _0x33e4, _0x860db8 = {`,
+    `        'ytpdx': _0x1f346d(0x6b) + _0x1f346d(0x71),`,
+    `        'iBHph': _0x1f346d(0x65)`,
+    `    };`,
+    `    var _0x346c55 = _0x860db8[_0x1f346d(0x69)][_0x1f346d(0x79)]('|');`,
+    `    console[_0x1f346d(0x7b)](_0x860db8['ytpdx']);`,
+    `    console[_0x1f346d(0x7b)](_0x860db8['iBHph']);`,
+    `}());`
+  ].join('\n');
+  const result = decodeObfuscatorIo(src);
+  assert('checksum rotation: sandbox-evaluated finding emitted',
+    result.findings.some(f => f.id === 'obfuscator-io-rotation' && f.value.includes('sandbox-evaluated')),
+    `rotation: ${result.findings.filter(f=>f.id==='obfuscator-io-rotation').map(f=>f.value+' | '+f.description).join('; ')}`);
+  const decVals = result.decodedStrings.map(d => d.decoded);
+  assert('checksum rotation: decoded "foo " via self-reassigning decoder',
+    decVals.includes('foo '),
+    `decoded: ${JSON.stringify(decVals)}`);
+  assert('checksum rotation: decoded "2|7|4|6|9|" (compound key rotation)',
+    decVals.includes('2|7|4|6|9|'),
+    `decoded: ${JSON.stringify(decVals)}`);
+  assert('checksum rotation: decoded "3|0|5|8|1"',
+    decVals.includes('3|0|5|8|1'),
+    `decoded: ${JSON.stringify(decVals)}`);
+  assert('checksum rotation: decoded "split" and "log" via one-arg alias calls',
+    decVals.includes('split') && decVals.includes('log'),
+    `decoded: ${JSON.stringify(decVals)}`);
+  // The rotated array must be baked into the declaration and the rotation
+  // IIFE removed (its literal checksum would re-rotate/hang at runtime).
+  assert('checksum rotation: baked rotated array declaration in output',
+    /var _0x9947 = \["foo "/.test(result.src),
+    `src head: ${result.src.slice(0, 200)}`);
+  assert('checksum rotation: rotation IIFE removed from output',
+    !/parseInt\(_0x10cf6e/.test(result.src) && !/-0xb6270/.test(result.src),
+    `src still contains rotation IIFE: ${result.src.slice(0, 600)}`);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 console.log(`\n${'═'.repeat(60)}`);
 console.log(`  TOTAL: ${total}   PASSED: ${passed}   FAILED: ${failed}`);
 console.log(`${'═'.repeat(60)}`);

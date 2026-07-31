@@ -1900,32 +1900,61 @@ function decodeObfuscatorIo(src) {
   }
 
   // ── Step 2: extract rotation IIFE ──────────────────────────────────────
-  // Pattern: (function(NAME, KEY){ ...push/shift... }(NAME, 0xNNN))
-  // The initial rotation estimate is 0xNNN % arr.length, but the actual
-  // effective rotation depends on a self-referencing computation inside the
-  // IIFE that can change as the array rotates. We defer final rotation to
-  // after decoder inlining (see Step 4f).
+  // Pattern: (function(NAME, KEY){ ...push/shift... }(NAME, KEYEXPR))
+  // The key may be a compound arithmetic expression (e.g.
+  // `-0xb6270 + 0x4dfd2 * 0x2 + 0x75460 * 0x2`) and the IIFE may be part of a
+  // comma-separated expression chain (`, function(){...}()` follows).
+  // Two rotation styles exist:
+  //   (a) simple count:  key = number of shifts (key % len applied directly)
+  //   (b) checksum:      body computes parseInt(dec(...)) and compares to key;
+  //                       rotation continues until the checksum matches, so
+  //                       the static key % len estimate is meaningless.
+  //       → checksum rotations are marked `sa.checksumRotation` and left
+  //         unrotated; Step 3e sandbox-evaluates them (see below).
   for (const sa of stringArrays) {
     const arrOrGetter = sa.getterName ? `(?:${sa.name}|${sa.getterName})` : sa.name;
     const rotateRe = new RegExp(
-      `\\(function\\s*\\(\\s*[A-Za-z_$][\\w$]*\\s*,\\s*[A-Za-z_$][\\w$]*\\s*\\)\\s*\\{[\\s\\S]*?(?:push|shift)[\\s\\S]*?\\}\\s*\\(\\s*${arrOrGetter}\\s*,\\s*(0x[0-9a-fA-F]+|\\d+)\\s*\\)\\s*\\)`
+      `\\(function\\s*\\(\\s*[A-Za-z_$][\\w$]*\\s*,\\s*[A-Za-z_$][\\w$]*\\s*\\)\\s*\\{[\\s\\S]*?(?:push|shift)[\\s\\S]*?\\}\\s*\\(\\s*${arrOrGetter}\\s*,\\s*((?:-?0x[0-9a-fA-F]+|-?\\d+)(?:\\s*[+\\-*/]\\s*(?:-?0x[0-9a-fA-F]+|-?\\d+))*)\\s*\\)\\s*(?:\\)|,|;|$)`
     );
     const rm = rotateRe.exec(src);
     if (rm) {
-      const rotateCount = parseInt(rm[1], rm[1].startsWith('0x') ? 16 : 10);
-      const initialEffective = rotateCount % sa.strings.length;
-      sa.rotationKey = rotateCount;
-      // Apply initial estimate as starting point; will be corrected in Step 4f
-      sa.strings = sa.strings.slice(initialEffective).concat(sa.strings.slice(0, initialEffective));
-      sa.rotated = true;
-      findings.push({
-        id: 'obfuscator-io-rotation',
-        category: 'Obfuscator.io Decoder',
-        severity: 'info',
-        value: `rotated ${sa.name} by ${initialEffective} (key=${rotateCount})`,
-        context: `array of ${sa.strings.length} strings`,
-        description: `Applied obfuscator.io string-array rotation: ${initialEffective} positions`,
-      });
+      const keyExpr = rm[1].replace(/\s+/g, '');
+      let rotateCount = NaN;
+      if (/^[0-9a-fA-Fx+\-*/]+$/.test(keyExpr)) {
+        try {
+          const vmKey = require('vm');
+          rotateCount = new vmKey.Script('(' + keyExpr + ')').runInNewContext({});
+        } catch (_) { rotateCount = NaN; }
+      }
+      const checksumRotation = !isNaN(rotateCount) &&
+        /parseInt\s*\(/.test(rm[0]) && /===/.test(rm[0]);
+      if (checksumRotation) {
+        sa.rotationKey = rotateCount;
+        sa.checksumRotation = true;
+        sa.rotated = true;
+        findings.push({
+          id: 'obfuscator-io-rotation',
+          category: 'Obfuscator.io Decoder',
+          severity: 'info',
+          value: `checksum rotation for ${sa.name} (target=${rotateCount})`,
+          context: `array of ${sa.strings.length} strings`,
+          description: `Checksum-calibrated rotation detected; final offset determined by sandbox eval`,
+        });
+      } else if (!isNaN(rotateCount)) {
+        const initialEffective = rotateCount % sa.strings.length;
+        sa.rotationKey = rotateCount;
+        // Apply initial estimate as starting point; will be corrected in Step 3f
+        sa.strings = sa.strings.slice(initialEffective).concat(sa.strings.slice(0, initialEffective));
+        sa.rotated = true;
+        findings.push({
+          id: 'obfuscator-io-rotation',
+          category: 'Obfuscator.io Decoder',
+          severity: 'info',
+          value: `rotated ${sa.name} by ${initialEffective} (key=${rotateCount})`,
+          context: `array of ${sa.strings.length} strings`,
+          description: `Applied obfuscator.io string-array rotation: ${initialEffective} positions`,
+        });
+      }
     }
   }
 
@@ -1988,12 +2017,41 @@ function decodeObfuscatorIo(src) {
 
       // Detect built-in base offset: idxParam = idxParam OP BASE
       // obfuscator.io often adds:  var idx = idx - 0xNNN;  at the start of decoders
+      // Supports:
+      //   (a) bare literal:        idx = idx - 0xNNN
+      //   (b) parenthesized expr:  idx = idx - (0x1939 + -0xf * 0x1f3 + 0x1 * 0x469)
+      //   (c) self-reassigning:    function D(a,b){ return D = function (i,k) {
+      //                               i = i - (EXPR); ... }, D(a,b); }
+      //       → the offset uses the INNER function's params, so we locate the
+      //         innermost `= function (i, k)` and evaluate the offset on `i`.
       let baseOffset = 0;
+      let effIdxParam = idxParam;
+      let effKeyParam = keyParam;
+      const selfReassignRe = body.match(/return\s+[A-Za-z_$][\w$]*\s*=\s*function\s*\(\s*([A-Za-z_$][\w$]*)\s*,\s*([A-Za-z_$][\w$]*)\s*\)/);
+      if (selfReassignRe) {
+        effIdxParam = selfReassignRe[1];
+        effKeyParam = selfReassignRe[2];
+      }
       const offsetMatch = body.match(new RegExp(
-        `\\b${idxParam}\\s*=\\s*${idxParam}\\s*([+-])\\s*(0x[0-9a-fA-F]+|\\d+)`
+        `\\b${effIdxParam}\\s*=\\s*${effIdxParam}\\s*([+-])\\s*(?:\\(([^)]+)\\)|(0x[0-9a-fA-F]+|\\d+))`
       ));
       if (offsetMatch) {
-        baseOffset = offsetMatch[1] === '-' ? parseInt(offsetMatch[2], offsetMatch[2].startsWith('0x') ? 16 : 10) : -parseInt(offsetMatch[2], offsetMatch[2].startsWith('0x') ? 16 : 10);
+        let offVal = NaN;
+        if (offsetMatch[2] !== undefined) {
+          // Parenthesized compound expression — evaluate with real precedence
+          const expr = offsetMatch[2].trim();
+          if (/^[0-9a-fA-Fx+\-*/()\s]+$/.test(expr)) {
+            try {
+              const vmOff = require('vm');
+              offVal = new vmOff.Script('(' + expr + ')').runInNewContext({});
+            } catch (_) { offVal = NaN; }
+          }
+        } else {
+          offVal = parseInt(offsetMatch[3], offsetMatch[3].startsWith('0x') ? 16 : 10);
+        }
+        if (!isNaN(offVal)) {
+          baseOffset = offsetMatch[1] === '-' ? offVal : -offVal;
+        }
       }
 
       // Determine decoder type
@@ -2011,58 +2069,140 @@ function decodeObfuscatorIo(src) {
       // gives the wrong offset. We extract the IIFE, getter, and decoder,
       // evaluate them in a sandbox, and capture the actual rotated array.
       // If the sandbox eval fails, Step 3f brute-forces the rotation.
+      // Two sandbox layouts:
+      //   (a) getter-based:   getterBody + decoderBody + rotationIIFE; read getter()
+      //   (b) checksum/plain: arrayDecl + decoderBody + rotationIIFE; read array
       let rotatedCorrected = false;
-      const rotEvalKey = `${sa.name}_${sa.getterName || ''}`;
-      if (sa.rotated && sa.getterName && !decodeObfuscatorIo._rotEvaled?.has(rotEvalKey)) {
+      const rotEvalKey = `${sa.name}_${sa.getterName || ''}_${sa.checksumRotation ? 'csum' : ''}`;
+      if (sa.rotated && (sa.getterName || sa.checksumRotation) && !decodeObfuscatorIo._rotEvaled?.has(rotEvalKey)) {
         (decodeObfuscatorIo._rotEvaled ??= new Set()).add(rotEvalKey);
         try {
-          const getterRe = new RegExp(
-            `function\\s+${sa.getterName}\\s*\\(\\s*\\)\\s*\\{[\\s\\S]{0,10000}?${sa.name}\\s*=\\s*\\[[^\\]]+\\][\\s\\S]{0,10000}?\\}`,
-            'g'
-          );
-          const gm2 = getterRe.exec(src);
-          if (gm2) {
-            const bb = gm2[0].indexOf('{');
-            const gEnd = _findMatchingBrace(src, gm2.index + bb + 1);
-            const getterBody = src.slice(gm2.index, gEnd + 1);
-            const decoderBody = body;
-            const rotRe2 = new RegExp(
-              `\\(function\\s*\\(\\s*[A-Za-z_$][\\w$]*\\s*,\\s*[A-Za-z_$][\\w$]*\\s*\\)\\s*\\{[\\s\\S]*?(?:push|shift)[\\s\\S]*?\\}\\s*\\(\\s*${sa.getterName}\\s*,\\s*(?:0x[0-9a-fA-F]+|\\d+)\\s*\\)\\s*\\)`
+          let sandboxSrc = null;
+          let rotRm = null;        // rotation IIFE match (checksum path)
+          let rotDeclM = null;     // array declaration match (checksum path)
+          // Getter-based arrays always use the getter path below (their array
+          // lives inside the getter function, so the checksum path's array-
+          // declaration reconstruction cannot reproduce it). The getter path
+          // handles checksum rotations too, since the IIFE reassigns the
+          // getter to return the rotated array.
+          if (sa.checksumRotation && !sa.getterName) {
+            // Re-locate the rotation IIFE (may be part of a comma chain:
+            //   (function(a,b){...}(ARR, KEY), function(){...}()))
+            // Reconstruct a standalone IIFE: (function(...){...}(ARR, KEY))
+            const rotReCsum = new RegExp(
+              `\\(function\\s*\\(\\s*[A-Za-z_$][\\w$]*\\s*,\\s*[A-Za-z_$][\\w$]*\\s*\\)\\s*\\{[\\s\\S]*?(?:push|shift)[\\s\\S]*?\\}\\s*\\(\\s*${sa.name}\\s*,\\s*((?:-?0x[0-9a-fA-F]+|-?\\d+)(?:\\s*[+\\-*/]\\s*(?:-?0x[0-9a-fA-F]+|-?\\d+))*)\\s*\\)\\s*(?:,|;|$|\\))`
             );
-            const rm2 = rotRe2.exec(src);
-            if (rm2) {
-              const sandboxSrc = `"use strict";${getterBody}${decoderBody}${rm2[0]};JSON.stringify(${sa.getterName}())`;
-              const vm = require('vm');
-              const script = new vm.Script(sandboxSrc, { timeout: 5000 });
-              const sandboxGlobals = {
-                parseInt, parseFloat, isNaN, isFinite,
-                NaN, Infinity, undefined,
-                String, Number, Boolean, Array, Object,
-                RegExp, Function, Error, TypeError,
-                RangeError, SyntaxError, ReferenceError, EvalError, URIError,
-                Date, Map, Set, WeakMap, WeakSet, Promise, Symbol,
-                Math, JSON,
-                atob: typeof atob !== 'undefined' ? atob : (s) => Buffer.from(s, 'base64').toString('binary'),
-                btoa: typeof btoa !== 'undefined' ? btoa : (s) => Buffer.from(s, 'binary').toString('base64'),
-                escape, unescape,
-                decodeURIComponent, encodeURIComponent,
-                console: { log:()=>{}, warn:()=>{}, error:()=>{}, info:()=>{}, debug:()=>{} },
-                setTimeout: (fn) => (typeof fn === 'function' ? fn() : null),
-                setInterval: () => {},
-                clearTimeout: () => {},
-                clearInterval: () => {},
-              };
-              const rotatedJson = script.runInNewContext(sandboxGlobals, { timeout: 5000, breakOnSigint: true });
-              const rotatedArr = JSON.parse(rotatedJson);
-              if (Array.isArray(rotatedArr) && rotatedArr.length === sa.strings.length) {
-                sa.strings = rotatedArr;
-                rotatedCorrected = true;
-                for (const f of findings) {
-                  if (f.id === 'obfuscator-io-rotation' && f.value.includes(sa.name)) {
-                    f.value = `rotated ${sa.name} (sandbox-evaluated, ${sa.strings[0].slice(0, 8)}…)`;
-                    f.description = `Corrected rotation via IIFE evaluation`;
-                    break;
+            const rm3 = rotReCsum.exec(src);
+            if (rm3) {
+              rotRm = rm3;
+              const iifeEnd = rm3.index + rm3[0].length;
+              // rm3[0] begins with the outer `(` of the comma chain, but the
+              // chain's closing `)` comes after subsequent comma members.
+              // Rebuild a standalone IIFE by stripping the separator and
+              // re-balancing parentheses (strings are skipped).
+              let iifeSrc = rm3[0];
+              iifeSrc = iifeSrc.replace(/[\s,;]+$/, '');
+              let openP = 0;
+              for (let i = 0; i < iifeSrc.length; i++) {
+                const ch = iifeSrc[i];
+                if (ch === '\\') { i++; continue; }
+                if (ch === "'" || ch === '"' || ch === '`') {
+                  const q = ch; i++;
+                  while (i < iifeSrc.length && iifeSrc[i] !== q) {
+                    if (iifeSrc[i] === '\\') i++;
+                    i++;
                   }
+                  continue;
+                }
+                if (ch === '(') openP++;
+                else if (ch === ')') openP--;
+              }
+              while (openP > 0) { iifeSrc += ')'; openP--; }
+              // Find the original array declaration in src to reproduce it
+              // verbatim in the sandbox (sa.strings may already be stale).
+              const arrDeclRe = new RegExp(
+                `(var|const|let)\\s+${sa.name}\\s*=\\s*\\[[\\s\\S]*?\\]\\s*;`
+              );
+              const arrDeclMatch = arrDeclRe.exec(src);
+              rotDeclM = arrDeclMatch || null;
+              const arrayDecl = arrDeclMatch ? arrDeclMatch[0] : `var ${sa.name} = ${JSON.stringify(sa.strings)};`;
+              sandboxSrc = `"use strict";${arrayDecl}${body}${iifeSrc};JSON.stringify(${sa.name})`;
+            }
+          } else {
+            const getterRe = new RegExp(
+              `function\\s+${sa.getterName}\\s*\\(\\s*\\)\\s*\\{[\\s\\S]{0,10000}?${sa.name}\\s*=\\s*\\[[^\\]]+\\][\\s\\S]{0,10000}?\\}`,
+              'g'
+            );
+            const gm2 = getterRe.exec(src);
+            if (gm2) {
+              const bb = gm2[0].indexOf('{');
+              const gEnd = _findMatchingBrace(src, gm2.index + bb + 1);
+              const getterBody = src.slice(gm2.index, gEnd + 1);
+              const decoderBody = body;
+              const rotRe2 = new RegExp(
+                `\\(function\\s*\\(\\s*[A-Za-z_$][\\w$]*\\s*,\\s*[A-Za-z_$][\\w$]*\\s*\\)\\s*\\{[\\s\\S]*?(?:push|shift)[\\s\\S]*?\\}\\s*\\(\\s*${sa.getterName}\\s*,\\s*(?:0x[0-9a-fA-F]+|\\d+)\\s*\\)\\s*\\)`
+              );
+              const rm2 = rotRe2.exec(src);
+              if (rm2) {
+                sandboxSrc = `"use strict";${getterBody}${decoderBody}${rm2[0]};JSON.stringify(${sa.getterName}())`;
+              }
+            }
+          }
+          if (sandboxSrc) {
+            const vm = require('vm');
+            const script = new vm.Script(sandboxSrc, { timeout: 5000 });
+            const sandboxGlobals = {
+              parseInt, parseFloat, isNaN, isFinite,
+              NaN, Infinity, undefined,
+              String, Number, Boolean, Array, Object,
+              RegExp, Function, Error, TypeError,
+              RangeError, SyntaxError, ReferenceError, EvalError, URIError,
+              Date, Map, Set, WeakMap, WeakSet, Promise, Symbol,
+              Math, JSON,
+              atob: typeof atob !== 'undefined' ? atob : (s) => Buffer.from(s, 'base64').toString('binary'),
+              btoa: typeof btoa !== 'undefined' ? btoa : (s) => Buffer.from(s, 'binary').toString('base64'),
+              escape, unescape,
+              decodeURIComponent, encodeURIComponent,
+              console: { log:()=>{}, warn:()=>{}, error:()=>{}, info:()=>{}, debug:()=>{} },
+              setTimeout: (fn) => (typeof fn === 'function' ? fn() : null),
+              setInterval: () => {},
+              clearTimeout: () => {},
+              clearInterval: () => {},
+            };
+            const rotatedJson = script.runInNewContext(sandboxGlobals, { timeout: 5000, breakOnSigint: true });
+            const rotatedArr = JSON.parse(rotatedJson);
+            if (Array.isArray(rotatedArr) && rotatedArr.length === sa.strings.length) {
+              sa.strings = rotatedArr;
+              rotatedCorrected = true;
+              // Bake the sandbox-rotated array into the source and drop the
+              // rotation IIFE: its checksum loop now sees already-decoded
+              // literal values, so keeping it would re-rotate (or hang) at
+              // runtime. The rotated declaration keeps any remaining decoder
+              // calls semantically correct.
+              if (sa.checksumRotation && rotRm) {
+                if (rotDeclM) {
+                  const kw = rotDeclM[1] || 'var';
+                  const rotatedJsonStr = JSON.stringify(rotatedArr);
+                  // Remove the IIFE FIRST (position valid on current src),
+                  // then replace the array declaration (its index is
+                  // unaffected by the earlier removal).
+                  const sepMatch = rotRm[0].match(/[\s,;]+$/);
+                  const sep = sepMatch ? sepMatch[0] : '';
+                  if (sep.includes(',')) {
+                    // Comma chain: keep the outer `(` of the chain
+                    src = src.slice(0, rotRm.index) + '(' + src.slice(rotRm.index + rotRm[0].length);
+                  } else {
+                    src = src.slice(0, rotRm.index) + src.slice(rotRm.index + rotRm[0].length);
+                  }
+                  const declSrc = `${kw} ${sa.name} = ${rotatedJsonStr};`;
+                  src = src.slice(0, rotDeclM.index) + declSrc + src.slice(rotDeclM.index + rotDeclM[0].length);
+                }
+              }
+              for (const f of findings) {
+                if (f.id === 'obfuscator-io-rotation' && f.value.includes(sa.name)) {
+                  f.value = `rotated ${sa.name} (sandbox-evaluated, ${sa.strings[0].slice(0, 8)}…)`;
+                  f.description = `Corrected rotation via IIFE evaluation`;
+                  break;
                 }
               }
             }
@@ -2191,6 +2331,10 @@ function decodeObfuscatorIo(src) {
       // ── Step 4: find all calls to this decoder with constant args ──────
       // Supports direct calls, .call(), .apply(), and indirect (0, fn)() patterns
       // Includes any local aliases detected above.
+      // For plain/base64 decoders obfuscator.io emits ONE-ARG calls:
+      //   dec(0x123)        — no key needed
+      //   alias(0x123)
+      // RC4 decoders always carry the key: dec(0x123, 'key').
       const callPatterns = [
         // Direct: decName(0x123, 'key') or decName(-0x1a7, 'key')
         `\\b${decName}\\s*\\(\\s*(-?0x[0-9a-fA-F]+|-?\\d+)\\s*,\\s*["']([^"']*)["']\\s*\\)`,
@@ -2201,6 +2345,14 @@ function decodeObfuscatorIo(src) {
         // Indirect: (0, decName)(0x123, 'key')
         `\\(\\s*0\\s*,\\s*${decName}\\s*\\)\\s*\\(\\s*(-?0x[0-9a-fA-F]+|-?\\d+)\\s*,\\s*["']([^"']*)["']\\s*\\)`,
       ];
+      if (!isRC4) {
+        // One-arg variants (plain/base64 decoders)
+        callPatterns.push(
+          `\\b${decName}\\s*\\(\\s*(-?0x[0-9a-fA-F]+|-?\\d+)\\s*\\)`,
+          `\\b${decName}\\.call\\s*\\(\\s*(?:this|null|undefined)\\s*,\\s*(-?0x[0-9a-fA-F]+|-?\\d+)\\s*\\)`,
+          `\\(\\s*0\\s*,\\s*${decName}\\s*\\)\\s*\\(\\s*(-?0x[0-9a-fA-F]+|-?\\d+)\\s*\\)`
+        );
+      }
       for (const alias of aliases) {
         callPatterns.push(
           `\\b${alias}\\s*\\(\\s*(-?0x[0-9a-fA-F]+|-?\\d+)\\s*,\\s*["']([^"']*)["']\\s*\\)`,
@@ -2208,6 +2360,13 @@ function decodeObfuscatorIo(src) {
           `\\b${alias}\\.apply\\s*\\(\\s*(?:this|null|undefined)\\s*,\\s*\\[(-?0x[0-9a-fA-F]+|-?\\d+)\\s*,\\s*["']([^"']*)["']\\s*\\]\\s*\\)`,
           `\\(\\s*0\\s*,\\s*${alias}\\s*\\)\\s*\\(\\s*(-?0x[0-9a-fA-F]+|-?\\d+)\\s*,\\s*["']([^"']*)["']\\s*\\)`
         );
+        if (!isRC4) {
+          callPatterns.push(
+            `\\b${alias}\\s*\\(\\s*(-?0x[0-9a-fA-F]+|-?\\d+)\\s*\\)`,
+            `\\b${alias}\\.call\\s*\\(\\s*(?:this|null|undefined)\\s*,\\s*(-?0x[0-9a-fA-F]+|-?\\d+)\\s*\\)`,
+            `\\(\\s*0\\s*,\\s*${alias}\\s*\\)\\s*\\(\\s*(-?0x[0-9a-fA-F]+|-?\\d+)\\s*\\)`
+          );
+        }
       }
       let replacedCount = 0;
       for (const callPattern of callPatterns) {
@@ -2407,16 +2566,41 @@ function rc4Decrypt(ciphertext, key) {
 // picks the one that decodes the most valid-looking strings.
 // Returns the best offset or null if no offset produces meaningful results.
 function rotateBruteForce(src, sa, decName, idxParam, keyParam, baseOffset, isRC4, isBase64, isPlain) {
-  // 1. Find all decoder calls with constant args in the source
-  const callPattern = new RegExp(
-    `\\b${decName}\\s*\\(\\s*(-?0x[0-9a-fA-F]+|-?\\d+)\\s*,\\s*["']([^"']*)["']\\s*\\)`,
+  // 1. Find all decoder calls with constant args in the source.
+  //    Matches the direct name AND any local aliases (var ALIAS = decName),
+  //    plus one-arg calls for plain/base64 decoders (obfuscator.io emits
+  //    alias(0x123) with no key when the decoder is not RC4).
+  const names = [decName];
+  const aliasRe = new RegExp(
+    `(?:,\\s*|(?:var|const|let)\\s+)([A-Za-z_$][\\w$]*)\\s*=\\s*${decName}\\b`,
     'g'
   );
+  let am;
+  while ((am = aliasRe.exec(src)) !== null) {
+    const nextCh = src[am.index + am[0].length];
+    if (nextCh === '[' || nextCh === '.') continue;
+    names.push(am[1]);
+  }
+
+  const callPatterns = [];
+  for (const nm of names) {
+    callPatterns.push(
+      `\\b${nm}\\s*\\(\\s*(-?0x[0-9a-fA-F]+|-?\\d+)\\s*,\\s*["']([^"']*)["']\\s*\\)`
+    );
+    if (!isRC4) {
+      callPatterns.push(
+        `\\b${nm}\\s*\\(\\s*(-?0x[0-9a-fA-F]+|-?\\d+)\\s*\\)`
+      );
+    }
+  }
   const callSites = [];
-  let cm;
-  while ((cm = callPattern.exec(src)) !== null) {
-    const idx = parseInt(cm[1], /^-?0x/i.test(cm[1]) ? 16 : 10);
-    callSites.push({ idx, key: cm[2] });
+  for (const callPattern of callPatterns) {
+    const callRe = new RegExp(callPattern, 'g');
+    let cm;
+    while ((cm = callRe.exec(src)) !== null) {
+      const idx = parseInt(cm[1], /^-?0x/i.test(cm[1]) ? 16 : 10);
+      callSites.push({ idx, key: cm[2] });
+    }
   }
   if (callSites.length < 2) return null;
 
