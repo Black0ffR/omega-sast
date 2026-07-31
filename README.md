@@ -1,6 +1,6 @@
 # OMEGA-5.0 — Zero-Dependency JavaScript SAST Engine
 
-[![Test Suite](https://img.shields.io/badge/tests-571%20passing-brightgreen)](test/)
+[![Test Suite](https://img.shields.io/badge/tests-649%20passing-brightgreen)](test/)
 [![Zero Deps](https://img.shields.io/badge/dependencies-0-success)](package.json)
 [![Ongoing Fixes](https://img.shields.io/badge/fixes-P0--P3%20complete-blue)](OMEGA-SAST-FIX-PLAN-R3.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -34,6 +34,7 @@ OMEGA-5.0 analyzes a JavaScript bundle in 20 phases:
 | 2b | CharCode decoder | Juice-Shop-style IIFE obfuscation |
 | 2c | obfuscator.io decoder | String-array rotation + RC4/base64 + brute-force fallback; multi-layer pass-through + swapped-arg/double-neg wrapper inlining |
 | 2d | Constant evaluator | Safe partial evaluator for runtime strings |
+| 2e | Esoteric decode | Opt-in JSFuck/AAEncode/JJEncode payload recovery (`--decode-esoteric`, sandboxed, no execution) |
 | 3-6 | Normalization | Booleans, webpack cleanup, Angular Ivy, RxJS |
 | 7 | Beautifier | Token-based formatter (arrow-safe) |
 | 8-8c | Code analysis | Cyclomatic complexity, storage keys, auth surface |
@@ -41,6 +42,7 @@ OMEGA-5.0 analyzes a JavaScript bundle in 20 phases:
 | 10-11 | Routes & credentials | API routes, 33+ credential patterns (generalized API key/secret regex with fpGuard) |
 | 12 | Security patterns | XSS, injection, crypto, network, storage |
 | 12b-m | Behavioral detectors | Dynamic code, business logic, WebSocket, IDOR, CVEs |
+| 12n | CSRF analyzer | Report-only hybrid regex/context detector (state-changing calls, cookie attributes, JSONP, token mishandling) |
 | 12o-p | Modern scanners | JWT/WebCrypto/Node crypto, network surface |
 | 12r | ReDoS detection | In-source ReDoS vulnerable pattern scan |
 | 12s | Pluggable custom rules | User-defined regex patterns from `.omega-rules.json` |
@@ -71,6 +73,19 @@ Removes dead code branches after constant folding:
 - `"str" === "str"` → `true`, `x !== x` → `false`
 - `true ? A : B` → `A`, `false ? A : B` → `B`
 
+### Esoteric Payload Decode (Phase 2e, `--decode-esoteric`)
+Opt-in recovery of JSFuck / AAEncode / JJEncode payloads **without executing the payload**: an eval-shim strategy (context-global `eval` overwrite) recovers JSFuck, and a constructor-patch strategy captures `return "…"` bodies in a fresh empty realm for AAEncode/JJEncode. Runs inside a `worker_threads` Worker (terminated after) with an in-process vm fallback; hostile payloads (`return process`, `while(1){}`) fail safe. The decoded payload replaces the working source for downstream phases, and `decodeStats.esoteric` records the recovered character count.
+
+### CSRF Analyzer (Phase 12n)
+Report-only hybrid regex/context analyzer (findings **never** affect exit codes or the attack score — CI gates stay untouched). Classifies the bundle's auth context (cookie vs bearer) and checks:
+- **State-changing requests without a CSRF token** — fetch/axios/jQuery/XHR/superagent `POST/PUT/PATCH/DELETE` calls with no `X-CSRF*`/`X-XSRF*` header (medium in cookie-auth bundles, info otherwise)
+- **Cookie attribute weaknesses** — missing `SameSite` on auth-named cookies, `SameSite=None` without `Secure`
+- **JSONP legacy patterns** — `callback=` script loads, `dataType: 'jsonp'`
+- **Token mishandling** — token in URL query, localStorage-only token never attached, client-side token comparison
+- **Positive protections** — axios `xsrf` defaults, `meta[name="csrf-token"]`, Angular `HttpXsrfInterceptor`, Django `csrf_token`, generic header attaches suppress findings and mark surfaces `PROTECTED`
+
+Emits a **CSRF Posture** section in HTML/JSON/Markdown reports: auth context, token mechanism, protected vs at-risk request surfaces (`{surface, method, protected}`).
+
 ### TypeScript Stripper (Phase 0a)
 Strips TypeScript type annotations so `.ts` files can be analyzed as plain `.js`:
 - Removes `: Type`, `as Type`, `interface`, `type`, `enum`, `declare`, decorators, generics
@@ -99,13 +114,13 @@ Suppress known findings using a JSON baseline file:
 Use with `--baseline <file>`. Suppressed findings are tagged in SARIF output as `suppressed` (kind: `external`). Use `--update-baseline` to generate a baseline from current scan results.
 
 ### Obfuscator Fingerprinting
-Detects 6 obfuscator types (obfuscator.io, Jscrambler, ByteHide, JSProtect, JSFuck, generic) with confidence scoring. Emits LLM-actionable metadata: "expect mangled identifiers", "expect control-flow flattening", etc.
+Detects 8 obfuscator types (obfuscator.io, Jscrambler, ByteHide, JSProtect, JSFuck, AAEncode, JJEncode, generic) with confidence scoring. Emits LLM-actionable metadata: "expect mangled identifiers", "expect control-flow flattening", etc.
 
 ### LLM-Ready Payload
 Each function compresses to a ~40-80 token "taint contract" (params, sources, sinks, sanitizers, returns). The backward slicer produces inter-procedural paths ranked by severity. The Variable Rename Table cuts token count 30-50% on minified input.
 
 ### CI/CD Integration
-Exit codes for CI pipelines: `0`=clean, `2`=critical (default), `3`=high+, `4`=medium+, `5`=low+. Configure via `OMEGA_FAIL_ON` env var. `--quiet` flag suppresses all non-essential output.
+Exit codes for CI pipelines: `0`=clean, `2`=critical (default), `3`=high+, `4`=medium+, `5`=low+. Configure via `OMEGA_FAIL_ON` env var. `--quiet` flag suppresses all non-essential output. Phase 12n CSRF findings are report-only and never affect exit codes.
 
 ## CLI Usage
 
@@ -123,6 +138,11 @@ Options:
   --no-ast              Disable AST pass (regex-only fallback)
   --treat-ts-as-js      Strip TypeScript annotations before analysis
   --custom-rules <f>    Path to .omega-rules.json for pluggable rule patterns
+  --baseline <f>        Suppress known findings from a baseline JSON file
+  --update-baseline     Write current findings to .omega-ignore baseline
+  --decode-esoteric     Recover JSFuck/AAEncode/JJEncode payloads (sandboxed)
+  --watch               Re-scan when the input file changes
+  --max-hops <n>        Backward-slice hop limit (default: 5)
 
 CI Exit Codes (OMEGA_FAIL_ON env var):
   0=clean, 1=error, 2=critical (default), 3=high+, 4=medium+, 5=low+
@@ -196,8 +216,11 @@ omega-sast/
 │   ├── test-corpus.js          # Bundle corpus regression (51)
 │   ├── test-getter-function-detection.js # Getter detection (15)
 │   ├── test-verification-issues.js # FP-fix + RC4 + cmd-injection tests (73)
+│   ├── test-esoteric.js           # Esoteric decode tests (30)
+│   ├── test-csrf.js               # CSRF analyzer tests (41)
 │   └── fixtures/
 │       └── sample-bundle.js  # Test fixture
+├── bundles/                    # 21 real-world library bundles (regression corpus)
 ├── docs/
 │   └── API.md                # API documentation
 ├── examples/
@@ -212,7 +235,7 @@ omega-sast/
 ## Test Suite
 
 ```bash
-# Run all 571 tests (100% pass rate)
+# Run all 649 tests (100% pass rate)
 npm test
 
 # Run individual suites
@@ -239,7 +262,9 @@ npm run test:obfuscator
 - **Jscrambler** — chained atob/charCode decoder, OC* globals, date anti-debug
 - **ByteHide** — namespace detection, XOR decryptor
 - **JSProtect** — eval(CryptoJS.decrypt(...))
-- **JSFuck** — `[]()!+` encoding
+- **JSFuck** — `[]()!+` encoding (fingerprinted + decodable via `--decode-esoteric`)
+- **AAEncode** — `ﾟωﾟﾉ` bootstrap (fingerprinted + decodable via `--decode-esoteric`)
+- **JJEncode** — `$=~[]` bootstrap (fingerprinted + decodable via `--decode-esoteric`)
 - **Generic** — hex identifiers, eval density, string-concat chains
 
 ## Limitations
