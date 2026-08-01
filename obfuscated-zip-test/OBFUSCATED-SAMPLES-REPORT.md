@@ -39,7 +39,7 @@ These are the canonical obfuscation patterns that production SAST tools and LLM-
 **All 12 scans completed without crashes. All 12 reports (HTML + JSON + MD + SARIF) generated successfully.** Average wall-clock run time ~2.0s; average peak RSS ~54 MB.
 
 | File | Size | Exit | Time (s) | RSS (MB) | Findings | Max severity | Decode stats |
-|---|---:|---:|---:|---:|---:|---|---|---|
+|---:|---:|---:|---:|---:|---:|---:|---|
 | `01_original` | 211 B | 0 | 1.87 | 53 | 0 | — | — |
 | `02_jsfuck` | 2.5 KB | 3 | 2.11 | 56 | 1 | **high** | — |
 | `03_aaencode` | 3.3 KB | 3 | 2.21 | 58 | 2 | **high** | — |
