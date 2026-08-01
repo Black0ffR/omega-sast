@@ -1058,7 +1058,10 @@ const SECURITY_PATTERNS = [
     re:/Math\.random\(\)\s*\.\s*toString\s*\(\s*36\s*\)/g,
     ctx: m => {
       const c = m.slice(0, 300);
-      return /token|nonce|csrf|session|secret|key|nonce|id|guid|uuid/i.test(c);
+      // Security-token words only. Internal ID generation (id/key/guid/uuid —
+      // e.g. react-dom's `id="_reactListening"+Math.random().toString(36)`)
+      // is NOT cryptographic and must not fire high.
+      return /token|nonce|csrf|session|secret|password|otp|salt|hash|crypto|auth/i.test(c);
     } },
   { id:'rand-math-predictable', cat:'Broken Crypto', sev:'medium',
     re:/Math\.random\(\)/g,
