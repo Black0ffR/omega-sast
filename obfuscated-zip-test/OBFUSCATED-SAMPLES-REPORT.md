@@ -36,22 +36,24 @@ These are the canonical obfuscation patterns that production SAST tools and LLM-
 
 ## 2. Headline results
 
-**All 12 scans completed without crashes. All 12 reports (HTML + JSON + MD + SARIF) generated successfully.** Average in-process analysis time ~0.80s; average peak RSS ~53 MB.
+**All 12 scans completed without crashes. All 12 reports (HTML + JSON + MD + SARIF) generated successfully.** Average wall-clock run time ~2.0s; average peak RSS ~54 MB.
 
 | File | Size | Exit | Time (s) | RSS (MB) | Findings | Max severity | Decode stats |
-|---|---|---:|---:|---:|---:|---|---|---|
-| `01_original` | 211 B | 0 | 0.61 | 51 | 0 | — | — |
-| `02_jsfuck` | 2.5 KB | 3 | 0.85 | 54 | 1 | **high** | — |
-| `03_aaencode` | 3.3 KB | 3 | 0.98 | 57 | 2 | **high** | — |
-| `04_jjencode` | 940 B | 3 | 0.88 | 53 | 1 | **high** | concat=5 |
-| `05_packer_dean_edwards` | 713 B | 2 | 0.75 | 51 | 1 | **critical** | — |
-| `06_obfuscator_io_style` | 3.8 KB | 4 | 1.16 | 55 | 5 | medium | Hex=1, **obfuscatorIo=12** (23-string array) |
-| `07_hex_unicode_strings` | 336 B | 0 | 0.62 | 51 | 0 | — | **Unicode=16, Hex=16** |
-| `08_string_array_mapping` | 459 B | 5 | 0.72 | 52 | 1 | info | — |
-| `09_minified_terser_style` | 196 B | 0 | 0.72 | 52 | 0 | — | — |
-| `10_control_flow_flattening` | 629 B | 0 | 0.76 | 51 | 0 | — | **deflattened** |
-| `11_dead_code_injection` | 494 B | 0 | 0.67 | 51 | 0 | — | **dead code pruned** |
-| `12_webpack_like_bundle` | 1.4 KB | 0 | 0.84 | 54 | 0 | — | — |
+|---|---:|---:|---:|---:|---:|---|---|---|
+| `01_original` | 211 B | 0 | 1.87 | 53 | 0 | — | — |
+| `02_jsfuck` | 2.5 KB | 3 | 2.11 | 56 | 1 | **high** | — |
+| `03_aaencode` | 3.3 KB | 3 | 2.21 | 58 | 2 | **high** | — |
+| `04_jjencode` | 940 B | 3 | 2.03 | 55 | 1 | **high** | concat=5 |
+| `05_packer_dean_edwards` | 713 B | 2 | 1.90 | 53 | 1 | **critical** | — |
+| `06_obfuscator_io_style` | 3.8 KB | 4 | 2.29 | 57 | 5 | medium | Hex=1, **obfuscatorIo=12** (23-string array) |
+| `07_hex_unicode_strings` | 336 B | 0 | 1.80 | 51 | 0 | — | **Unicode=16, Hex=16** |
+| `08_string_array_mapping` | 459 B | 5 | 1.91 | 53 | 1 | info | — |
+| `09_minified_terser_style` | 196 B | 0 | 1.86 | 53 | 0 | — | — |
+| `10_control_flow_flattening` | 629 B | 0 | 1.89 | 53 | 0 | — | **deflattened** |
+| `11_dead_code_injection` | 494 B | 0 | 1.88 | 53 | 0 | — | **dead code pruned** |
+| `12_webpack_like_bundle` | 1.4 KB | 0 | 2.11 | 55 | 0 | — | — |
+
+Time/RSS provenance: measured 2026-08-01 on Termux/Android (ARM64), Node v26.1.0, via `node /tmp/rev/measure2.js` — a wrapper that spawns `node bin/omega.js <file> --security --report --out <out>` and polls `/proc/<pid>/status` VmRSS (20 ms) for peak RSS; Time is full wall-clock (process spawn + startup + analysis + report write). Values are host-dependent and indicative, not a benchmark.
 
 Exit-code legend (default `OMEGA_FAIL_ON=critical`): 0=clean, 2=critical present, 3=high present, 4=medium present, 5=low+/info only. The tool never OOM'd, never returned exit 1, and never hung on any input — even on the JSFuck payload that is essentially pure expression-evaluation metaprogramming.
 
@@ -65,12 +67,15 @@ The tool flagged the file as **obfuscator.io @ 60% confidence** (medium; the fin
 
 ```
 [MEDIUM] Obfuscator Fingerprint — obfuscator.io (confidence: 60%)
-[INFO]  Obfuscator.io Decoder — rotated _0x9947 (sandbox-evaluated, array of 23 strings)
-[INFO]  Obfuscator.io Decoder — found decoder function _0x33e4
+[INFO]  Obfuscator.io Decoder — rotated _0x9947 (sandbox-evaluated, foo …)
+[INFO]  Obfuscator.io Decoder — _0x33e4(undefined, undefined) — plain — 12 strings decoded
 [LOW]   Obfuscator.io Decoder — 17 strings decoded via _0x33e4
+[INFO]  Obfuscator.io Decoder — _0x33e4(undefined, undefined) — plain — 12 strings decoded
 ```
 
-The string-array rotation is no longer cosmetic. The rotation IIFE (`while (!![]) { … push/shift … }` with the compound `parseInt(…)` checksum) is sandbox-evaluated and removed; the 23-entry array is baked into its post-rotation order; the decoder call sites (`_0x1f346d(0x6b)`, `console[_0x1f346d(0x7b)]`, `_0x860db8[_0x1f346d(0x66)](…)`, …) are inlined to their literals (`'2|7|4|6|9|3|0|5|8|1'`, `console['log']`, `['split']`, `['map']`, `'foo '`). `decodeStats.obfuscatorIo = 12` unique strings are recorded by the decoder passes.
+That's **5 findings** total (1 medium + 3 info + 1 low), all in `extendedFindings`, matching `report.json`. The two `obfuscator-io-decoder` info findings carry the same value (`_0x33e4(undefined, undefined) — plain — 12 strings decoded`); both are emitted because each is recorded on a separate decode pass (Phase 12s second-pass dedup keeps same-id findings whose position differs by more than the 30-char window).
+
+The string-array rotation is no longer cosmetic. The rotation IIFE (`while (!![]) { … push/shift … }` with the compound `parseInt(…)` checksum) is sandbox-evaluated and removed; the 23-entry array is baked into its post-rotation order; the decoder call sites (`_0x1f346d(0x6b)`, `console[_0x1f346d(0x7b)]`, `_0x860db8[_0x1f346d(0x66)](…)`, …) are inlined to their literals (`'2|7|4|6|9|3|0|5|8|1'`, `console['log']`, `['split']`, `['map']`, `'foo '`). The three string counts in this report are three distinct quantities, each produced by a different stage: **23** = size of the baked post-rotation array (from the rotation-finding value `_0x9947`), **17** = strings decoded via the `_0x33e4` decoder call (the `obfuscator-io-decoded` finding value), **12** = `decodeStats.obfuscatorIo` unique strings recorded by the decoder passes.
 
 The decoded output is **62.5% of input size** (2386 B vs 3819 B) and **runtime-identical**: running the original and the decoded output both produce
 
@@ -212,13 +217,14 @@ Minified-style code is left as-is. The tool can tokenize/parse it (no crash, 0 f
 
 ## 6. Output artifacts
 
-Every run produced:
-- `results/<file>/report.html` — dark-mode HTML, includes the attack-score card, function analysis tables, the obfuscator fingerprint, and the decoded source.
-- `results/<file>/report.json` — full structured output (~5-30 KB per file, depending on findings).
-- `results/<file>/report.md` — readable summary.
-- `results/<file>/report.sarif` — SARIF 2.1.0 spec-compliant.
-- `results/<file>/routes.txt` — empty (no API routes in any of these).
-- `results/<file>/<file>.decoded.js` — the beautified / deobfuscated source, as far as the pipeline got.
+Every run produced (with `--out /tmp/rev/<file>.out`):
+- `/tmp/rev/<file>.out/report.html` — dark-mode HTML, includes the attack-score card, function analysis tables, the obfuscator fingerprint, and the decoded source.
+- `/tmp/rev/<file>.out/report.json` — full structured output (~5-30 KB per file, depending on findings).
+- `/tmp/rev/<file>.out/report.md` — readable summary.
+- `/tmp/rev/<file>.out/report.sarif` — SARIF 2.1.0 spec-compliant.
+- `/tmp/rev/<file>.out/<file>.decoded.js` — the beautified / deobfuscated source, as far as the pipeline got.
+
+`routes.txt` is only written when the analyzer finds route registrations; none of these 12 samples produce one, so it is absent from all 12 output dirs.
 
 ---
 
@@ -257,4 +263,6 @@ It does **not** (by design, documented in §4):
 | `11_dead_code_injection` | 5 | **5 (dead code pruned)** | 5 |
 | `12_webpack_like_bundle` | 5 | 3 | 3 |
 
-**Overall on this set: 5/5 on robustness, ~4.2/5 on decode effectiveness, ~4.5/5 on practical usefulness.** The tool does what it claims — signature-level obfuscator detection, full literal decoding for simple encodings, real string-array rotation recovery, CFF de-flattening, dead-code elimination, and opt-in esoteric payload recovery — and is honest about its remaining limits (§4).
+**Overall on this set: 5/5 on robustness, ~4.0/5 on decode effectiveness, ~4.2/5 on practical usefulness.** The tool does what it claims — signature-level obfuscator detection, full literal decoding for simple encodings, real string-array rotation recovery, CFF de-flattening, dead-code elimination, and opt-in esoteric payload recovery — and is honest about its remaining limits (§4).
+
+Per-sample arithmetic means: Robustness 60/12 = 5.00; Decode effectiveness 48/12 = 4.00; Usefulness 50/12 ≈ 4.17.

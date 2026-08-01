@@ -40,7 +40,7 @@ It runs a 20-phase pipeline (per the README and verified in the source):
 | 13-14 | Webpack module graph + call graph | ✓ (Angular: 1095 functions in call graph) |
 | 14c | **AST-based SSA taint tracker** with destructuring | ✓ (3 cross-statement flows in fixture, CWE-79/95/78) |
 | 15 | HTML (dark-mode) + JSON + Markdown + **SARIF 2.1.0** reports | ✓ (all four formats validated) |
-| 16 | Obfuscator fingerprint (6 flavors) | ✓ (heuristic correctly identified obfuscator.io @ 35% on the educational sample) |
+| 16 | Obfuscator fingerprint (6 flavors) | ✓ (heuristic correctly identified obfuscator.io @ 60% on the educational sample; confidence re-synced after the decode pass) |
 | 17 | Per-function taint contracts (LLM payload) | ✓ (e.g. d3: 2500 summaries, 26 reachable taint paths) |
 | 18 | Backward slicer (sink-anchored, 3-5 hop inter-procedural) | ✓ |
 | 19 | Variable rename table (token compression) | ✓ (Angular: 1723 renames) |
@@ -82,24 +82,26 @@ Exit-code legend (per OMEGA_FAIL_ON default `critical`): 0=clean, 1=error, 2=cri
 
 ### A.4 Headline numbers — obfuscation-samples run
 
-**All 12 scans completed without crashes. All 12 reports (HTML + JSON + MD + SARIF) generated successfully. Average time: ~180ms. Average peak RSS: 60 MB.**
+**All 12 scans completed without crashes. All 12 reports (HTML + JSON + MD + SARIF) generated successfully. Average wall-clock run time ~2.0s; average peak RSS ~54 MB.**
 
-| File | Size | Exit | Time (ms) | RSS (MB) | Findings | Max severity | Decode stats |
-|---|---:|---:|---:|---:|---:|---|---|
-| `01_original` | 211 B | 0 | 221 | 59 | 0 | — | — |
-| `02_jsfuck` | 2.5 KB | 0 | 175 | 61 | 0 | — | — |
-| `03_aaencode` | 3.3 KB | 0 | 178 | 60 | 0 | — | — |
-| `04_jjencode` | 940 B | 0 | 214 | 60 | 0 | — | concat=5 |
-| `05_packer_dean_edwards` | 713 B | 2 | 168 | 59 | 1 | **critical** | — |
-| `06_obfuscator_io_style` | 3.8 KB | 5 | 227 | 60 | 2 | low | Hex=1 |
-| `07_hex_unicode_strings` | 336 B | 0 | 166 | 58 | 0 | — | **Unicode=16, Hex=16** |
-| `08_string_array_mapping` | 459 B | 5 | 166 | 59 | 1 | info | — |
-| `09_minified_terser_style` | 196 B | 0 | 167 | 59 | 0 | — | — |
-| `10_control_flow_flattening` | 629 B | 0 | 160 | 59 | 0 | — | — |
-| `11_dead_code_injection` | 494 B | 0 | 167 | 59 | 0 | — | — |
-| `12_webpack_like_bundle` | 1.4 KB | 0 | 167 | 60 | 0 | — | — |
+> Table reproduced from OBFUSCATED-SAMPLES-REPORT.md §2 (regenerated 2026-08-01 for current v5 capability).
 
-The tool never OOM'd, never returned exit 1, and never hung on any input — even on the JSFuck payload that is essentially pure expression-evaluation metaprogramming.
+| File | Size | Exit | Findings | Max severity | Decode stats |
+|---|---|---:|---:|---|---|
+| `01_original` | 211 B | 0 | 0 | — | — |
+| `02_jsfuck` | 2.5 KB | 3 | 1 | **high** | — |
+| `03_aaencode` | 3.3 KB | 3 | 2 | **high** | — |
+| `04_jjencode` | 940 B | 3 | 1 | **high** | concat=5 |
+| `05_packer_dean_edwards` | 713 B | 2 | 1 | **critical** | — |
+| `06_obfuscator_io_style` | 3.8 KB | 4 | 5 | medium | Hex=1, **obfuscatorIo=12** (23-string array) |
+| `07_hex_unicode_strings` | 336 B | 0 | 0 | — | **Unicode=16, Hex=16** |
+| `08_string_array_mapping` | 459 B | 5 | 1 | info | — |
+| `09_minified_terser_style` | 196 B | 0 | 0 | — | — |
+| `10_control_flow_flattening` | 629 B | 0 | 0 | — | **deflattened** |
+| `11_dead_code_injection` | 494 B | 0 | 0 | — | **dead code pruned** |
+| `12_webpack_like_bundle` | 1.4 KB | 0 | 0 | — | — |
+
+Exit-code legend (default `OMEGA_FAIL_ON=critical`): 0=clean, 2=critical present, 3=high present, 4=medium present, 5=low+/info only. The tool never OOM'd, never returned exit 1, and never hung on any input — even on the JSFuck payload that is essentially pure expression-evaluation metaprogramming.
 
 ### A.5 TP/FP analysis on the planted fixture
 
@@ -179,17 +181,17 @@ On jQuery, 2 SSA taint flows into `location.href`. This is **non-trivial** for a
 | Hex escapes (`\xHH`) | ✓ | ✓ | full literal resolution (`\x6C\x6F\x67` → `log`) |
 | Unicode escapes (`\uHHHH`) | ✓ | ✓ | full literal resolution |
 | Dean Edwards Packer | ✓ (eval flagged) | partial | catches the dangerous sink, leaves the dictionary intact |
-| obfuscator.io string array | ✓ (decoder found, @ 35% conf) | ✗ (rotation not evaluated) | fingerprinted + LLM-hinted |
-| String-array w/ index refs | ✗ (literal preserved) | ✗ | human analyst substitutes manually |
+| obfuscator.io string array | ✓ (decoder found) | ✓ (rotation evaluated, 23-string array baked, runtime-identical) | fully decoded; RC4 path fixture-validated only |
+| String-array w/ index refs | ✓ (literal preserved) | ✗ | human analyst substitutes manually |
 | Webpack IIFE | ✓ (parsed) | n/a | no-op on this toy size |
-| CFF (switch dispatcher) | ✓ (parsed) | ✗ | control flow preserved |
-| Dead code | ✓ (parsed) | ✗ | dead branches preserved |
+| CFF (switch dispatcher) | ✓ (parsed) | ✓ (de-flattened to linear) | readable linear code |
+| Dead code + opaque predicates | ✓ (parsed) | ✓ (pruned, inlined) | dead branches removed |
 | Minified (Terser) | ✓ (parsed) | n/a | no expansion on small input |
-| JSFuck | ✓ (no crash) | ✗ | not in scope — would need sandbox eval |
-| AAEncode | ✓ (no crash) | ✗ | not in scope |
-| JJEncode | ✓ (no crash, concat=5) | ✗ | not in scope |
+| JSFuck | ✓ (fingerprinted 80%) | ✓ with `--decode-esoteric` (✗ by default) | `alert(1)` recovered opt-in |
+| AAEncode | ✓ (fingerprinted 90%) | ✓ with `--decode-esoteric` (✗ by default) | `alert("Hello, JavaScript")` recovered opt-in |
+| JJEncode | ✓ (fingerprinted 80%) | ✓ with `--decode-esoteric` (✗ by default) | `alert("Hello, JavaScript")` recovered opt-in |
 
-**Net:** strong on the simple end (hex/unicode = full decode), solid on the mid-range (obfuscator.io signature + eval/Packer sink catching), explicitly not designed for the esoteric end (JSFuck/AAEncode/JJEncode). This matches the README's "no runtime evaluation" caveat.
+**Net:** the tool's deobfuscation pipeline is **strong on the simple end (hex/unicode = full decode), complete on the mid-range (obfuscator.io string-array rotation with sandbox eval + brute-force fallback, CFF de-flattening, dead-code elimination), and esoteric shells are decodable via the opt-in `--decode-esoteric` flag (JSFuck/AAEncode/JJEncode single payloads).** Honest limits are those in §4 of OBFUSCATED-SAMPLES-REPORT.md.
 
 ### A.10 AST framework detection vs regex
 
@@ -325,26 +327,28 @@ CSRF (CWE-352), runtime-only concerns, and the "no runtime evaluation" decision 
 
 ### P1 — Important improvements (next minor release)
 
-#### B.7 [P1] Evaluate obfuscator.io's string-array rotation via sandboxed eval
+#### B.7 [P1] Evaluate obfuscator.io's string-array rotation via sandboxed eval — ✅ IMPLEMENTED
 
-**Evidence:** OMEGA correctly fingerprints `obfuscator.io_style.js` at 35% confidence and finds the decoder IIFE, but doesn't evaluate the rotation loop. The output `06_obfuscator_io_style.decoded.js` is **identical to the input except for whitespace**. The README's "sandbox eval + brute-force rotation fallback" implies this *should* work, but the test fixture we ran on suggests it doesn't on a small file.
+> **Status (2026-08-01): IMPLEMENTED.** Phase 2c sandbox-evaluates the rotation IIFE, bakes the rotated 23-string array into the source, and inlines the decoder call sites to their literals; the decoded output is 62.5% of input size and runtime-identical (see OBFUSCATED-SAMPLES-REPORT.md §3.1). Retained as engineering history.
 
-**Suggested fix:**
+**Original evidence (pre-fix):** OMEGA fingerprinted `obfuscator.io_style.js` at 35% confidence and found the decoder IIFE, but did not evaluate the rotation loop; the decoded output was a whitespace-only re-format of the input.
+
+**Original suggested fix (as implemented):**
 - Detect the decoder IIFE more aggressively (look for the string-array declaration followed by a function that subtracts a hex offset and indexes into it).
 - Run the rotation loop in a sandboxed eval context (no real network/IO, time-bounded) to extract the actual string table.
 - Inline the resolved strings back into the source.
 
-**Effort:** medium (1-2 weeks). **Impact:** transforms OMEGA from "signature detector" to "actual deobfuscator" for the most common obfuscator. ROI: very high — this is the most-requested feature in the SAST community.
+**Remaining:** real obfuscator.io RC4/base64 string-array output (`stringArrayEncoding: ['rc4']`) is fixture-validated but not yet validated end-to-end on a live production sample (AGENTS.md known-work #1).
 
-**Risk:** Sandbox eval can be slow / buggy. Mitigate with a hard timeout (e.g. 5s) and a fallback to "fingerprint only."
+#### B.8 [P1] Add CFF de-flattening for switch-dispatcher patterns — ✅ IMPLEMENTED
 
-#### B.8 [P1] Add CFF de-flattening for switch-dispatcher patterns
+> **Status (2026-08-01): IMPLEMENTED.** Phase 2c.2 collapses the switch dispatcher to linear code with a `// deflattened` marker and no switch dispatcher, runtime-identical to the input (see OBFUSCATED-SAMPLES-REPORT.md §3.6). Retained as engineering history.
 
-**Evidence:** `10_control_flow_flattening.js` is preserved verbatim. The dispatcher-switch-while-true pattern is recognized in the AST but not de-flattened.
+**Original evidence (pre-fix):** `10_control_flow_flattening.js` was emitted unchanged; the dispatcher-switch-while-true pattern was recognized in the AST but not de-flattened.
 
-**Suggested fix:** Pattern-match the `while(true){switch(x){case '0': ...; continue; ...}}` shape, lift the case bodies into a single function with sequential statements, and re-emit.
+**Original suggested fix (as implemented):** Pattern-match the `while(true){switch(x){case '0': ...; continue; ...}}` shape, lift the case bodies into a single function with sequential statements, and re-emit.
 
-**Effort:** medium-large (2-3 weeks). **Impact:** big for real obfuscator.io / Jscrambler / ByteHide outputs. ROI: high.
+**Original effort/impact:** medium-large (2-3 weeks). Impact: big for real obfuscator.io / Jscrambler / ByteHide outputs. ROI: high.
 
 #### B.9 [P1] Tighten the AST framework detection heuristic
 
@@ -379,28 +383,26 @@ The tool has `--baseline <file>` and `--update-baseline`. Document them with a r
 
 ### P2 — Strategic / longer-term
 
-#### B.13 [P2] Sandboxed runtime evaluator (optional plug-in)
+#### B.13 [P2] Sandboxed runtime evaluator (optional plug-in) — ✅ IMPLEMENTED (as `--decode-esoteric`)
 
-Add an *optional* plug-in that runs obfuscated JSFuck / AAEncode / JJEncode in a sandboxed Node `vm` context to resolve expressions. Keep the zero-dep default behavior, but let users opt in with `--sandbox-eval` (or a `--sandbox-timeout 5000` flag).
+> **Status (2026-08-01): IMPLEMENTED.** The opt-in `--decode-esoteric` flag (Phase 2e) recovers JSFuck / AAEncode / JJEncode single-payload shells in a worker/vm sandbox (empty realm, 3s timeout, worker terminate) without executing the payload itself: `02` → `alert(1)`, `03`/`04` → `alert("Hello, JavaScript")` (see OBFUSCATED-SAMPLES-REPORT.md §3.5/§4.4). Retained as engineering history.
 
-**This would be the single biggest jump in deobfuscation power**, but it requires:
-- Process isolation (child process, not `vm` directly, to avoid escape)
+**Original proposal:** an *optional* plug-in that runs obfuscated JSFuck / AAEncode / JJEncode in a sandboxed Node `vm` context to resolve expressions, opt-in via `--sandbox-eval` / `--sandbox-timeout`. Shipped as `--decode-esoteric`.
+
+**Original constraints (as shipped):**
+- Process isolation (worker thread, not bare `vm`)
 - A timeout + memory cap
 - No network/IO access
 
-**Effort:** large (1-2 months). **Impact:** transforms the tool from "SAST + signature detection" to "deobfuscator + SAST." ROI: very high, but this is a v6.0 feature, not a 5.x.
+**Remaining:** only single-payload esoteric shells are handled; multi-layer / obfuscator.io-style shells are out of scope (AGENTS.md known-work #8).
 
-#### B.14 [P2] Cross-file / cross-bundle taint
+#### B.15 [P2] Deobfuscation of dead code + opaque predicates — ✅ IMPLEMENTED
 
-The `--multi` mode is already there. Currently the backward slicer has a 3-5 hop cap. Increasing this to 8-10 hops (with caching) and letting `--multi` join findings across multiple bundles (e.g. the same `internalApi` symbol used in main + chunk + vendor) would catch real-world cross-bundle vulnerabilities that single-bundle tools miss.
+> **Status (2026-08-01): IMPLEMENTED.** Opaque predicates are folded and dead branches removed: `11_dead_code_injection.js` is fully linearized — `if (!![])` inlined, false branch and unreachable `return null` dropped (see OBFUSCATED-SAMPLES-REPORT.md §3.7). Retained as engineering history.
 
-**Effort:** medium (3-4 weeks). **Impact:** high for monorepos / webpack-federation setups. ROI: high.
+**Original description (pre-fix):** `11_dead_code_injection.js` was emitted unchanged. Adding a constant-folding + opaque-predicate-resolver pass (e.g. `if ("a" === "a")` → always true; `if (1+1 === 3)` → always false) would clean up the input AST before taint analysis, reducing false negatives on real obfuscator.io outputs.
 
-#### B.15 [P2] Deobfuscation of dead code + opaque predicates
-
-`11_dead_code_injection.js` is preserved verbatim. Adding a constant-folding + opaque-predicate-resolver pass (e.g. `if ("a" === "a")` → always true; `if (1+1 === 3)` → always false) would clean up the input AST before taint analysis, reducing false negatives on real obfuscator.io outputs.
-
-**Effort:** medium (2-3 weeks). **Impact:** medium-high. ROI: medium.
+**Original effort/impact:** medium (2-3 weeks). Impact: medium-high. ROI: medium.
 
 #### B.16 [P2] Co-maintainer / contributor onboarding
 
@@ -449,15 +451,15 @@ Some users will want to add their own patterns (e.g. an internal API key shape, 
 | True positive rate on the planted fixture | 5/5 | 13/14 in-scope patterns caught, with full taint chains |
 | True positive rate on real production bundles | 4/5 | Surfaced real issues in d3, underscore, backbone, three, dompurify, react-dom |
 | False positive management | 3.5/5 | ~38% raw FP rate but well-framed with confidence + reason; proto-pollution pattern is the worst offender |
-| Decode effectiveness (simple) | 5/5 | Hex + Unicode fully resolved; obfuscator.io fingerprinted |
-| Decode effectiveness (esoteric) | 1/5 | JSFuck / AAEncode / JJEncode not decoded (out of scope by design) |
+| Decode effectiveness (simple) | 5/5 | Hex + Unicode fully resolved; obfuscator.io string-array rotation decoded (23 strings, runtime-identical) |
+| Decode effectiveness (esoteric) | 4/5 | JSFuck / AAEncode / JJEncode single-payload shells decoded via opt-in `--decode-esoteric` (not by default) |
 | Performance | 4/5 | Sub-6s on 1.5MB, ~100-160MB RSS; scales linearly |
 | Coverage (CWE breadth) | 3/5 | XSS, eval, injection, hardcoded creds, broken crypto, source map leaks, ReDoS, CVE-lookup. Missing: path-traversal, CSRF, SSRF, race conditions |
 | Production-readiness | 4/5 | Stable, no crashes, 4 output formats, CI exit codes |
 | Innovation (LLM payload, inter-proc taint) | 5/5 | Genuinely novel for a single-author zero-dep tool |
 | Documentation | 4/5 | README is solid; 4 upgrade-plan docs in the root show active maintenance |
 
-**Overall: 4.0 / 5** — a strong, focused, honest tool with a real edge case (LLM-driven bundle analysis) that larger tools don't have. The FP patterns need tightening (P0 fixes) and the deobfuscation depth needs expansion (P1/P2 work).
+**Overall: 4.0 / 5** — a strong, focused, honest tool with a real edge case (LLM-driven bundle analysis) that larger tools don't have. The FP patterns still need tightening (P0 fixes); the main P1/P2 deobfuscation items (B.7/B.8/B.13/B.15) are now shipped, with RC4 production validation and multi-layer esoteric shells remaining.
 
 ### C.2 Quick-start
 
@@ -490,7 +492,7 @@ node bin/omega.js your-bundle.js --security --no-report --no-llm-payload
 1. **Ship B.1** (proto-pollution FP fix) — 1 day, 5 fewer FPs per scan.
 2. **Ship B.2** (network-surface doc-host filter) — 1 hour, 9 fewer FPs at once.
 3. **Ship B.4 + B.5** (Open Redirect category + path-traversal sink) — 2 days, closes 2 CWE coverage gaps.
-4. **Plan B.7** (sandboxed string-array eval) — biggest single upgrade to deobfuscation power.
+4. **Validate RC4 string-array production output** (B.7 follow-up, AGENTS.md known-work #1) — last obfuscator.io decode gap.
 5. **Add B.11** (documented CI integration with baseline/diff) — biggest single upgrade to adoption.
 
 ---
