@@ -5813,11 +5813,15 @@ function classifyLibrary(src) {
   if (/\u0275\w+|angular\.module|ng\.|@angular\//.test(src)) return 'ui-framework';
   // JJEncode guard: $=~[];$={___:++$ is the classic opening — prevent $ matches hitting jQuery
   if (/^\s*(?:\$|var\s+\$)\s*=\s*~\[\]\s*;/.test(src)) return 'obfuscated';
+  // lodash/underscore BEFORE the jQuery API check: lodash modules carry
+  // "Copyright jQuery Foundation and other contributors" license headers,
+  // and the bare-word jQuery signature would misclassify them (review R4).
+  // Trade-off: a bundle using BOTH jQuery and lodash resolves to utility.
+  if (/lodash|underscore/.test(src)) return 'utility';
   if (/jQuery|\$\.|\$\([^)]*\)\.(?:html|append|prepend|ready|on|click|ajax)/i.test(src)) return 'ui-framework';
   if (/React|createElement|createRoot|useState|useEffect/.test(src)) return 'ui-framework';
   if (/Vue|createApp|defineComponent|ref\s*\(/.test(src)) return 'ui-framework';
   if (/d3\.\w+\(/.test(src)) return 'ui-framework';
-  if (/lodash|underscore/.test(src)) return 'utility';
   if (/Moment|Dayjs|dayjs|date-fns/.test(src)) return 'utility';
   if (/express|koa|fastify|hapi/.test(src)) return 'backend';
   return 'general';
