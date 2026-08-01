@@ -134,6 +134,24 @@ Each function compresses to a ~40-80 token "taint contract" (params, sources, si
 ### CI/CD Integration
 Exit codes for CI pipelines: `0`=clean, `2`=critical (default), `3`=high+, `4`=medium+, `5`=low+. Configure via `OMEGA_FAIL_ON` env var. `--quiet` flag suppresses all non-essential output. Phase 12n CSRF findings are report-only and never affect exit codes.
 
+### Runtime on large bundles (measured 2026-08-01, Node 26.1, Termux/ARM64, single pass)
+
+| Bundle | Size | Time |
+|---|---:|---:|
+| angular-17.3.0.iife.js | 1.5 MB | ~16 s |
+| three.min.js | 656 KB | ~21 s |
+| d3-7.9.0.min.js | 276 KB | ~15 s |
+| vue-3.4.21.global.prod.js | 148 KB | ~8 s |
+
+Scaling is super-linear on multi-MB bundles (multiple full-source passes:
+decode fixpoint, CFF, taint, security patterns). For regular scanning of
+multi-MB assets, run with `OMEGA_PROFILE=1` to find the dominant phase,
+or scan per-chunk. **Optimization landed:** Phase 5 Ivy annotation previously
+ran 196 full-source regex passes (98 map entries × 2 patterns); now merged
+into 2 alternation passes (`annotateAngularIvy`) — angular total dropped
+~26 s → ~16 s with byte-identical findings (all 21 bundle scores unchanged,
+717/717 tests).
+
 ## CLI Usage
 
 ```bash

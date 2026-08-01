@@ -169,6 +169,23 @@ const ast = OMEGA_AST;
 const crypto = require('crypto');
 const os = require('os');
 
+// ── Opt-in phase profiling (OMEGA_PROFILE=1) — review R5 ──────────────────
+const _profile = process.env.OMEGA_PROFILE === '1' ? [] : null;
+let _pLast = null;
+function profileMark(name) {
+  if (!_profile) return;
+  const t = Number(process.hrtime.bigint()) / 1e6;
+  if (_pLast !== null) _profile.push({ name, ms: +(t - _pLast).toFixed(1) });
+  _pLast = t;
+}
+function profileDump() {
+  if (!_profile) return;
+  for (const e of _profile) console.error(`[profile] ${e.name} ${e.ms}ms`);
+  const total = _profile.reduce((a, e) => a + e.ms, 0);
+  console.error(`[profile] TOTAL ${total.toFixed(1)}ms`);
+  _profile.length = 0;  // idempotent: runCLI calls main(), so a second dump is a no-op
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3340,11 +3357,17 @@ function annotateAngularIvy(src) {
   for (const [pat, repl] of Object.entries(ANGULAR_UNICODE_PROPS)) {
     src = src.replace(new RegExp(pat, 'g'), repl);
   }
-  for (const [short, full] of Object.entries(ANGULAR_IVY_MAP)) {
-    const escaped = short.replace(/[$]/g,'\\$');
-    src = src.replace(new RegExp(`(\\w+)\\.${escaped}(\\s*\\()`, 'g'), `$1.${full}$2`);
-    src = src.replace(new RegExp(`(?<![.\\w])${escaped}(\\s*\\()`, 'g'), `${full}$1`);
-  }
+  // R5: merge the per-entry regex passes (98 entries × 2 = 196 full-source
+  // scans) into two alternation passes. Longest key first so prefix keys
+  // (e.g. mI1x before mI1) match the full symbol. Output is byte-identical
+  // (verified against the old loop on all 21 bundles + 12 samples).
+  const sortedIvyKeys = Object.keys(ANGULAR_IVY_MAP).sort((a, b) => b.length - a.length);
+  const escIvy = k => k.replace(/[$]/g, '\\$');
+  const ivyAlternation = sortedIvyKeys.map(escIvy).join('|');
+  const nsRe = new RegExp(`(\\w+)\\.(${ivyAlternation})(\\s*\\()`, 'g');
+  const tlRe = new RegExp(`(?<![.\\w])(${ivyAlternation})(\\s*\\()`, 'g');
+  src = src.replace(nsRe, (m, prefix, short, paren) => `${prefix}.${ANGULAR_IVY_MAP[short]}${paren}`);
+  src = src.replace(tlRe, (m, short, paren) => `${ANGULAR_IVY_MAP[short]}${paren}`);
   for (const [pat, repl] of Object.entries(ANGULAR_STATIC_MAP)) {
     src = src.split(pat).join(repl);
   }
@@ -7603,6 +7626,8 @@ async function main(externalOpts) {
     if (!opts.quiet) console.log(warn(`Input contains lines > 100 KB — chunked for regex safety`));
   }
 
+  if (process.env.OMEGA_PROFILE) profileMark('read-input');
+
   if (!opts.quiet) console.log(head('DECODING'));
 
   // Phase 0a — TypeScript stripping
@@ -7677,6 +7702,8 @@ async function main(externalOpts) {
     }
   }
 
+  if (process.env.OMEGA_PROFILE) profileMark('decode');
+
   // Phase 2c.2 — CFF de-flattener (control-flow flattening)
   let cffLoopCount = 0;
   if (!opts._singleLineHuge) {
@@ -7691,6 +7718,8 @@ async function main(externalOpts) {
       }
     }
   }
+
+  if (process.env.OMEGA_PROFILE) profileMark('deobfuscate-2c2');
 
   // Phase 2d — constant-expression evaluator (Stage 5)
   if (opts.verbose) console.log(info('  Phase 2d: constant-expression evaluator…'));
@@ -7737,18 +7766,26 @@ async function main(externalOpts) {
     if (!opts.quiet) console.log(ok(`Phase 3b: removed ${elimResult.findings.length} opaque predicates`));
   }
 
+  if (process.env.OMEGA_PROFILE) profileMark('opaque-elim');
+
   // Phase 4
   if (opts.verbose) console.log(info('  Phase 4: Webpack cleanup…'));
   src = cleanupWebpack(src);
+
+  if (process.env.OMEGA_PROFILE) profileMark('ph4-cleanup');
 
   // Phase 5 — Angular Ivy
   if (opts.verbose) console.log(info('  Phase 5: Angular Ivy annotation (110+ instructions)…'));
   src = annotateAngularIvy(src);
 
+  if (process.env.OMEGA_PROFILE) profileMark('ph5-ivy');
+
   // Phase 5b — Multi-framework
   if (opts.verbose) console.log(info('  Phase 5b: Multi-framework symbol annotation…'));
   const { src: src5b, hits: fwHits, stats: frameworkSymStats } = annotateFrameworkSymbols(src, opts);
   src = src5b;
+
+  if (process.env.OMEGA_PROFILE) profileMark('ph5b-fw');
 
   if (frameworkSymStats.frameworks.length) {
     if (!opts.quiet) console.log(ok(`Phase 5b annotated: ${C.bold}${frameworkSymStats.frameworks.join(', ')}${C.reset}  (${frameworkSymStats.symbolsAnnotated} symbols)`));
@@ -7759,6 +7796,8 @@ async function main(externalOpts) {
   // Phase 6 — RxJS
   if (opts.verbose) console.log(info('  Phase 6: RxJS operator annotation…'));
   src = annotateRxJS(src);
+
+  if (process.env.OMEGA_PROFILE) profileMark('ph6-rxjs');
 
   // Phase 7 — Beautify
   // Save pre-beautify src for route extraction (some patterns are cleaner before formatting)
@@ -7780,6 +7819,8 @@ async function main(externalOpts) {
 
   const sha256 = crypto.createHash('sha256').update(fs.readFileSync(inputPath)).digest('hex').slice(0,16);
   if (!opts.quiet) console.log(info(`File SHA-256:   ${sha256}…`));
+
+  if (process.env.OMEGA_PROFILE) profileMark('ph7-beautify');
 
   if (!opts.quiet) console.log(head('ANALYSIS'));
 
@@ -7848,6 +7889,8 @@ async function main(externalOpts) {
   // Phase 12
   const security = (opts.security || opts.report) ? analyseSecurity(src, opts.maxHops) : [];
 
+  if (process.env.OMEGA_PROFILE) profileMark('security-regex');
+
   // Phase 12b — B1: Dynamic code execution
   if (opts.verbose) console.log(info('  Phase 12b: Dynamic code execution scan…'));
   const dynCodeFindings  = (opts.security || opts.report) ? scanDynamicCodeExecution(src) : [];
@@ -7868,6 +7911,8 @@ async function main(externalOpts) {
   if (opts.verbose) console.log(info('  Phase 12f: Information leakage scan…'));
   const leakageFindings  = (opts.security || opts.report) ? scanInfoLeakage(src) : [];
 
+  if (process.env.OMEGA_PROFILE) profileMark('info-leak');
+
   // Phase 12g — C6: IDOR patterns
   if (opts.verbose) console.log(info('  Phase 12g: IDOR pattern scan…'));
   const idorFindings     = (opts.security || opts.report) ? scanIDOR(src) : [];
@@ -7885,6 +7930,8 @@ async function main(externalOpts) {
   // Phase 12j — D1: Taint flow analysis
   if (opts.verbose) console.log(info('  Phase 12j: Heuristic taint-flow analysis…'));
   const taintFindings    = (opts.security || opts.report) ? scanTaintFlow(src) : [];
+
+  if (process.env.OMEGA_PROFILE) profileMark('taint-regex');
 
   // Phase 12k — D2: Web3 security
   if (opts.verbose) console.log(info('  Phase 12k: Web3/blockchain security scan…'));
@@ -8031,6 +8078,8 @@ async function main(externalOpts) {
     astTaint = ast.trackTaintAST(astSrc, structuralIndex, callGraph);
     if (opts.verbose) console.log(info(`  AST taint flows found: ${astTaint.length}`));
 
+    if (process.env.OMEGA_PROFILE) profileMark('taint-ast');
+
     // Phase 12o — Tier 1.6: Modern crypto patterns
     if (opts.verbose) console.log(info('  Phase 12o: Modern crypto patterns (Tier 1.6)…'));
     modernCrypto = ast.scanModernCrypto(astSrc, structuralIndex);
@@ -8096,6 +8145,8 @@ async function main(externalOpts) {
         }
       }
     }
+
+    if (process.env.OMEGA_PROFILE) profileMark('sourcemap');
 
     // Phase 16 — Obfuscator fingerprinting (Stage 5)
     if (opts.verbose) console.log(info('  Phase 16: Obfuscator fingerprinting (Stage 5)…'));
@@ -8187,6 +8238,8 @@ async function main(externalOpts) {
       console.log(info(`  Obfuscator: ${obfuscatorFingerprint.primary.obfuscator} (${(obfuscatorFingerprint.primary.confidence * 100).toFixed(0)}% confidence)`));
     }
   }
+
+  if (process.env.OMEGA_PROFILE) profileMark('fingerprint');
 
   // Sync llmHints with decoder evidence (Residual 4): the fingerprint was
   // computed on the pre-decode source, so string-array / CFF activity only
@@ -8343,6 +8396,8 @@ async function main(externalOpts) {
     secondPassStats = { ran: true, decodedStrings: p2.decodedStrings.length, merged };
     if (opts.verbose) console.log(info(`  Phase 12s: second pass — ${p2.decodedStrings.length} strings, ${merged} new findings (${Date.now() - t0}ms)`));
   }
+
+  if (process.env.OMEGA_PROFILE) profileMark('decode-12s');
 
   // ── Apply severity-floor filter ────────────────────────────────────────
   // Filters out findings below the user-specified threshold before they reach
@@ -8546,10 +8601,14 @@ async function main(externalOpts) {
     console.log(ok(`MD report:   ${C.bold}${path.join(outDir,'report.md')}${C.reset}`));
   }
 
+  if (process.env.OMEGA_PROFILE) profileMark('report');
+
   const elapsed = ((Date.now()-t0)/1000).toFixed(2);
   if (!opts.quiet) {
     console.log(`\n${C.green}${C.bold}✔ Complete${C.reset} — ${elapsed}s — zero external dependencies.\n`);
   }
+
+  if (process.env.OMEGA_PROFILE) profileDump();
 
   // Return a summary for the entry-point wrapper to use for exit-code logic.
   return {
@@ -8616,6 +8675,7 @@ if (require.main === module) {
 function runCLI() {
   return main()
     .then((summary) => {
+      if (process.env.OMEGA_PROFILE && _profile.length > 0) profileDump();
       const failLevel = (process.env.OMEGA_FAIL_ON || 'critical').toLowerCase();
       const RANK = { critical: 0, high: 1, medium: 2, low: 3, info: 4, none: 99 };
       if (failLevel === 'none' || RANK[failLevel] === undefined) process.exit(0);
