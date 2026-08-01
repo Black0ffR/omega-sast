@@ -1,6 +1,6 @@
 # OMEGA-5.0 — Zero-Dependency JavaScript SAST Engine
 
-[![Test Suite](https://img.shields.io/badge/tests-707%20passing-brightgreen)](test/)
+[![Test Suite](https://img.shields.io/badge/tests-712%20passing-brightgreen)](test/)
 [![Zero Deps](https://img.shields.io/badge/dependencies-0-success)](package.json)
 [![Ongoing Fixes](https://img.shields.io/badge/fixes-P0--P3%20complete-blue)](OMEGA-SAST-FIX-PLAN-R3.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -234,6 +234,7 @@ omega-sast/
 │   ├── test-sourcemap.js          # Source map parser tests (40)
 │   ├── test-open-disambiguation.js # fs.open vs XHR vs window.open (9)
 │   ├── test-math-random-context.js # rand-math-token security-context disambiguation (5)
+│   ├── test-stack-trace-context.js # err-stacktrace exposure-context gate (5)
 │   ├── test-obfio-recovery.js     # Decoder evidence: hints, boost sync, fixpoint, mutations, second pass (32)
 │   └── fixtures/
 │       └── sample-bundle.js  # Test fixture
@@ -252,7 +253,7 @@ omega-sast/
 ## Test Suite
 
 ```bash
-# Run all 707 tests (100% pass rate)
+# Run all 712 tests (100% pass rate)
 npm test
 
 # Run individual suites

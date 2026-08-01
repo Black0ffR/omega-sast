@@ -1090,7 +1090,8 @@ const SECURITY_PATTERNS = [
   { id:'err-tostring',   cat:'Info Leakage',  sev:'low',
     re:/\.toString\s*\(\s*\).*(?:innerHTML|textContent|innerText)\s*=/g, ctx: null },
   { id:'err-stacktrace', cat:'Info Leakage',  sev:'high',
-    re:/(?:error|err|e)\.stack\b/g, ctx: null },
+    re:/(?:error|err|e)\.stack\b/g,
+    ctx: m => /console\.(?:log|error|warn|info)\s*\(|innerHTML|textContent|innerText|alert\s*\(|response|send|json|body\s*:/i.test(m.slice(0, 200)) },
 
   // ── B9: Source Map Artifacts ────────────────────────────────────────────
   // Note: sourceMappingURL detection is handled by Phase 12q (parseSourceMap)
