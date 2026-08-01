@@ -147,7 +147,7 @@ Scaling is super-linear on multi-MB bundles (multiple full-source passes:
 decode fixpoint, CFF, taint, security patterns). For regular scanning of
 multi-MB assets, run with `OMEGA_PROFILE=1` to find the dominant phase,
 or scan per-chunk. **Optimization landed:** Phase 5 Ivy annotation previously
-ran 196 full-source regex passes (98 map entries × 2 patterns); now merged
+ran 204 full-source regex passes (102 map entries × 2 patterns); now merged
 into 2 alternation passes (`annotateAngularIvy`) — angular total dropped
 ~26 s → ~16 s with byte-identical findings (all 21 bundle scores unchanged,
 717/717 tests).
