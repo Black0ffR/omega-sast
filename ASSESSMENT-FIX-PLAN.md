@@ -1,5 +1,8 @@
 # Plan: Scoring Calibration & Detection Quality Improvements
 
+> **STATUS (2026-08-01): IMPLEMENTED.** Every fix in this plan is present in current `main`
+> (verified independently, see OBFUSCATED-SAMPLES-REPORT.md). Retained as engineering history.
+
 Based on the assessment report (OMEGA-SAST-Assessment-Report.md), there are 5 key gaps to address:
 
 ---

@@ -1,5 +1,8 @@
 # Plan: Fix Remaining V7 Gaps
 
+> **STATUS (2026-08-01): IMPLEMENTED.** Every fix in this plan is present in current `main`
+> (verified independently, see OBFUSCATED-SAMPLES-REPORT.md). Retained as engineering history.
+
 Based on `VERDICT-V7.md` — 3 remaining gaps in priority order.
 
 ---
