@@ -1186,8 +1186,13 @@ const FRAMEWORKS = [
     score: s => (s.match(/app\.(?:get|post|put|delete|use)\s*\(\s*['"]/g)||[]).length,
     guard: s => !/angular|router\.navigate/.test(s.slice(0,3000)),
   },
-  { name:'jQuery',    re:/\$\s*\(\s*document\s*\)|jQuery\s*\(/,
+  { name:'jQuery',    re:/\$\s*\(\s*document\s*\)|jQuery\s*\(|\*! jQuery v\d/,
     score: s => (s.match(/jQuery\s*\(|\$\s*\(\s*document\s*\)/g)||[]).length,
+    // Strong, non-comment-idiom signals — a doc-comment example like
+    // `jQuery(window).on('resize', ...)` must NOT fingerprint a bundle as jQuery.
+    uniqueMarkers: [/\$\s*\(\s*document\s*\)/, /jQuery\.fn\b/,
+      /jQuery\.(?:ajax|get|post|getJSON|each|ready|extend|data|animate|css)\s*\(/,
+      /\*! jQuery v\d/],
   },
   { name:'Lodash',    re:/import\s+_\s+from\s+['"]lodash["']|_\.map\(|_\.filter\(/,
     score: s => (s.match(/_\.map\s*\(|_\.filter\s*\(|_\.reduce\s*\(|_\.find\s*\(|_\.assign\s*\(/g)||[]).length,
