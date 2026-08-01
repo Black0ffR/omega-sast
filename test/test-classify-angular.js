@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 /**
- * OMEGA-5.1 Review R4 — classifyLibrary: lodash before jQuery
+ * OMEGA-5.1 Review R4.5 — classifyLibrary: angular rule requires word boundary
  *
- * lodash modules' BSD license header contains "Copyright jQuery Foundation
- * and other contributors"; the jQuery signature matched the bare word and
- * classified lodash-debounce as ui-framework. The lodash/underscore identity
- * check now runs before the jQuery API-usage check.
+ * The angular signature `ng\.` matched ANY "…ng." substring — `objectToString.call`
+ * ("String.call") and `String.fromCharCode` both contain "ng." and were wrongly
+ * classifying utility libraries as ui-framework. The rule now uses `\bng\.` so only
+ * genuine Angular scope expressions (`ng-`, `ng.` after a word boundary) match.
  *
- * Run:  node test/test-classify-library.js
+ * Run:  node test/test-classify-angular.js
  */
 'use strict';
 
@@ -89,60 +89,48 @@ function libraryTypeOf(src) {
   return r && r.attackScore ? r.attackScore.libraryType : null;
 }
 
+function bundleType(name) {
+  return libraryTypeOf(fs.readFileSync(path.join(ROOT, 'bundles', name), 'utf8'));
+}
+
 // ═════════════════════════════════════════════════════════════════════════
-section('1. lodash module with jQuery Foundation license header → utility');
+section('1. lodash-debounce (utility) no longer matches the angular ng. rule');
 {
-  const lt = libraryTypeOf(
-    '// https://lodash.com/\n' +
-    '// Copyright jQuery Foundation and other contributors\n' +
-    'var debounce = function debounce(func, wait) { var lastArgs, lastThis; return function() { return func.apply(this, arguments); }; };\n' +
-    'module.exports = debounce;'
-  );
-  assert('lodash-debounce shape → libraryType utility',
+  const lt = bundleType('lodash-debounce-4.0.8.js');
+  assert('lodash-debounce-4.0.8.js → utility',
     lt === 'utility',
     `got ${lt}`);
 }
 
-section('2. real jquery bundle stays ui-framework');
+section('2. chart.js (general) — its "ng." substring was the angular FP');
 {
-  const lt = libraryTypeOf(
-    fs.readFileSync(path.join(ROOT, 'bundles', 'jquery-3.7.1.min.js'), 'utf8')
-  );
-  assert('jquery-3.7.1 → ui-framework',
+  const lt = bundleType('chart-4.4.2.min.js');
+  assert('chart-4.4.2.min.js → general',
+    lt === 'general',
+    `got ${lt}`);
+}
+
+section('3. marked (general) — no longer ui-framework via ng.');
+{
+  const lt = bundleType('marked-12.0.1.min.js');
+  assert('marked-12.0.1.min.js → general',
+    lt === 'general',
+    `got ${lt}`);
+}
+
+section('4. backbone (utility) — was ui-framework via ng. substring');
+{
+  const lt = bundleType('backbone-1.5.0.js');
+  assert('backbone-1.5.0.js → utility',
+    lt === 'utility',
+    `got ${lt}`);
+}
+
+section('5. real angular bundle stays ui-framework (strong signals)');
+{
+  const lt = bundleType('angular-17.3.0.iife.js');
+  assert('angular-17.3.0.iife.js → ui-framework',
     lt === 'ui-framework',
-    `got ${lt}`);
-}
-
-section('3. backbone → utility (R4.5: angular ng. substring no longer matches)');
-{
-  const lt = libraryTypeOf(
-    fs.readFileSync(path.join(ROOT, 'bundles', 'backbone-1.5.0.js'), 'utf8')
-  );
-  assert('backbone-1.5.0 → utility',
-    lt === 'utility',
-    `got ${lt}`);
-}
-
-section('4. react stays ui-framework');
-{
-  const lt = libraryTypeOf(
-    fs.readFileSync(path.join(ROOT, 'bundles', 'react-18.3.1.production.min.js'), 'utf8')
-  );
-  assert('react-18.3.1 → ui-framework',
-    lt === 'ui-framework',
-    `got ${lt}`);
-}
-
-section('5. documented trade-off: jQuery API + lodash word → utility');
-{
-  const lt = libraryTypeOf(
-    '// Copyright jQuery Foundation and other contributors\n' +
-    '$.ajax({ url: "/api", method: "GET" });\n' +
-    '// lodash bundled alongside\n' +
-    'var _ = {}; _.debounce = function(f){ return f; };'
-  );
-  assert('bundle with BOTH jQuery API and lodash word → utility (identity wins; documented)',
-    lt === 'utility',
     `got ${lt}`);
 }
 

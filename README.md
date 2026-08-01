@@ -1,6 +1,6 @@
 # OMEGA-5.0 — Zero-Dependency JavaScript SAST Engine
 
-[![Test Suite](https://img.shields.io/badge/tests-717%20passing-brightgreen)](test/)
+[![Test Suite](https://img.shields.io/badge/tests-722%20passing-brightgreen)](test/)
 [![Zero Deps](https://img.shields.io/badge/dependencies-0-success)](package.json)
 [![Ongoing Fixes](https://img.shields.io/badge/fixes-P0--P3%20complete-blue)](OMEGA-SAST-FIX-PLAN-R3.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -157,7 +157,10 @@ or scan per-chunk. **Optimization landed:** Phase 5 Ivy annotation previously
 ran 204 full-source regex passes (102 map entries × 2 patterns); now merged
 into 2 alternation passes (`annotateAngularIvy`) — angular total dropped
 ~26 s → ~16 s with byte-identical findings (all 21 bundle scores unchanged,
-717/717 tests).
+717/717 tests). **R4.5:** the angular classifier signature now requires a word
+boundary (`\bng\.`) so `objectToString.call` / `String.fromCharCode` ("…String.")
+no longer match the `ng.` substring — lodash-debounce/backbone reclassify
+ui-framework → utility, chart/marked → general (722/722 tests).
 
 ## CLI Usage
 
@@ -262,6 +265,7 @@ omega-sast/
 │   ├── test-stack-trace-context.js # err-stacktrace exposure-context gate (5)
 │   ├── test-obfio-recovery.js     # Decoder evidence: hints, boost sync, fixpoint, mutations, second pass (32)
 │   ├── test-classify-library.js   # classifyLibrary: lodash-before-jQuery ordering (5)
+│   ├── test-classify-angular.js   # classifyLibrary: angular word-boundary rule (\bng\.) (5)
 │   └── fixtures/
 │       └── sample-bundle.js  # Test fixture
 ├── bundles/                    # 21 real-world library bundles (regression corpus)
@@ -279,7 +283,7 @@ omega-sast/
 ## Test Suite
 
 ```bash
-# Run all 717 tests (100% pass rate)
+# Run all 722 tests (100% pass rate)
 npm test
 
 # Run individual suites

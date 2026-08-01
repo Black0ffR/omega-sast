@@ -5833,7 +5833,7 @@ function classifyLibrary(src) {
   if (/socket\.io|socket\.io/i.test(src)) return 'networking';
   if (/axios|XSRF-TOKEN/.test(src)) return 'networking';
   if (/CryptoJS|cryptojs|\bAES\b|\bSHA\d{1,3}\b|WordArray|Cipher|enc\.Utf8/.test(src)) return 'crypto';
-  if (/\u0275\w+|angular\.module|ng\.|@angular\//.test(src)) return 'ui-framework';
+  if (/\u0275\w+|angular\.module|\bng\.|@angular\//.test(src)) return 'ui-framework';
   // JJEncode guard: $=~[];$={___:++$ is the classic opening — prevent $ matches hitting jQuery
   if (/^\s*(?:\$|var\s+\$)\s*=\s*~\[\]\s*;/.test(src)) return 'obfuscated';
   // lodash/underscore BEFORE the jQuery API check: lodash modules carry
