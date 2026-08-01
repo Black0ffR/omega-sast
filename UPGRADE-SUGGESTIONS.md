@@ -398,7 +398,7 @@ The tool has `--baseline <file>` and `--update-baseline`. Document them with a r
 
 #### B.15 [P2] Deobfuscation of dead code + opaque predicates — ✅ IMPLEMENTED
 
-> **Status (2026-08-01): IMPLEMENTED.** Opaque predicates are folded and dead branches removed: `11_dead_code_injection.js` is fully linearized — `if (!![])` inlined, false branch and unreachable `return null` dropped (see OBFUSCATED-SAMPLES-REPORT.md §3.7). Retained as engineering history.
+> **Status (2026-08-01): IMPLEMENTED (partial).** Opaque predicates are folded and dead branches removed: `11_dead_code_injection.js` is linearized — `if (!![])` inlined, the `false` branch dropped. The trailing `return null;` is **preserved** (it carries the input's own `// unreachable` comment; statement-level removal of code following a terminating block is a follow-up candidate). See OBFUSCATED-SAMPLES-REPORT.md §3.7. Retained as engineering history.
 
 **Original description (pre-fix):** `11_dead_code_injection.js` was emitted unchanged. Adding a constant-folding + opaque-predicate-resolver pass (e.g. `if ("a" === "a")` → always true; `if (1+1 === 3)` → always false) would clean up the input AST before taint analysis, reducing false negatives on real obfuscator.io outputs.
 

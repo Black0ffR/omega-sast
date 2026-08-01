@@ -146,18 +146,22 @@ The opaque predicates are folded and the dead branch removed. Input had two unre
 ```js
 if (_0xdead > 0 && false) { … "Dummy never executed" }   // never taken → removed
 if (!![]) { … return message; }                           // always true → inlined
-return null;                                              // unreachable → removed
+return null;                                              // unreachable → kept (follow-up: statement-level removal)
 ```
 
 Output is fully linearized:
 
 ```js
+var _0xdead = 0xffff;
+// always true
 var message = "Hello, " + name + "!";
 console.log(message);
 return message;
+// unreachable
+return null;
 ```
 
-No `if (!![])` and no dead branch remains. The program behaviour is unchanged.
+No `if (!![])` and no dead branch remains. The `// always true` and `// unreachable` comments are the input's own, preserved by the pipeline; statement-level removal of the trailing unreachable `return null` is a follow-up candidate (§4.8). The program behaviour is unchanged.
 
 ---
 
@@ -187,7 +191,9 @@ The obfuscator.io fingerprint/decoder signatures are validated against the 12-sa
 
 The webpack-style IIFE wrapper with `__webpack_require__` is preserved. The tool has `--split-modules` and the report mentions Webpack 5 dynamic module graph, but for this small (1.4 KB) educational sample the bundler fingerprint didn't fire. Bundler detection does work on real-world-sized bundles (jQuery → `jqueryUmd`, Vue → `iifeGlobal` in the production-bundle run).
 
-### 4.7 `09_minified_terser_style.js` — no expansion
+### 4.7 Statement-level unreachable code is preserved
+
+`11_dead_code_injection.js` ends with `return null;` after an inlined always-true `return message;` — genuinely unreachable, but the pipeline only prunes dead *branches* and folds opaque predicates; a statement that follows a terminating statement is kept as-is (with the input's `// unreachable` comment). Statement-level unreachable elimination (respecting function hoisting and labels) is a follow-up candidate. `09_minified_terser_style.js` — no expansion
 
 Minified-style code is left as-is. The tool can tokenize/parse it (no crash, 0 findings) but doesn't apply the source-expansion / variable-rename-table pass to make it more readable. The rename-table pass needs the file to be large enough and complex enough to be worth the work.
 
