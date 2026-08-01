@@ -78,6 +78,13 @@ When Phase 2c (string-array) or 2c.2 (CFF de-flattener) actually decoded code, O
 ### Obfuscator Fingerprinting + Confidence Corroboration
 Fingerprints obfuscator.io, JSFuck, AAEncode, JJEncode, and packers from structural signatures. When Phase 2c inlines 10+ strings from an obfuscator.io string array, the fingerprint confidence is raised (≥ 0.6) with a `decoder-inlining-corroboration` signature, `llmHints` are synced with decoder evidence (`expectStringArrayIndirection`, `expectControlFlowFlattening`, `recommendedDecoderPasses`), and the fingerprint finding's text/severity are re-synced to the boosted confidence (no more "35%" text next to a 0.6 confidence).
 
+### Interpreting findings on framework internals
+
+- **`innerHTML`/DOM sinks inside framework internals** (Angular sanitizer-wrapped bindings, Vue `v-html`, DOMPurify, jQuery, preact) are *technically correct attack-surface call-outs* but usually sanitizer-wrapped: triage by checking whether user input can reach the sink un-sanitized, not by the flag alone. `bypassSecurityTrust*` findings are the real danger signals (they disable Angular's sanitizer).
+- **Info Leakage on library error paths** (`console.error(e)`, `e.stack` in error formatting) is standard library practice; only the exposure-gated findings (console/alert/DOM/network) are reported since v5.1.
+- **Broken Crypto `Math.random().toString(36)`** fires only in security-token contexts (token/nonce/csrf/session/secret/password/otp/salt/hash/crypto/auth) since v5.1 — internal ID generation is not flagged.
+- **`new Function(` / `eval(`** in libraries is usually a real code-exec risk: underscore's `_.template()` and D3's compiled accessors are documented cases worth an explicit look.
+
 ### Opaque Predicate Eliminator (Phase 3b)
 Removes dead code branches after constant folding:
 - `if (true) { A } else { B }` → `A`
