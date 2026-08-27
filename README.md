@@ -189,6 +189,30 @@ CI Exit Codes (OMEGA_FAIL_ON env var):
   0=clean, 1=error, 2=critical (default), 3=high+, 4=medium+, 5=low+
 ```
 
+## EP-EXTRACTOR NDJSON
+
+EP-EXTRACTOR exports cached script bodies as NDJSON (`url`, `content`, …). Convert with `--ndjson` (next version) or:
+
+```bash
+node docs/ndjson-to-js.js export.ndjson js-out
+omega js-out/004_theme_site.js --security --report --out ./out
+# Direct NDJSON mode (v5.1+):
+omega --ndjson export.ndjson --prefer-host liteapks.com --security --report --out ./out
+```
+
+## Interpreting CRITICAL on WordPress bundles
+
+- Prefer **theme** `js/*.js` over `wp-includes` and minified plugin bundles.
+- `Mexp.eval` / math engines are **not** `window.eval`.
+- Empty `innerHTML = ''` is not XSS.
+- `Date.now()` for TTL locks is not broken crypto.
+- Same-origin `searchParams.set` is not an open redirect to an attacker host.
+- Join SAST sinks with EP endpoint intel (`admin-ajax.php`, etc.).
+
+## Confidence rule of thumb
+
+**CRITICAL** should mean: first-party code + real dangerous primitive + plausible attacker dataflow — not “sink exists in a vendor min file.”
+
 ## Programmatic API
 
 ```javascript

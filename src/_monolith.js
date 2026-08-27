@@ -262,6 +262,120 @@ const fail = s => `${C.red}✘${C.reset} ${s}`;
 const head = s => `\n${C.bold}${C.blue}══ ${s} ══${C.reset}`;
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  PATCH HELPERS — EP-EXTRACTOR v19.19.5 Handoff (Steps 1-8)
+// ═══════════════════════════════════════════════════════════════════════════
+const MATH_EVAL_CALLEES = new Set(['mexp','math','expr','expression','parser','formula','nerdamer','mathjs']);
+function classifyEvalAt(src, pos) {
+  const before = src.slice(Math.max(0, pos - 80), pos);
+  const m = before.match(/([A-Za-z_$][\w$]*)\s*\.\s*$/);
+  if (m) {
+    const callee = m[1];
+    const low = callee.toLowerCase();
+    if (MATH_EVAL_CALLEES.has(low)) return { kind:'method-eval', callee, subtype:'math-engine' };
+    return { kind:'method-eval', callee, subtype:'unknown-method' };
+  }
+  if (/\b(?:window|globalThis|self)\s*\.\s*$/.test(before)) return { kind:'global-eval', callee:'window.eval' };
+  const bare = before.match(/(?:^|[^.\w$])(eval)\s*$/);
+  if (bare) return { kind:'global-eval', callee:'eval' };
+  if (/\beval\s*$/.test(before.trim())) return { kind:'global-eval', callee:'eval' };
+  return { kind:'unknown', callee:null };
+}
+const WS_SYMBOL_RE = /\b(?:WebSocket|MozWebSocket)\b|\bio\s*\(|\bStomp\b|\bsocket\.on\s*\(/;
+function sourceHasWebSocketSurface(src) { return WS_SYMBOL_RE.test(src); }
+function isBenignRhs(rhs) {
+  const t = String(rhs||'').trim();
+  if (!t) return true;
+  if (t==="''"||t==='""'||t==='``') return true;
+  if (/^['"`]\s*['"`]$/.test(t)) return true;
+  if (/^['"`][^'"<>`]*['"`]$/.test(t) && !/<[a-z]/i.test(t)) return true;
+  return false;
+}
+function scoreInnerHtmlAssignment(lhs, rhs) {
+  if (isBenignRhs(rhs)) return { severity:'info', exploitability:'theoretical', reason:'empty-or-literal-safe-rhs' };
+  if (/highlightText\s*\(/.test(rhs) || /\+\s*['"`]<strong>/.test(rhs)) return { severity:'high', exploitability:'needs-dataflow', reason:'partial-html-highlight-without-full-escape', primitive:'Element.innerHTML' };
+  if (/[?&]|location\.|document\.|response\.|data\.|item\./.test(rhs)) return { severity:'high', exploitability:'needs-dataflow', reason:'untrusted-looking-rhs' };
+  return { severity:'medium', exploitability:'needs-dataflow', reason:'dynamic-rhs' };
+}
+function classifyLocationAssign(rhs) {
+  const t = String(rhs||'');
+  if (/\.data\.(?:halt\.)?redirect|\.actions\.redirect|response\.[a-zA-Z]*redirect/i.test(t)) return { severity:'medium', id:'redirect-server-json', exploitability:'needs-dataflow', reason:'navigation from response field — exploit depends on response integrity' };
+  if (/new\s+URL\s*\(/.test(t) && /searchParams\.set/.test(t)) return { severity:'info', id:'redirect-same-origin-params', exploitability:'theoretical', reason:'same-origin URL with query mutation' };
+  if (/location\.(?:hash|search)|params\.get|query|userInput|input\.value/i.test(t)) return { severity:'high', id:'redirect-user-controlled', exploitability:'likely', reason:'user-influenced navigation target' };
+  return { severity:'medium', id:'redirect-location-assign', exploitability:'needs-dataflow', reason:'generic location assignment' };
+}
+const SECURITY_NAME_RE = /token|nonce|secret|password|session|otp|csrf|auth|jwt|signature|api[_-]?key|hmac/i;
+const TTL_NAME_RE = /ttl|expir|timeToLive|lock|rated|timeout|delay|cooldown|timestamp|now\b/i;
+function isSecurityTokenContext(surroundingCode) { return SECURITY_NAME_RE.test(surroundingCode) && !TTL_NAME_RE.test(surroundingCode); }
+function classifyDateNow(src, pos) {
+  const window = src.slice(Math.max(0, pos - 100), pos + 100);
+  if (TTL_NAME_RE.test(window) && !SECURITY_NAME_RE.test(window)) return { emit:false, reason:'ttl-or-ui-lock' };
+  if (isSecurityTokenContext(window)) return { emit:true, severity:'high', id:'rand-date-token', reason:'Date.now used near security-token naming' };
+  return { emit:false, reason:'no-security-token-context' };
+}
+const VENDOR_PATH_RE = new RegExp([String.raw`jquery`,String.raw`underscore`,String.raw`backbone`,String.raw`lodash`,String.raw`vendor`,String.raw`node_modules`,String.raw`wp-includes`,String.raw`googletagmanager`,String.raw`gtag`,String.raw`plugins\/[^/]+\/assets\/js\/min`].join('|'),'i');
+function detectScope(filePath, opts={}) {
+  const p = String(filePath||'');
+  if (opts.strictVendor===false && opts.preferHost) {
+    const hostKey = String(opts.preferHost).toLowerCase().replace(/\./g,'_');
+    if (p.toLowerCase().includes(hostKey) && /themes\//i.test(p)) return 'first-party';
+  }
+  if (VENDOR_PATH_RE.test(p)) return 'vendor';
+  if (/\/themes\/[^/]+\/(?:js|assets)\//i.test(p)) return 'first-party';
+  return 'unknown';
+}
+function classifyScope(filePath, preferHost) { return detectScope(filePath, { preferHost }); }
+function enrichFinding(f, ctx={}) {
+  return { ...f, exploitability: f.exploitability||'needs-dataflow', scope: f.scope||classifyScope(ctx.filePath, ctx.preferHost), primitive: f.primitive||f.value||'unknown', evidence: f.evidence||{ snippet: f.context||'', matchedRule: f.id||'' } };
+}
+function capVendorSeverity(f) {
+  if (f.scope!=='vendor') return f;
+  const order=['info','low','medium','high','critical'];
+  const idx=order.indexOf(String(f.severity||'info').toLowerCase());
+  if (idx>2) return { ...f, severity:'medium', confidenceReason:(f.confidenceReason||'')+' [vendor-capped]' };
+  return f;
+}
+const SEV_W = { critical:10, high:6, medium:3, low:1, info:0 };
+const SCOPE_W = { 'first-party':1.0, unknown:0.6, vendor:0.25 };
+const EXP_W = { theoretical:0.3, 'needs-dataflow':0.5, likely:0.8, 'confirmed-pattern':1.0 };
+function scoreFindings(findings) {
+  let total=0; let firstPartyHigh=0;
+  for (const f of findings) {
+    const sev=SEV_W[String(f.severity||'info').toLowerCase()]??0;
+    const scope=SCOPE_W[f.scope||'unknown']??0.6;
+    const exp=EXP_W[f.exploitability||'needs-dataflow']??0.5;
+    const conf=typeof f.confidence==='number'?f.confidence:0.6;
+    total+=sev*scope*exp*conf;
+    if ((f.scope==='first-party') && (f.severity==='high'||f.severity==='critical') && conf>=0.8) firstPartyHigh++;
+  }
+  const score=Math.round(total);
+  let risk='LOW';
+  if (score>=80 && firstPartyHigh>=1) risk='CRITICAL';
+  else if (score>=50 || firstPartyHigh>=1) risk='HIGH';
+  else if (score>=20) risk='MEDIUM';
+  return { score, risk, firstPartyHigh };
+}
+function expandNdjson(ndjsonPath, opts={}) {
+  const skipRe = opts.skipUrlRegex ? new RegExp(opts.skipUrlRegex,'i') : null;
+  const prefer = opts.preferHost ? String(opts.preferHost).toLowerCase() : null;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(),'omega-ndjson-'));
+  const files=[];
+  let n=0;
+  for (const line of fs.readFileSync(ndjsonPath,'utf8').split('\n')) {
+    if (!line.trim()) continue;
+    let o; try { o=JSON.parse(line); } catch { continue; }
+    if (!o.content) continue;
+    if (skipRe && skipRe.test(o.url||'')) continue;
+    const base = String(o.url||'script').replace(/^https?:\/\//,'').replace(/[?#].*$/,'').replace(/[^a-zA-Z0-9._-]+/g,'_').slice(-120);
+    const fp = path.join(dir, `${String(n).padStart(3,'0')}_${base}.js`);
+    fs.writeFileSync(fp, o.content);
+    files.push({ path: fp, url: o.url||'', priority: prefer && String(o.url||'').toLowerCase().includes(prefer)?1:0 });
+    n++;
+  }
+  files.sort((a,b)=>b.priority-a.priority);
+  return { dir, files };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  ANGULAR IVY MAP — 110+ entries  (unchanged from OMEGA-1.0)
 // ═══════════════════════════════════════════════════════════════════════════
 const ANGULAR_IVY_MAP = {
@@ -1394,8 +1508,11 @@ function parseArgs() {
   if (!args.length || args[0] === '--help' || args[0] === '-h') {
     printHelp(); process.exit(0);
   }
+  let inputArg = args[0];
+  let startIdx = 1;
+  if (inputArg && inputArg.startsWith('--')) { inputArg = null; startIdx = 0; }
   const o = {
-    input: args[0],
+    input: inputArg,
     out: './omega_output',
     splitModules: false, beautify: true,
     secrets: false, routes: false, security: false,
@@ -1416,8 +1533,14 @@ function parseArgs() {
     treatTsAsJs: false,    // strip TypeScript annotations before analysis
     customRulesPath: null, // path to .omega-rules.json for pluggable rules
     decodeEsoteric: false, // opt-in esoteric decode (JSFuck/AAEncode/JJEncode)
+    ndjson: null,
+    preferHost: null,
+    skipUrlRegex: null,
+    strictVendor: false,
+    firstPartyHost: null,
+    firstPartyRoot: null,
   };
-  for (let i = 1; i < args.length; i++) {
+  for (let i = startIdx; i < args.length; i++) {
     switch (args[i]) {
       case '--out':           o.out          = args[++i]; break;
       case '--split-modules': o.splitModules = true;      break;
@@ -1448,6 +1571,12 @@ function parseArgs() {
     case '--treat-ts-as-js': o.treatTsAsJs    = true;      break;
     case '--custom-rules':   o.customRulesPath = args[++i]; break;
     case '--decode-esoteric': o.decodeEsoteric = true; break;
+    case '--ndjson':          o.ndjson       = args[++i]; break;
+    case '--prefer-host':     o.preferHost   = args[++i]; o.firstPartyHost = o.preferHost; break;
+    case '--first-party-host': o.firstPartyHost = args[++i]; o.preferHost = o.firstPartyHost; break;
+    case '--first-party-root': o.firstPartyRoot = args[++i]; break;
+    case '--skip-url-regex':  o.skipUrlRegex = args[++i]; break;
+    case '--strict-vendor':   o.strictVendor = true; break;
     case '--all':
         o.splitModules = o.secrets = o.routes = o.security =
         o.graph = o.report = o.ast = true; break;
@@ -1495,6 +1624,12 @@ function printHelp() {
   console.log('                     JJEncode) in an isolated worker — payload recovered');
   console.log('                     without execution and fed into the full pipeline;');
   console.log('                     writes <name>.decoded.js + decodeStats.esoteric');
+  console.log('  --ndjson <file>    EP-EXTRACTOR NDJSON input — expands url/content to temp .js');
+  console.log('  --prefer-host <h>  Prefer host for scope + sort (e.g. liteapks.com)');
+  console.log('  --first-party-host <h> Same as --prefer-host');
+  console.log('  --first-party-root <p> Root path hint for first-party detection');
+  console.log('  --skip-url-regex <re> Skip NDJSON entries matching URL regex');
+  console.log('  --strict-vendor    Do not cap vendor severity (default caps critical/high→medium)');
   console.log('  --multi            Cross-bundle analysis mode (comma-separated inputs)');
   console.log('');
   console.log('  CI exit codes (configure via OMEGA_FAIL_ON env var):');
@@ -4343,7 +4478,7 @@ function scanCredentials(src) {
 // ═══════════════════════════════════════════════════════════════════════════
 //  PHASE 12 — SECURITY ANALYSIS
 // ═══════════════════════════════════════════════════════════════════════════
-function analyseSecurity(src, maxHops) {
+function analyseSecurity(src, maxHops, opts={}) {
   const findings = [];
   const seen = new Set();
   const abortedPatterns = [];
@@ -4354,16 +4489,46 @@ function analyseSecurity(src, maxHops) {
       (m) => {
         const snippet = src.slice(Math.max(0, m.index-100), m.index+120);
         if (pat.ctx && !pat.ctx(snippet, src)) return;
+        if (pat.id==='rand-date-token') {
+          const cls = classifyDateNow(src, m.index);
+          if (!cls.emit) return;
+        }
         const value = (m[1] || m[0]).slice(0,100);
-        const key = `${pat.id}::${value}`;
+        let id = pat.id;
+        let cat = pat.cat;
+        let sev = pat.sev;
+        let exploitability = 'needs-dataflow';
+        let primitive = value;
+        if (pat.id==='xss-eval') {
+          const cls = classifyEvalAt(src, m.index);
+          if (cls.kind==='method-eval' && cls.subtype==='math-engine') {
+            id='code-eval-math-engine'; cat='Dynamic Code (library)'; sev='info'; exploitability='theoretical'; primitive=`${cls.callee}.eval`;
+          } else if (cls.kind==='method-eval') {
+            id='code-eval-method'; cat='Dynamic Code'; sev='medium'; exploitability='needs-dataflow'; primitive=`${cls.callee||'?'}.eval`;
+          } else if (cls.kind==='global-eval') {
+            id='code-eval-global'; cat='Dangerous API Calls'; sev='critical'; exploitability='needs-dataflow'; primitive=cls.callee||'eval';
+          }
+        }
+        if (pat.id==='xss-innerhtml') {
+          const after = src.slice(m.index, m.index+180);
+          const eqIdx = after.indexOf('=');
+          const rhs = eqIdx>=0 ? after.slice(eqIdx+1).split(';')[0].slice(0,120) : '';
+          const sc = scoreInnerHtmlAssignment('', rhs);
+          if (sc.severity==='info') { id='xss-innerhtml-benign'; cat='XSS'; sev='info'; exploitability='theoretical'; }
+          else if (sc.reason==='partial-html-highlight-without-full-escape') { exploitability='needs-dataflow'; sev='high'; }
+        }
+        if (pat.id.startsWith('redirect-')) {
+          const after = src.slice(m.index, m.index+300);
+          const c = classifyLocationAssign(after);
+          sev=c.severity; id=c.id; exploitability=c.exploitability;
+        }
+        const key = `${id}::${value}::${m.index}`;
         if (seen.has(key)) return;
         seen.add(key);
-        findings.push({
-          id: pat.id, category: pat.cat, severity: pat.sev,
-          value,
-          context: snippet.replace(/\n/g,' ').trim(),
-          pos: m.index,
-        });
+        let f={ id, category:cat, severity:sev, value, context:snippet.replace(/\n/g,' ').trim(), pos:m.index, confidence: sev==='critical'?0.85:sev==='high'?0.75:0.55, exploitability, primitive, evidence:{ snippet: snippet.replace(/\n/g,' ').trim(), matchedRule: pat.id } };
+        f = enrichFinding(f, { filePath: opts.filePath, preferHost: opts.preferHost });
+        f = capVendorSeverity(f);
+        findings.push(f);
       },
       (reason) => { abortedPatterns.push({ pattern: pat.id, reason }); }
     );
@@ -4373,6 +4538,7 @@ function analyseSecurity(src, maxHops) {
       id: 'scanner-abort', category: 'Scanner Abort', severity: 'info',
       value: `${a.pattern}: ${a.reason}`,
       context: 'Pattern iteration aborted — input may be hostile',
+      exploitability:'theoretical', scope:'unknown', primitive:'scanner',
     });
   }
   return findings.sort((a,b) => {
@@ -4508,6 +4674,7 @@ function scanBusinessLogic(src) {
 //  PHASE 12d — C2/C3: WEBSOCKET & SOCKET.IO CONTENT ANALYZER
 // ═══════════════════════════════════════════════════════════════════════════
 function scanWebSocketContent(src) {
+  if (!sourceHasWebSocketSurface(src)) return [];
   const findings = [];
   const ctx = (i, r=250) => src.slice(Math.max(0,i-r/2), i+r/2).replace(/\n/g,' ');
 
@@ -5898,9 +6065,10 @@ function tagLibraryFindings(findings, src) {
 //  PHASE 12n — B14: ATTACK SURFACE PRIORITISATION SCORER
 // ═══════════════════════════════════════════════════════════════════════════
 function scoreAttackSurface(allFindings, authSurface, routes, astContext) {
-  const weights = { critical:10, high:5, medium:2, low:1, info:0 };
+  const weights = SEV_W;
   let score = 0;
   const breakdown = {};
+  let firstPartyHigh = 0;
 
   // Cap low-severity hex-secret candidates at 20 pts to prevent lookup tables
   // (e.g., D3 color tables generating 100+ false hits) from inflating scores.
@@ -5910,7 +6078,13 @@ function scoreAttackSurface(allFindings, authSurface, routes, astContext) {
   for (const f of allFindings) {
     const sev = f.severity || f.sev || 'info';
     const cat = f.category || f.name || 'Unknown';
-    const w = weights[sev] || 0;
+    const baseW = weights[sev] || 0;
+    const scopeW = SCOPE_W[f.scope||'unknown'] ?? 0.6;
+    const expW = EXP_W[f.exploitability||'needs-dataflow'] ?? 0.5;
+    const conf = typeof f.confidence==='number'?f.confidence:0.6;
+    let w = Math.round(baseW * scopeW * expW * conf);
+    if (w<1 && baseW>0) w=1;
+    if ((f.scope==='first-party') && (sev==='high'||sev==='critical') && conf>=0.8) firstPartyHigh++;
     // Cap hex-secret contribution
     if ((f.name || '').includes('Hex secret') && sev === 'low') {
       if (++hexCandidates > HEX_LOW_CAP) continue;
@@ -6028,13 +6202,16 @@ function scoreAttackSurface(allFindings, authSurface, routes, astContext) {
     }
   }
 
-  const risk = score >= 80 ? 'CRITICAL' : score >= 40 ? 'HIGH' : score >= 15 ? 'MEDIUM' : 'LOW';
+  let risk='LOW';
+  if (score>=80 && firstPartyHigh>=1) risk='CRITICAL';
+  else if (score>=50 || firstPartyHigh>=1) risk='HIGH';
+  else if (score>=20) risk='MEDIUM';
   const topCategories = Object.entries(breakdown)
     .sort((a,b) => b[1]-a[1])
     .slice(0,5)
     .map(([cat,pts]) => `${cat} (${pts}pts)`);
 
-  return { score, risk, breakdown, topCategories, libraryType: libType, dangerMultiplier };
+  return { score, risk, breakdown, topCategories, libraryType: libType, dangerMultiplier, firstPartyHigh };
 }
 
 
@@ -7579,11 +7756,26 @@ async function main(externalOpts) {
     }
   }
 
+  // ── NDJSON input mode ─────────────────────────────────────────────────
+  let ndjsonMeta = null;
+  if (opts.ndjson) {
+    const ndPath = path.resolve(opts.ndjson);
+    if (!fs.existsSync(ndPath)) { console.error(fail(`NDJSON file not found: ${ndPath}`)); process.exit(1); }
+    const exp = expandNdjson(ndPath, { preferHost: opts.preferHost||opts.firstPartyHost, skipUrlRegex: opts.skipUrlRegex });
+    if (!exp.files.length) { console.error(fail(`NDJSON contained no script content`)); process.exit(1); }
+    ndjsonMeta = exp;
+    if (!opts.input) opts.input = exp.files[0].path;
+    if (!opts.quiet) console.log(ok(`NDJSON expanded ${exp.files.length} scripts → ${exp.dir} (preferHost=${opts.preferHost||'none'})`));
+    opts._ndjsonDir = exp.dir;
+    opts._ndjsonSourceUrl = exp.files[0].url || '';
+  }
+
   // ── Multi-bundle mode ──────────────────────────────────────────────────
   if (opts.multi) {
     return await runMultiBundle(opts);
   }
 
+  if (!opts.input) { console.error(fail('No input file provided (positional <file.js> or --ndjson)')); printHelp(); process.exit(1); }
   const inputPath = path.resolve(opts.input);
   if (!fs.existsSync(inputPath)) {
     console.error(fail(`File not found: ${inputPath}`)); process.exit(1);
@@ -7602,6 +7794,7 @@ async function main(externalOpts) {
   if (!opts.quiet) {
     console.log(`\n${C.bold}${C.cyan}JS Decoder OMEGA v5${C.reset} ${VERSION}`);
     console.log(info(`Input:  ${C.bold}${path.basename(inputPath)}${C.reset} (${(stat.size/1024).toFixed(1)} KB)`));
+    if (ndjsonMeta && ndjsonMeta.files[0] && ndjsonMeta.files[0].url) console.log(info(`Source URL: ${ndjsonMeta.files[0].url}`));
     console.log(info(`Output: ${C.bold}${outDir}${C.reset}`));
   }
 
@@ -7892,7 +8085,7 @@ async function main(externalOpts) {
   })();
 
   // Phase 12
-  const security = (opts.security || opts.report) ? analyseSecurity(src, opts.maxHops) : [];
+  const security = (opts.security || opts.report) ? analyseSecurity(src, opts.maxHops, { filePath: inputPath || opts.input, preferHost: opts.preferHost }) : [];
 
   if (process.env.OMEGA_PROFILE === '1') profileMark('security-regex');
 
@@ -8383,7 +8576,7 @@ async function main(externalOpts) {
     const p2 = decodeObfuscatorIo(src);
     const p2Elim = eliminateOpaquePredicates(p2.src);
     const p2Taint = scanTaintFlow(p2Elim.src);
-    const p2Sec = analyseSecurity(p2Elim.src, opts.maxHops);
+    const p2Sec = analyseSecurity(p2Elim.src, opts.maxHops, { filePath: opts.input, preferHost: opts.preferHost });
     const pool = [...security, ...credentials, ...extendedFindings, ...taintAll];
     const seen = new Set(pool.map(f => `${f.id}|${f.value}`));
     let merged = 0;
@@ -8450,9 +8643,16 @@ async function main(externalOpts) {
     structuralIndex, modernCrypto, networkSurface, callGraph, astFwFindings, bundlerInfo, webpackGraph,
     libraryType,
   } : null;
-  // Phase 12m2 — Confidence score each finding before aggregation
+  // Phase 12m2 — Confidence score each finding before aggregation + scope enrichment
   const allScored = [...credentials, ...security, ...extendedFindings];
   for (const f of allScored) {
+    if (!f.scope) f.scope = classifyScope(opts.input || inputPath, opts.preferHost || opts.firstPartyHost);
+    if (!f.exploitability) f.exploitability = 'needs-dataflow';
+    if (!f.primitive) f.primitive = f.value || f.id || 'unknown';
+    if (!f.evidence) f.evidence = { snippet: f.context || '', matchedRule: f.id || '' };
+    if (!opts.strictVendor && f.scope==='vendor') {
+      const before=f.severity; const capped=capVendorSeverity(f); if (capped.severity!==before) f.severity=capped.severity;
+    }
     if (!f.confidence) {
       const cs = scoreFindingConfidence(f);
       f.confidence = cs.confidence;
