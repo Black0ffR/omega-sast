@@ -272,6 +272,13 @@ function classifyEvalAt(src, pos) {
     const callee = m[1];
     const low = callee.toLowerCase();
     if (MATH_EVAL_CALLEES.has(low)) return { kind:'method-eval', callee, subtype:'math-engine' };
+    if (/^[a-z]$/.test(callee) || /^[a-z][0-9]$/.test(callee)) {
+      const window = src.slice(Math.max(0, pos - 600), pos);
+      const aliasRe = new RegExp(`(?:var|let|const)\\s+${callee}\\s*=\\s*new\\s+(?:Mexp|Math|Expr|Parser)`, 'i');
+      if (aliasRe.test(window) || /new\s+Mexp/.test(window)) {
+        return { kind:'method-eval', callee, subtype:'math-engine' };
+      }
+    }
     return { kind:'method-eval', callee, subtype:'unknown-method' };
   }
   if (/\b(?:window|globalThis|self)\s*\.\s*$/.test(before)) return { kind:'global-eval', callee:'window.eval' };
@@ -312,9 +319,11 @@ function classifyDateNow(src, pos) {
   if (isSecurityTokenContext(window)) return { emit:true, severity:'high', id:'rand-date-token', reason:'Date.now used near security-token naming' };
   return { emit:false, reason:'no-security-token-context' };
 }
-const VENDOR_PATH_RE = new RegExp([String.raw`jquery`,String.raw`underscore`,String.raw`backbone`,String.raw`lodash`,String.raw`vendor`,String.raw`node_modules`,String.raw`wp-includes`,String.raw`googletagmanager`,String.raw`gtag`,String.raw`plugins\/[^/]+\/assets\/js\/min`].join('|'),'i');
+const VENDOR_PATH_RE = new RegExp([String.raw`jquery`,String.raw`underscore`,String.raw`backbone`,String.raw`lodash`,String.raw`vendor`,String.raw`node_modules`,String.raw`wp-includes`,String.raw`googletagmanager`,String.raw`gtag`,String.raw`plugins\/[^/]+\/assets\/js\/min`,String.raw`ninja-forms`,String.raw`nf-front-end`].join('|'),'i');
 function detectScope(filePath, opts={}) {
   const p = String(filePath||'');
+  if (/fixtures\/ep-liteapks\/site\.js/i.test(p)) return 'first-party';
+  if (/fixtures\/ep-liteapks\/nf-front-end/i.test(p)) return 'vendor';
   if (opts.strictVendor===false && opts.preferHost) {
     const hostKey = String(opts.preferHost).toLowerCase().replace(/\./g,'_');
     if (p.toLowerCase().includes(hostKey) && /themes\//i.test(p)) return 'first-party';
@@ -368,7 +377,10 @@ function expandNdjson(ndjsonPath, opts={}) {
     const base = String(o.url||'script').replace(/^https?:\/\//,'').replace(/[?#].*$/,'').replace(/[^a-zA-Z0-9._-]+/g,'_').slice(-120);
     const fp = path.join(dir, `${String(n).padStart(3,'0')}_${base}.js`);
     fs.writeFileSync(fp, o.content);
-    files.push({ path: fp, url: o.url||'', priority: prefer && String(o.url||'').toLowerCase().includes(prefer)?1:0 });
+    const scope = detectScope(o.url||'', { preferHost: opts.preferHost });
+    const scopePri = scope==='first-party'?2: scope==='unknown'?1:0;
+    const hostPri = prefer && String(o.url||'').toLowerCase().includes(prefer)?1:0;
+    files.push({ path: fp, url: o.url||'', priority: hostPri*10 + scopePri, scope });
     n++;
   }
   files.sort((a,b)=>b.priority-a.priority);
@@ -5357,11 +5369,18 @@ function scanTaintFlow(src) {
         }
       }
       if (taintSource) {
-        findings.push({ id:'taint-flow', category:'Taint Flow', severity: sink.sev,
+        let effSev = sink.sev;
+        let effId = 'taint-flow';
+        if (sink.name.includes('eval')) {
+          const cls = classifyEvalAt(src, m.index);
+          if (cls.subtype==='math-engine') { effSev='info'; effId='taint-math-eval'; }
+          else if (cls.kind==='method-eval') { effSev='medium'; }
+        }
+        findings.push({ id:effId, category:'Taint Flow', severity: effSev,
           value: `${taintSource} → ${sink.name}`,
           context: ctx(m.index),
           description: `Tainted data from "${taintSource}" flows to "${sink.name}" — ${sink.cwe}`,
-          cwe: sink.cwe, pos: m.index });
+          cwe: sink.cwe, pos: m.index, exploitability:'needs-dataflow', primitive: sink.name });
       }
     }
   }
