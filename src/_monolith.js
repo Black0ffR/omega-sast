@@ -8535,12 +8535,13 @@ async function main(externalOpts) {
   const taintAll = [...taintFindings, ...astTaint];
 
   // ── Module-export taint findings — emit when a module exports tainted data ─
+  const taintedExportFindings = [];
   if (functionSummaries) {
     for (const sm of functionSummaries) {
       if (!sm.exports || sm.exports.length === 0) continue;
       for (const ex of sm.exports) {
         if (ex.via !== 'unknown') {
-          extendedFindings.push({
+          taintedExportFindings.push({
             id: 'tainted-export',
             category: 'Taint Flow',
             severity: 'high',
@@ -8576,6 +8577,7 @@ async function main(externalOpts) {
     ...constExprFindings,
     ...redosFindings,
     ...customFindings,
+    ...taintedExportFindings,
   ];
 
   // Phase 12n1 — Tag library-internal findings to reduce FP noise (uses
