@@ -29,7 +29,10 @@ jobs:
 
     - name: Run demo scan
       run: |
-        node bin/omega.js test/fixtures/sample-bundle.js --security --report --out /tmp/omega-ci
+        # sample-bundle.js is intentionally vulnerable, so a findings
+        # exit code (2/3/4/5) is expected. Only code 1 is a scanner error.
+        node bin/omega.js test/fixtures/sample-bundle.js --security --report --out /tmp/omega-ci; code=$?
+        if [ "$code" -eq 1 ]; then echo "scanner errored"; exit 1; fi
         test -f /tmp/omega-ci/report.json
         test -f /tmp/omega-ci/report.html
         test -f /tmp/omega-ci/report.md
