@@ -477,7 +477,7 @@ function buildStructuralIndex(src) {
       if (k2 >= M) continue;
       functions.push({
         name: nameTok ? nameTok.value : '<anonymous>',
-        start: t.start, end: T[k2].end,
+        start: t.start, end: T[k2] ? T[k2].end : t.end,
         paramsTokStart: paramsStart, paramsTokEnd: paramsEnd,
         bodyTokStart: bodyStart, bodyTokEnd: k2,
         isArrow: false,

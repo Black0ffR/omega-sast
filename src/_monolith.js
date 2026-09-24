@@ -2848,12 +2848,22 @@ function rc4Decrypt(ciphertext, key) {
   // obfuscator.io percent-encodes the raw bytes then calls decodeURIComponent
   // which collapses multi-byte UTF-8 sequences into single characters.
   // This changes the effective length of the string fed to RC4 XOR.
-  let uriStr = '';
-  for (let i = 0; i < rawBytes.length; i++) {
-    const code = rawBytes.charCodeAt(i);
-    uriStr += '%' + (code < 16 ? '0' : '') + code.toString(16);
+  //
+  // Modern obfuscator.io output sometimes contains non-UTF-8 byte sequences
+  // (raw bytes > 0x7F that don't form valid multi-byte UTF-8). When this
+  // happens, decodeURIComponent throws URIError. Fall back to operating
+  // on the raw bytes directly — RC4 XOR doesn't care about the encoding.
+  let decodedStr;
+  try {
+    let uriStr = '';
+    for (let i = 0; i < rawBytes.length; i++) {
+      const code = rawBytes.charCodeAt(i);
+      uriStr += '%' + (code < 16 ? '0' : '') + code.toString(16);
+    }
+    decodedStr = decodeURIComponent(uriStr);
+  } catch (_) {
+    decodedStr = rawBytes;
   }
-  const decodedStr = decodeURIComponent(uriStr);
   // Key scheduling
   const s = [];
   for (let i = 0; i < 256; i++) s[i] = i;
@@ -4553,10 +4563,58 @@ function analyseSecurity(src, maxHops, opts={}) {
       exploitability:'theoretical', scope:'unknown', primitive:'scanner',
     });
   }
+  collapseInnerHtmlByFunction(findings, src);
   return findings.sort((a,b) => {
     const order = {critical:0, high:1, medium:2, low:3, info:4};
     return (order[a.severity]||4) - (order[b.severity]||4);
   });
+}
+
+// ── innerHTML dedup by enclosing function ──────────────────────────────
+// Large libraries reuse `.innerHTML=` for rendering (apexcharts: 27 high,
+// clustered in tooltip/legend/series functions). Every match firing
+// independently drowns the report. Collapse same-function repeats into
+// ONE finding carrying repeatCount + mergedPositions — no data loss,
+// severity kept at max. Only xss-innerhtml/high participates; benign
+// info findings and other rules are untouched. Fail-open: any error
+// leaves findings uncollapsed.
+function collapseInnerHtmlByFunction(findings, src) {
+  const targets = findings.filter(f => f.id === 'xss-innerhtml' && f.severity === 'high');
+  if (targets.length < 2) return;
+  let index = null;
+  try {
+    if (!ast || typeof ast.buildStructuralIndex !== 'function') return;
+    index = ast.buildStructuralIndex(src);
+  } catch (_) { return; }
+  const funcs = (index && index.functions) || [];
+  if (!funcs.length) return;
+  const keyOf = (pos) => {
+    let best = null;
+    for (const fn of funcs) {
+      if (fn.start <= pos && pos <= fn.end && (!best || (fn.end - fn.start) < (best.end - best.start))) best = fn;
+    }
+    return best ? `fn:${best.name}:${best.start}` : `<top>:${Math.floor(pos / 4096)}`;
+  };
+  const groups = new Map();
+  for (const f of targets) {
+    const k = keyOf(f.pos || 0);
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(f);
+  }
+  const drop = new Set();
+  for (const [, g] of groups) {
+    if (g.length < 2) continue;
+    g.sort((a, b) => (a.pos || 0) - (b.pos || 0));
+    const keep = g[0];
+    keep.repeatCount = g.length;
+    keep.mergedPositions = g.map(f => f.pos);
+    keep.description = (keep.description || '') + ` [${g.length} innerHTML assignments in same function — showing first]`;
+    for (let i = 1; i < g.length; i++) drop.add(g[i]);
+  }
+  if (!drop.size) return;
+  for (let i = findings.length - 1; i >= 0; i--) {
+    if (drop.has(findings[i])) findings.splice(i, 1);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -5356,10 +5414,15 @@ function scanTaintFlow(src) {
               (HTTP_VERB.test(parts[0]) || /method/i.test(parts[0]))) continue;
         }
       }
-      // Check if any tainted variable appears in sink context
+      // Check if any tainted variable appears in sink context.
+      // Must be an identifier-boundary match: plain substring includes()
+      // fires on any window containing the letters (e.g. tainted var `n`
+      // matches every 120-char window containing the letter "n" — 19
+      // critical FPs on echarts.min.js). Identifier chars are [A-Za-z0-9_$].
       let taintSource = null;
       for (const v of taintedVars) {
-        if (after.includes(v)) { taintSource = v; break; }
+        const esc = v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        if (new RegExp('(^|[^A-Za-z0-9_$])' + esc + '(?![A-Za-z0-9_$])').test(after)) { taintSource = v; break; }
       }
       // Also check for direct source patterns in sink context
       if (!taintSource) {
@@ -8528,6 +8591,33 @@ async function main(externalOpts) {
     }
     if (opts.verbose && beforeCount !== taintFindings.length) {
       console.log(info(`  Taint dedup: removed ${beforeCount - taintFindings.length} regex duplicates also found by AST`));
+    }
+    // Demote uncorroborated single-letter-var regex findings: minified
+    // bundles reuse one-letter names in every scope, so a tainted `n`
+    // (e.g. `var n=e.data` — chart domain data, not untrusted input)
+    // collides with unrelated locals at sink sites (`n=t.top-s` SVG
+    // coordinates → 8 critical FPs on echarts.min.js). The AST tracker
+    // is scope-aware; when it corroborates nothing for the same sink,
+    // cap the heuristic finding at medium instead of dropping it
+    // (dropping would hide true positives where AST has false negatives).
+    // Direct named sources (`URL parameter → X`) are never demoted.
+    {
+      const astSinks = new Set();
+      for (const f of astTaint) {
+        astSinks.add((f.value || '').split('→').pop().trim());
+      }
+      for (const f of taintFindings) {
+        const parts = (f.value || '').split('→');
+        if (parts.length < 2) continue;
+        const srcSide = parts[0].trim();
+        const sinkName = parts[1].trim();
+        if (/^[A-Za-z_$]$/.test(srcSide) && !astSinks.has(sinkName)) {
+          if (f.severity === 'critical' || f.severity === 'high') {
+            f.severity = 'medium';
+            f.description = (f.description || '') + ' [demoted: single-letter heuristic source, no AST corroboration]';
+          }
+        }
+      }
     }
   }
 

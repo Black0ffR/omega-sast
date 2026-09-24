@@ -1,6 +1,6 @@
 # OMEGA-5.0 — Zero-Dependency JavaScript SAST Engine
 
-[![Test Suite](https://img.shields.io/badge/tests-727%20passing-brightgreen)](test/)
+[![Test Suite](https://img.shields.io/badge/tests-762%20passing-brightgreen)](test/)
 [![Zero Deps](https://img.shields.io/badge/dependencies-0-success)](package.json)
 [![Ongoing Fixes](https://img.shields.io/badge/fixes-P0--P3%20complete-blue)](OMEGA-SAST-FIX-PLAN-R3.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -32,7 +32,7 @@ OMEGA-5.0 analyzes a JavaScript bundle in 20 phases:
 | 1 | Escape decode | Unicode/hex/octal/HTML-entity |
 | 2 | String decode | fromCharCode, atob, base64, hex arrays (10-pass) |
 | 2b | CharCode decoder | Juice-Shop-style IIFE obfuscation |
-| 2c | obfuscator.io decoder | String-array rotation + RC4/base64 + brute-force fallback; multi-layer pass-through + swapped-arg/double-neg wrapper inlining |
+| 2c | obfuscator.io decoder | String-array rotation + RC4/base64 (raw-bytes fallback on non-UTF-8 output) + brute-force fallback; multi-layer pass-through + swapped-arg/double-neg wrapper inlining |
 | 2d | Constant evaluator | Safe partial evaluator for runtime strings |
 | 2e | Esoteric decode | Opt-in JSFuck/AAEncode/JJEncode payload recovery (`--decode-esoteric`, sandboxed, no execution) |
 | 3-6 | Normalization | Booleans, webpack cleanup, Angular Ivy, RxJS |
@@ -80,7 +80,7 @@ Fingerprints obfuscator.io, JSFuck, AAEncode, JJEncode, and packers from structu
 
 ### Interpreting findings on framework internals
 
-- **`innerHTML`/DOM sinks inside framework internals** (Angular sanitizer-wrapped bindings, Vue `v-html`, DOMPurify, jQuery, preact) are *technically correct attack-surface call-outs* but usually sanitizer-wrapped: triage by checking whether user input can reach the sink un-sanitized, not by the flag alone. `bypassSecurityTrust*` findings are the real danger signals (they disable Angular's sanitizer).
+- **`innerHTML`/DOM sinks inside framework internals** (Angular sanitizer-wrapped bindings, Vue `v-html`, DOMPurify, jQuery, preact) are *technically correct attack-surface call-outs* but usually sanitizer-wrapped: triage by checking whether user input can reach the sink un-sanitized, not by the flag alone. `bypassSecurityTrust*` findings are the real danger signals (they disable Angular's sanitizer). Repeated assignments inside one function collapse into a single finding carrying `repeatCount` + `mergedPositions` — expand those positions before dismissing the group.
 - **Info Leakage on library error paths** (`console.error(e)`, `e.stack` in error formatting) is standard library practice; only the exposure-gated findings (console/alert/DOM/network) are reported (review R3).
 - **Broken Crypto `Math.random().toString(36)`** fires only in security-token contexts (token/nonce/csrf/session/secret/password/otp/salt/hash/crypto/auth) (review R2) — internal ID generation is not flagged.
 - **`new Function(` / `eval(`** in libraries is usually a real code-exec risk: underscore's `_.template()` and D3's compiled accessors are documented cases worth an explicit look.
@@ -160,7 +160,7 @@ into 2 alternation passes (`annotateAngularIvy`) — angular total dropped
 717/717 tests). **R4.5:** the angular classifier signature now requires a word
 boundary (`\bng\.`) so `objectToString.call` / `String.fromCharCode` ("…String.")
 no longer match the `ng.` substring — lodash-debounce/backbone reclassify
-ui-framework → utility, chart/marked → general (722/722 tests). **R4.6:** the jQuery framework fingerprint now requires strong markers (uniqueMarkers: `$(document)`, `jQuery.fn`, `jQuery.*` API calls, `/*! jQuery v` banner) — lodash-debounce’s doc-comment example `jQuery(window).on(...)` no longer fingerprints it as jQuery, and the real minified jquery-3.7.1 bundle is now detected via its version banner (727/727 tests).
+ui-framework → utility, chart/marked → general (722/722 tests). **R4.6:** the jQuery framework fingerprint now requires strong markers (uniqueMarkers: `$(document)`, `jQuery.fn`, `jQuery.*` API calls, `/*! jQuery v` banner) — lodash-debounce’s doc-comment example `jQuery(window).on(...)` no longer fingerprints it as jQuery, and the real minified jquery-3.7.1 bundle is now detected via its version banner (727/727 tests). **Follow-up fixes (762/762 tests):** the RC4 decoder falls back to raw bytes when obfuscator.io output is not valid UTF-8 (`decodeURIComponent` no longer throws away the decode); regex taint matches tainted variables on identifier boundaries and uncorroborated single-letter-var findings are demoted to medium when the AST tracker finds no corroborating flow (echarts 19 criticals → 1 high + 8 medium, no finding dropped); same-function `innerHTML` repeats collapse into one finding with `repeatCount` + `mergedPositions` (apexcharts 27 high → 16 findings, severity kept).
 
 ## CLI Usage
 
@@ -268,22 +268,23 @@ omega-sast/
 ├── test/
 │   ├── run-all.js            # Test runner
 │   ├── test-harness.js       # Core AST tests (89)
-│   ├── test-tokenizer.js     # Tokenizer edge cases (73)
+│   ├── test-tokenizer.js     # Tokenizer edge cases (77)
 │   ├── test-beautifier.js    # Beautifier tests (11)
-│   ├── test-summaries.js     # Function summary tests (52)
-│   ├── test-obfuscator.js    # Obfuscator fingerprint tests (45)
+│   ├── test-summaries.js     # Function summary tests (53)
+│   ├── test-obfuscator.js    # Obfuscator fingerprint tests (57)
 │   ├── test-stage7.js        # Destructuring/VRT/expander tests (52)
 │   ├── test-regex-audit.js   # Regex audit regression tests (20)
-│   ├── test-sourcemap.js     # Source map parser tests (28)
+│   ├── test-sourcemap.js     # Source map parser tests (40)
 │   ├── test-charcode.js      # CharCode decoder tests (15)
 │   ├── test-redos.js         # ReDoS protection tests (10)
+│   ├── test-redos-detector.js # ReDoS detector tests (8)
 │   ├── test-arrow-functions.js # Arrow function tests (19)
 │   ├── test-corpus.js          # Bundle corpus regression (51)
 │   ├── test-getter-function-detection.js # Getter detection (15)
 │   ├── test-verification-issues.js # FP-fix + RC4 + cmd-injection tests (73)
 │   ├── test-esoteric.js           # Esoteric decode tests (30)
+│   ├── test-ep-liteapks.js        # Lite-APK extraction tests (9)
 │   ├── test-csrf.js               # CSRF analyzer tests (41)
-│   ├── test-sourcemap.js          # Source map parser tests (40)
 │   ├── test-open-disambiguation.js # fs.open vs XHR vs window.open (9)
 │   ├── test-math-random-context.js # rand-math-token security-context disambiguation (5)
 │   ├── test-stack-trace-context.js # err-stacktrace exposure-context gate (5)
@@ -291,6 +292,9 @@ omega-sast/
 │   ├── test-classify-library.js   # classifyLibrary: lodash-before-jQuery ordering (5)
 │   ├── test-classify-angular.js   # classifyLibrary: angular word-boundary rule (\bng\.) (5)
 │   ├── test-frameworks-jquery.js  # jQuery fingerprint strong markers (5)
+│   ├── test-modern-obf-fingerprint.js # Modern obfuscator.io synthesis-bridge regression (10)
+│   ├── test-taint-single-letter.js    # Taint single-letter-var boundary + demotion (5)
+│   ├── test-innerhtml-dedup.js        # innerHTML same-function collapse (5)
 │   └── fixtures/
 │       └── sample-bundle.js  # Test fixture
 ├── bundles/                    # 21 real-world library bundles (regression corpus)
@@ -308,7 +312,7 @@ omega-sast/
 ## Test Suite
 
 ```bash
-# Run all 727 tests (100% pass rate)
+# Run all 762 tests (100% pass rate)
 npm test
 
 # Run individual suites
