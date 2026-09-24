@@ -1061,6 +1061,11 @@ section('3.3 Brute-force rotation: returns non-null for base64 sample');
   ].join('\n');
   const m = OMEGA_SRC.match(/function rotateBruteForce\s*\([^)]*\)\s*\{[\s\S]*?\n\}/);
   if (!m) { assert('rotateBruteForce extractable', false); return; }
+  // rotateBruteForce calls the obfuscator-alphabet base64 helper — eval it
+  // into scope too (it is self-contained by design).
+  const h = OMEGA_SRC.match(/function obfBase64Decode\s*\([^)]*\)\s*\{[\s\S]*?\n\}/);
+  if (!h) { assert('obfBase64Decode extractable', false); return; }
+  const obfBase64Decode = eval('(' + h[0] + ')');
   const fn = eval('(' + m[0] + ')');
   const sa = { strings: rotated, length: rotated.length, name: '_0xARR' };
   const best = fn(src, sa, 'D', 'a', 'b', 0, false, true, false);

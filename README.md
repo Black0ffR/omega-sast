@@ -1,6 +1,6 @@
 # OMEGA-5.0 — Zero-Dependency JavaScript SAST Engine
 
-[![Test Suite](https://img.shields.io/badge/tests-762%20passing-brightgreen)](test/)
+[![Test Suite](https://img.shields.io/badge/tests-767%20passing-brightgreen)](test/)
 [![Zero Deps](https://img.shields.io/badge/dependencies-0-success)](package.json)
 [![Ongoing Fixes](https://img.shields.io/badge/fixes-P0--P3%20complete-blue)](OMEGA-SAST-FIX-PLAN-R3.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -160,7 +160,7 @@ into 2 alternation passes (`annotateAngularIvy`) — angular total dropped
 717/717 tests). **R4.5:** the angular classifier signature now requires a word
 boundary (`\bng\.`) so `objectToString.call` / `String.fromCharCode` ("…String.")
 no longer match the `ng.` substring — lodash-debounce/backbone reclassify
-ui-framework → utility, chart/marked → general (722/722 tests). **R4.6:** the jQuery framework fingerprint now requires strong markers (uniqueMarkers: `$(document)`, `jQuery.fn`, `jQuery.*` API calls, `/*! jQuery v` banner) — lodash-debounce’s doc-comment example `jQuery(window).on(...)` no longer fingerprints it as jQuery, and the real minified jquery-3.7.1 bundle is now detected via its version banner (727/727 tests). **Follow-up fixes (762/762 tests):** the RC4 decoder falls back to raw bytes when obfuscator.io output is not valid UTF-8 (`decodeURIComponent` no longer throws away the decode); regex taint matches tainted variables on identifier boundaries and uncorroborated single-letter-var findings are demoted to medium when the AST tracker finds no corroborating flow (echarts 19 criticals → 1 high + 8 medium, no finding dropped); same-function `innerHTML` repeats collapse into one finding with `repeatCount` + `mergedPositions` (apexcharts 27 high → 16 findings, severity kept).
+ui-framework → utility, chart/marked → general (722/722 tests). **R4.6:** the jQuery framework fingerprint now requires strong markers (uniqueMarkers: `$(document)`, `jQuery.fn`, `jQuery.*` API calls, `/*! jQuery v` banner) — lodash-debounce’s doc-comment example `jQuery(window).on(...)` no longer fingerprints it as jQuery, and the real minified jquery-3.7.1 bundle is now detected via its version banner (727/727 tests). **Follow-up fixes:** the RC4 decoder falls back to raw bytes when obfuscator.io output is not valid UTF-8 (`decodeURIComponent` no longer throws away the decode); regex taint matches tainted variables on identifier boundaries and uncorroborated single-letter-var findings are demoted to medium when the AST tracker finds no corroborating flow (echarts 19 criticals → 1 high + 8 medium, no finding dropped); same-function `innerHTML` repeats collapse into one finding with `repeatCount` + `mergedPositions` (apexcharts 27 high → 16 findings, severity kept). **Decoder stack (767/767 tests):** lowercase-first base64 alphabet support with body-evidence ordering, identifier-boundary RC4 key-use check, alias-chain fixpoint, self-reassigning getter linkage with tier-3 impostor rejection, and bracket-notation taint sources/sinks in the AST tracker (real 5.8.0 high-preset bundle: 0 → 35 strings decoded, both credentials + hash→innerHTML taint recovered).
 
 ## CLI Usage
 
@@ -295,6 +295,7 @@ omega-sast/
 │   ├── test-modern-obf-fingerprint.js # Modern obfuscator.io synthesis-bridge regression (10)
 │   ├── test-taint-single-letter.js    # Taint single-letter-var boundary + demotion (5)
 │   ├── test-innerhtml-dedup.js        # innerHTML same-function collapse (5)
+│   ├── test-obfio-modern-shapes.js    # Real-5.8.0 decoder shapes: alphabet, alias chains, self-reassigning getter, tier-3 gate (5)
 │   └── fixtures/
 │       └── sample-bundle.js  # Test fixture
 ├── bundles/                    # 21 real-world library bundles (regression corpus)
@@ -312,7 +313,7 @@ omega-sast/
 ## Test Suite
 
 ```bash
-# Run all 762 tests (100% pass rate)
+# Run all 767 tests (100% pass rate)
 npm test
 
 # Run individual suites

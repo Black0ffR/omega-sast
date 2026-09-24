@@ -1480,7 +1480,26 @@ function trackTaintAST(src, structuralIndex, callGraph) {
       }
     }
   }
-  // Deduplicate
+  // Bracket-notation sources: X['data'|'cookie'] and
+  // location|document|window['hash'|'search'|'href'|'cookie'|'URL'|'referrer'].
+  // Decoders emit bracket access (c['data']), which the dotted scan above
+  // misses — the WebSocket→innerHTML flow in decoded bundles was invisible.
+  for (let k = 0; k < M - 3; k++) {
+    if (T[k].type === 'ident' && T[k+1].type === 'punct' && T[k+1].value === '[' &&
+        T[k+2].type === 'string' && T[k+3].type === 'punct' && T[k+3].value === ']') {
+      const base = T[k].value, prop = T[k+2].value;
+      const expr = `${base}['${prop}']`;
+      if (prop === 'data') {
+        sources.push({ tokenIdx: k, expr, name: 'postMessage/WebSocket data (bracket)', kind: 'member' });
+      } else if (prop === 'cookie') {
+        sources.push({ tokenIdx: k, expr, name: 'cookie (bracket)', kind: 'member' });
+      } else if ((base === 'location' || base === 'document' || base === 'window') &&
+                 ['hash','search','href','URL','referrer'].includes(prop)) {
+        sources.push({ tokenIdx: k, expr, name: 'Browser location/document (bracket)', kind: 'member' });
+      }
+    }
+  }
+  // Deduplicate sources (same expr+position pushed twice)
   const sourcesSeen = new Set();
   const sourcesDedup = [];
   for (const s of sources) {
@@ -1516,6 +1535,19 @@ function trackTaintAST(src, structuralIndex, callGraph) {
           meta:     ASSIGN_SINK_PROPS[propName],
         });
       }
+    }
+    // bracket form: ... ['innerHTML'|'outerHTML'|'srcdoc'] = ...
+    // (decoder output uses brackets: x['innerHTML'] = d)
+    if (T[k].type === 'string' && ASSIGN_SINK_PROPS[T[k].value] &&
+        T[k-1] && T[k-1].type === 'punct' && T[k-1].value === '[' &&
+        T[k+1] && T[k+1].type === 'punct' && T[k+1].value === ']' &&
+        T[k+2] && T[k+2].type === 'punct' && T[k+2].value === '=') {
+      sinks.push({
+        startPos: T[k-1].start,
+        endPos:   T[k+2].end,
+        callee:   { kind:'ident', text: 'bracket.' + T[k].value },
+        meta:     ASSIGN_SINK_PROPS[T[k].value],
+      });
     }
   }
   // Also add existing call sinks

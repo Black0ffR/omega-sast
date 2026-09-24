@@ -2083,15 +2083,28 @@ function decodeObfuscatorIo(src) {
     // ── Step 1b: detect getter functions wrapping string arrays ────────────
     // obfuscator.io often wraps the string array in a zero-arg getter:
     //   function GETTER() { const ARR = [...]; return ARR; }
+    // 5.8.0 high preset uses a SELF-REASSIGNING getter instead:
+    //   function a(){ var t=[...]; a=function(){return t;}; return a(); }
     // The decoder then calls GETTER() and indexes a LOCAL variable.
     for (const sa of stringArrays) {
       const getterRe = new RegExp(
         `function\\s+([A-Za-z_$][\\w$]*)\\s*\\(\\s*\\)\\s*\\{[\\s\\S]{0,5000}?\\b(?:const|let|var)\\s+${sa.name}\\s*=\\s*\\[[\\s\\S]{0,5000}?\\breturn\\s+${sa.name}\\s*;?\\s*\\}`,
         'g'
       );
-      const gm = getterRe.exec(src);
-      if (gm) {
-        sa.getterName = gm[1];
+      // NOTE: self-reassigning shape is tried FIRST — the plain pattern's
+      // lazy span can start at an earlier zero-arg function and stretch
+      // across function boundaries to a later array (e.g. matched
+      // renderWelcome instead of a on 5.8.0 output). Specific first.
+      const selfReRe = new RegExp(
+        `function\\s+([A-Za-z_$][\\w$]*)\\s*\\(\\s*\\)\\s*\\{[\\s\\S]{0,5000}?\\b(?:const|let|var)\\s+${sa.name}\\s*=\\s*\\[[\\s\\S]{0,5000}?\\1\\s*=\\s*function\\s*\\(\\s*\\)\\s*\\{[\\s\\S]{0,200}?\\breturn\\s+${sa.name}\\s*;?\\s*\\}[\\s\\S]{0,500}?\\breturn\\s+\\1\\s*\\(\\s*\\)\\s*;?\\s*\\}`,
+        'g'
+      );
+      const sm = selfReRe.exec(src);
+      if (sm) {
+        sa.getterName = sm[1];
+      } else {
+        const gm = getterRe.exec(src);
+        if (gm) sa.getterName = gm[1];
       }
     }
   
@@ -2176,12 +2189,17 @@ function decodeObfuscatorIo(src) {
         `function\\s+([A-Za-z_$][\\w$]*)\\s*\\(\\s*[A-Za-z_$][\\w$]*\\s*,\\s*[A-Za-z_$][\\w$]*\\s*\\)\\s*\\{[\\s\\S]{0,800}?${sa.name}\\[\\s*[A-Za-z_$][\\w$]*\\s*\\][\\s\\S]{0,800}?\\}`,
         'g'
       );
-      // Collect matches from strict first, then fallback to broad
+      // Collect matches from strict first, then fallback to broad.
+      // Strict/broad carry a literal ARRAY[idx] reference — strong shape
+      // evidence, no content check needed (plain decoders have no
+      // transform markers at all). Tier-3 (getter + local index) is
+      // loose enough to catch app code, so those are tagged for gating.
       const decoderMatches = [];
+      const tier3Names = new Set();
       let dm;
-      while ((dm = decoderReStrict.exec(src)) !== null) decoderMatches.push(dm);
+      while ((dm = decoderReStrict.exec(src)) !== null) { decoderMatches.push(dm); }
       if (decoderMatches.length === 0) {
-        while ((dm = decoderReBroad.exec(src)) !== null) decoderMatches.push(dm);
+        while ((dm = decoderReBroad.exec(src)) !== null) { decoderMatches.push(dm); }
       }
       // Tier 3: getter-based fallback — decoder indexes a local variable
       // that was populated by calling the getter function.
@@ -2191,7 +2209,16 @@ function decodeObfuscatorIo(src) {
           `function\\s+([A-Za-z_$][\\w$]*)\\s*\\(\\s*([A-Za-z_$][\\w$]*)\\s*,\\s*([A-Za-z_$][\\w$]*)\\s*\\)\\s*\\{[\\s\\S]{0,800}?${sa.getterName}\\s*\\(\\s*\\)[\\s\\S]{0,200}?[A-Za-z_$][\\w$]*\\[\\s*\\2\\s*\\][\\s\\S]{0,800}?\\}`,
           'g'
         );
-        while ((dm = decoderReGetter.exec(src)) !== null) decoderMatches.push(dm);
+        // Overlapping scan: a false-positive early match (e.g. app code)
+        // would otherwise CONSUME the span hiding the true decoder later
+        // in the file. Advance by 1 char so nested/later functions are
+        // still candidates; the content gate below rejects the impostors.
+        while ((dm = decoderReGetter.exec(src)) !== null) {
+          tier3Names.add(dm[1]);
+          decoderMatches.push(dm);
+          decoderReGetter.lastIndex = dm.index + 1;
+          if (decoderMatches.length > 50) break;
+        }
       }
       // De-duplicate by function name
       const seenNames = new Set();
@@ -2209,6 +2236,43 @@ function decodeObfuscatorIo(src) {
         if (idx0 !== -1) {
           const end = _findMatchingBrace(src, dm.index + idx0 + 1);
           body = src.slice(dm.index, end + 1);
+        }
+        // Content gate (tier-3 only): a real decoder transforms the entry
+        // (charCodeAt / fromCharCode / atob / decodeURIComponent / charAt
+        // loop). Without it, any 2-param function that happens to call the
+        // getter and index a local (e.g. app code `login(c,d)`) false-matches
+        // — and a single early false match CONSUMES the span hiding the true
+        // decoder later in the file. Strict/broad matches carry a literal
+        // ARRAY[idx] reference and skip this gate (plain decoders have no
+        // transform markers).
+        // Content gate (tier-3 only): the loose getter+local-index shape
+        // also matches app code (e.g. `login(c,d)` calling the getter).
+        // Accept when the body EITHER transforms the entry (charCodeAt /
+        // fromCharCode / atob / decodeURIComponent / charAt loop) OR
+        // returns the getter-fed local directly
+        // (`var l = GETTER(); ... return l[idx]`, incl. via a temp:
+        // `var f = e[c]; return f;`) — the plain-decoder shapes.
+        // Strict/broad matches carry a literal ARRAY[idx] reference and
+        // skip this gate entirely.
+        if (tier3Names.has(decName)) {
+          const transforms = /charCodeAt|fromCharCode|\batob\s*\(|decodeURIComponent|charAt/.test(body);
+          let returnsIndexedLocal = false;
+          if (!transforms && typeof idxParam === 'string' && sa.getterName) {
+            const escIdx = idxParam.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const escG = sa.getterName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const fedRe = new RegExp(`(?:var|let|const)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*${escG}\\s*\\(\\s*\\)`);
+            const fed = body.match(fedRe);
+            if (fed) {
+              const escFed = fed[1].replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+              // direct: return l[idx] — or via temp: var f = l[idx]; ... return f
+              returnsIndexedLocal =
+                new RegExp(`return\\s+${escFed}\\s*\\[\\s*${escIdx}\\s*\\]`).test(body) ||
+                new RegExp(`(?:var|let|const)\\s+[A-Za-z_$][\\w$]*\\s*=\\s*${escFed}\\s*\\[\\s*${escIdx}\\s*\\][\\s\\S]{0,300}?return\\s+[A-Za-z_$][\\w$]*\\s*;?\\s*\\}`).test(body);
+            }
+          }
+          if (!transforms && !returnsIndexedLocal) {
+            continue;
+          }
         }
   
         // Detect built-in base offset: idxParam = idxParam OP BASE
@@ -2250,11 +2314,32 @@ function decodeObfuscatorIo(src) {
           }
         }
   
-        // Determine decoder type
+        // Determine decoder type.
+        // isRC4 must see the KEY PARAM actually used, not merely present:
+        // mangled presets use single-letter params (`d`), and substring
+        // includes() matches every body containing that letter (e.g. a
+        // pure-base64 decoder misclassified as RC4 -> 0 strings decoded
+        // on real 5.8.0 output). Strip the signature, then require an
+        // identifier-boundary use of the key (RC4 templates feed it to
+        // charCodeAt/XOR key scheduling).
         const hasCA = body.includes('charCodeAt');
         const hasFC = body.includes('fromCharCode');
-        const isRC4 = hasCA && hasFC && body.includes(keyParam);
-        const isBase64 = /atob\s*\(/.test(body) && !isRC4;
+        // NOTE: broad-regex matches carry no idx/key groups (dm[2]/dm[3]
+        // undefined) — legacy includes(undefined) was silently false, so
+        // keep keyUsed false there too instead of throwing on .replace.
+        const escKey = typeof keyParam === 'string' ? keyParam.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') : null;
+        const bodyNoSig = body.replace(/^[^{]*\{/, '');
+        const keyUsed = escKey ? new RegExp('(^|[^A-Za-z0-9_$])' + escKey + '(?![A-Za-z0-9_$])').test(bodyNoSig) : false;
+        const isRC4 = hasCA && hasFC && keyUsed;
+        // Base64 idiom is wider than atob(): obfuscator.io's template does
+        // a custom charAt loop + percent-encode + decodeURIComponent with
+        // no atob call anywhere. Treat that as base64 too.
+        const isBase64 = (/atob\s*\(/.test(body) || /decodeURIComponent/.test(body)) && !isRC4;
+        // Alphabet choice for the base64 branch: the obfuscator.io template
+        // embeds its lowercase-first alphabet literally; atob-style decoders
+        // don't. Guessing wrong yields printable garbage that the guard
+        // accepts, so decide from the body, not from printability.
+        sa.b64Std = isBase64 && !/abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ/.test(body);
         const isPlain = !isRC4 && !isBase64;  // just array indexing, no transform
   
         if (!isRC4 && !isBase64 && !isPlain) continue;
@@ -2515,16 +2600,28 @@ function decodeObfuscatorIo(src) {
         // obfuscator.io creates var ALIAS = decName inside functions, then
         // all call sites use ALIAS instead of decName. We detect these aliases
         // so Step 4 can match both the original and alias names.
-        const aliasRe = new RegExp(
-          `(?:,\\s*|(?:var|const|let)\\s+)([A-Za-z_$][\\w$]*)\\s*=\\s*${decName}\\b`,
-          'g'
-        );
+        // Fixpoint: aliases chain (var j = i where i is itself an alias),
+        // which single-level matching misses on real 5.8.0 output.
+        const escId = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         const aliases = new Set();
         let am;
-        while ((am = aliasRe.exec(src)) !== null) {
-          const nextCh = src[am.index + am[0].length];
-          if (nextCh === '[' || nextCh === '.') continue;
-          aliases.add(am[1]);
+        {
+          const known = new Set([decName]);
+          for (let round = 0; round < 5; round++) {
+            let added = false;
+            for (const nm of known) {
+              const re = new RegExp(
+                `(?:,\\s*|(?:var|const|let)\\s+)([A-Za-z_$][\\w$]*)\\s*=\\s*${escId(nm)}\\b`,
+                'g'
+              );
+              while ((am = re.exec(src)) !== null) {
+                const nextCh = src[am.index + am[0].length];
+                if (nextCh === '[' || nextCh === '.') continue;
+                if (!known.has(am[1])) { known.add(am[1]); aliases.add(am[1]); added = true; }
+              }
+            }
+            if (!added) break;
+          }
         }
         for (const alias of aliases) {
           decoderMap.set(alias, { sa, isRC4, isBase64, isPlain, baseOffset });
@@ -2661,7 +2758,7 @@ function decodeObfuscatorIo(src) {
               if (isPlain) {
                 decoded = raw;
               } else if (isBase64) {
-                decoded = Buffer.from(raw, 'base64').toString('utf8');
+                decoded = obfBase64Decode(raw, sa.b64Std);
               } else if (isRC4) {
                 decoded = rc4Decrypt(raw, key);
               }
@@ -2721,7 +2818,7 @@ function decodeObfuscatorIo(src) {
             let raw = sa.strings[adjustedIdx];
             if (Array.isArray(raw)) { rawSet = raw; raw = raw[0]; }
             if (isPlain) decoded = raw;
-            else if (isBase64) decoded = Buffer.from(raw, 'base64').toString('utf8');
+            else if (isBase64) decoded = obfBase64Decode(raw, sa.b64Std);
             else if (isRC4) decoded = rc4Decrypt(raw, key);
           } catch (_) { return full; }
           if (typeof decoded !== 'string') return full;
@@ -2885,6 +2982,41 @@ function rc4Decrypt(ciphertext, key) {
   return result;
 }
 
+// ── obfuscator.io base64 (custom alphabet) ─────────────────────────────
+// obfuscator.io ≥5 templates use a lowercase-first alphabet
+// (a-zA-Z0-9+/=), NOT RFC 4648 (A-Za-z0-9+/=). Node's Buffer decodes the
+// wrong alphabet into garbage that the printability guard then drops —
+// real 5.8.0 output decoded "0 strings". Mirror the template's charAt
+// loop, then percent-encode + UTF-8 collapse exactly like the template.
+// Prefers the custom-alphabet result when printable, else standard Buffer.
+function obfBase64Decode(raw, preferStd) {
+  // NOTE: self-contained on purpose — test-obfuscator.js extracts helpers
+  // by regex into a sandbox module, so this must not depend on other
+  // module-scope bindings (Buffer is a Node global, fine).
+  const ALPH = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/=';
+  const printable = (s) => typeof s === 'string' && /^[\x20-\x7e\s]*$/.test(s);
+  const stdDecode = () => { try { return Buffer.from(raw, 'base64').toString('utf8'); } catch (_) { return ''; } };
+  const customDecode = () => {
+    try {
+      let m = '';
+      for (let o = 0, p, q, r = 0; (q = raw.charAt(r++));) {
+        const qi = ALPH.indexOf(q);
+        if (~qi) { p = o % 4 ? p * 64 + qi : qi; if (o++ % 4) m += String.fromCharCode(255 & (p >> ((-2 * o) & 6))); }
+      }
+      let u = '';
+      for (let t = 0; t < m.length; t++) u += '%' + ('00' + m.charCodeAt(t).toString(16)).slice(-2);
+      return decodeURIComponent(u);
+    } catch (_) { return ''; }
+  };
+  // Alphabet order follows the caller's body evidence (sa.b64Std); the
+  // other alphabet is the fallback. Never return non-printable garbage.
+  const first = preferStd ? stdDecode() : customDecode();
+  if (printable(first)) return first;
+  const second = preferStd ? customDecode() : stdDecode();
+  if (printable(second)) return second;
+  return first || second || raw;
+}
+
 // ── Brute-force rotation correction ─────────────────────────────────────
 // When the sandbox eval fails (Step 3e), tries all N rotation offsets and
 // picks the one that decodes the most valid-looking strings.
@@ -2894,16 +3026,27 @@ function rotateBruteForce(src, sa, decName, idxParam, keyParam, baseOffset, isRC
   //    Matches the direct name AND any local aliases (var ALIAS = decName),
   //    plus one-arg calls for plain/base64 decoders (obfuscator.io emits
   //    alias(0x123) with no key when the decoder is not RC4).
+  //    Alias chains (var j = i) resolve to fixpoint, mirroring Step 3d.
   const names = [decName];
-  const aliasRe = new RegExp(
-    `(?:,\\s*|(?:var|const|let)\\s+)([A-Za-z_$][\\w$]*)\\s*=\\s*${decName}\\b`,
-    'g'
-  );
-  let am;
-  while ((am = aliasRe.exec(src)) !== null) {
-    const nextCh = src[am.index + am[0].length];
-    if (nextCh === '[' || nextCh === '.') continue;
-    names.push(am[1]);
+  {
+    const known = new Set(names);
+    const escId2 = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    for (let round = 0; round < 5; round++) {
+      let added = false;
+      for (const nm of [...known]) {
+        const re = new RegExp(
+          `(?:,\\s*|(?:var|const|let)\\s+)([A-Za-z_$][\\w$]*)\\s*=\\s*${escId2(nm)}\\b`,
+          'g'
+        );
+        let mm;
+        while ((mm = re.exec(src)) !== null) {
+          const nextCh = src[mm.index + mm[0].length];
+          if (nextCh === '[' || nextCh === '.') continue;
+          if (!known.has(mm[1])) { known.add(mm[1]); names.push(mm[1]); added = true; }
+        }
+      }
+      if (!added) break;
+    }
   }
 
   const callPatterns = [];
@@ -2944,7 +3087,7 @@ function rotateBruteForce(src, sa, decName, idxParam, keyParam, baseOffset, isRC
         const raw = rotated[adjustedIdx];
         let decoded;
         if (isPlain) decoded = raw;
-        else if (isBase64) decoded = Buffer.from(raw, 'base64').toString('utf8');
+        else if (isBase64) decoded = obfBase64Decode(raw, sa.b64Std);
         else if (isRC4) decoded = rc4Decrypt(raw, cs.key);
         if (typeof decoded === 'string' && /^[\x20-\x7e\s]*$/.test(decoded)) {
           score++;
@@ -4843,8 +4986,15 @@ function scanCryptoContext(src) {
       description:'Cryptographic seed derived from predictable user data' });
   }
 
-  // crypto.subtle misuse — no error handling
-  const subtleRe = /crypto\.subtle\.(?:encrypt|decrypt|sign|verify|importKey)\s*\(/g;
+  // crypto.subtle misuse — no error handling.
+  // Matches dot and bracket spellings (decoders emit brackets:
+  // crypto['subtle']['exportKey'](...)). exportKey is included: exporting
+  // raw/jwk key material is at least as sensitive as importing it.
+  const subtleVerbs = 'encrypt|decrypt|sign|verify|importKey|exportKey';
+  const subtleRe = new RegExp(
+    `crypto(?:\\.subtle|\\['subtle'\\])(?:\\.(${subtleVerbs})|\\['(${subtleVerbs})'\\])\\s*\\(`,
+    'g'
+  );
   while ((m = subtleRe.exec(src)) !== null) {
     const ahead = src.slice(m.index, m.index+300);
     if (!/.catch\s*\(|try\s*\{/.test(ahead)) {

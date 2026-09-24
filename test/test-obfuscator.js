@@ -29,9 +29,12 @@ function extractFnSrc(name) {
   if (!m) throw new Error(`could not extract ${name}`);
   return m[0];
 }
-// Build a self-contained module with the functions + their helpers
+// Build a self-contained module with the functions + their helpers.
+// NOTE: every helper referenced by the above must be listed here —
+// obfBase64Decode was added for the obfuscator.io custom base64 alphabet.
 const moduleSrc = `
 ${extractFnSrc('rc4Decrypt')}
+${extractFnSrc('obfBase64Decode')}
 ${extractFnSrc('evalConstantArith')}
 ${extractFnSrc('decodeObfuscatorIo')}
 ${extractFnSrc('evaluateConstantExpressions')}
