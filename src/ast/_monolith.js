@@ -1900,6 +1900,7 @@ function scanModernCrypto(src, structuralIndex) {
     findings.push({
       id:'crypto-jwt-literal', category:'JWT Exposure', severity:'high',
       value: tok.length > 60 ? tok.slice(0,60) + '…' : tok,
+      pos: m.index,
       context: ctx(m.index),
       description: `JWT literal in client bundle — payload decoded: ${decoded}`,
       jwtPayload: decoded,

@@ -5004,6 +5004,24 @@ function scanCryptoContext(src) {
     }
   }
 
+  // Key material written to web storage — readable by any XSS and
+  // persisted on disk. Fires when EITHER the key name is crypto-flavoured
+  // (export/key/token/secret/vault/private) OR the value carries key
+  // material shapes (Uint8Array, exportKey, subtle, long base64 blob), so
+  // setItem('theme','light') stays silent. Dot and bracket spellings
+  // (decoders emit localStorage['setItem']).
+  const storeKeyRe = /(localStorage|sessionStorage)(?:\.setItem|\[['"]setItem['"]\])\s*\(\s*['"]([^'"]{1,60})['"]\s*,/gi;
+  while ((m = storeKeyRe.exec(src)) !== null) {
+    const key = m[2];
+    const window = src.slice(m.index, m.index + 220);
+    const keySuspicious = /export|privat|secret|vault|token|key|seed|mnemonic|passphrase/i.test(key);
+    const valSuspicious = /Uint8Array|exportKey|subtle|crypto|fromCharCode['"]?\]\s*\(\s*null|btoa\s*\(|[A-Za-z0-9+/=]{40,}/.test(window);
+    if (!keySuspicious && !valSuspicious) continue;
+    findings.push({ id:'crypto-storage-key-exfil', category:'Cryptographic Risk', severity:'medium',
+      value: `${m[1]}.setItem('${key}')`.slice(0,80), context: ctx(m.index),
+      description:`Key material written to ${m[1]} under '${key}' — readable by any injected script and persisted on disk; keep keys in memory or non-extractable CryptoKey handles` });
+  }
+
   return findings;
 }
 
@@ -5754,16 +5772,19 @@ function scanCsrf(src) {
   const verbRe = /['"](POST|PUT|PATCH|DELETE)['"]/i;
 
   let m;
-  const fetchRe = /fetch\s*\(\s*['"]([^'"]+)['"]\s*,\s*\{[\s\S]{0,400}?method\s*:\s*['"](POST|PUT|PATCH|DELETE)['"]/gi;
+  const fetchRe = /fetch\s*\(\s*['"]([^'"]+)['"]\s*,\s*\{[\s\S]{0,400}?['"]?method['"]?\s*:\s*['"](POST|PUT|PATCH|DELETE)['"]/gi;
   while ((m = fetchRe.exec(src))) addCall(m.index, 'fetch', m[2].toUpperCase(), m[1]);
   const axiosRe = /axios\.(post|put|patch|delete)\s*\(\s*['"]([^'"]+)['"]/gi;
   while ((m = axiosRe.exec(src))) addCall(m.index, 'axios', m[1].toUpperCase(), m[2]);
-  const axiosObjRe = /axios\s*\(\s*\{[\s\S]{0,300}?method\s*:\s*['"](POST|PUT|PATCH|DELETE)['"][\s\S]{0,200}?url\s*:\s*['"]([^'"]+)['"]/gi;
+  const axiosObjRe = /axios\s*\(\s*\{[\s\S]{0,300}?['"]?method['"]?\s*:\s*['"](POST|PUT|PATCH|DELETE)['"][\s\S]{0,200}?['"]?url['"]?\s*:\s*['"]([^'"]+)['"]/gi;
   while ((m = axiosObjRe.exec(src))) addCall(m.index, 'axios', m[1].toUpperCase(), m[2]);
-  const jqPostRe = /(?:jQuery|\$)\.post\s*\(\s*['"]([^'"]+)['"]/gi;
-  while ((m = jqPostRe.exec(src))) addCall(m.index, 'jq', 'POST', m[1]);
-  const jqAjaxRe = /\$\.ajax\s*\(\s*\{[\s\S]{0,400}?(?:type|method)\s*:\s*['"](POST|PUT|PATCH|DELETE)['"][\s\S]{0,200}?url\s*:\s*['"]([^'"]+)['"]/gi;
-  while ((m = jqAjaxRe.exec(src))) addCall(m.index, 'jq', m[1].toUpperCase(), m[2]);
+   const jqPostRe = /(?:jQuery|\$)(?:\.post|\[['"]post['"]\])\s*\(\s*['"]([^'"]+)['"]/gi;
+   while ((m = jqPostRe.exec(src))) addCall(m.index, 'jq', 'POST', m[1]);
+   const jqAjaxRe = /(?:\$\.ajax|\$\[['"]ajax['"]\])\s*\(\s*\{[\s\S]{0,400}?['"]?(?:type|method)['"]?\s*:\s*['"](POST|PUT|PATCH|DELETE)['"][\s\S]{0,200}?['"]?url['"]?\s*:\s*['"]([^'"]+)['"]/gi;
+   while ((m = jqAjaxRe.exec(src))) addCall(m.index, 'jq', m[1].toUpperCase(), m[2]);
+   // Same shape, url-first key order (decoders preserve source order, which varies)
+   const jqAjaxRe2 = /(?:\$\.ajax|\$\[['"]ajax['"]\])\s*\(\s*\{[\s\S]{0,400}?['"]?url['"]?\s*:\s*['"]([^'"]+)['"][\s\S]{0,200}?['"]?(?:type|method)['"]?\s*:\s*['"](POST|PUT|PATCH|DELETE)['"]/gi;
+   while ((m = jqAjaxRe2.exec(src))) addCall(m.index, 'jq', m[2].toUpperCase(), m[1]);
   const xhrRe = /\.open\s*\(\s*['"](POST|PUT|PATCH|DELETE)['"]\s*,\s*['"]([^'"]+)['"]/gi;
   while ((m = xhrRe.exec(src))) addCall(m.index, 'xhr', m[1].toUpperCase(), m[2]);
   const genRe = /(?<!axios)(?<![A-Za-z$])\.(post|put|patch|delete)\s*\(\s*['"]([^'"]+)['"]/gi;
@@ -8305,19 +8326,159 @@ async function main(externalOpts) {
   const credentials = (() => {
     const raw = (opts.secrets || opts.report) ? scanCredentials(src) : [];
     const rank = { critical:0, high:1, medium:2, low:3, info:4 };
-    const seen = new Map();
+    // Near-dup merge: the same secret surfaces twice — truncated from the
+    // pre-decode buffer and full from decoded output (same name, one value
+    // a strict prefix of the other after stripping display truncation).
+    // Exact-value dedup (old key) missed these pairs. Merge into the
+    // fullest value at max severity, keeping every position.
+    const normCred = (v) => String(v || '').replace(/[….]+$/, '').replace(/\.{3,}$/, '');
+    // Phase 1 (legacy parity): exact normalized value, any name → one
+    // winner at max severity.
+    const byExact = new Map();
     for (const f of raw) {
-      const key = f.value.slice(0, 64);
-      const existing = seen.get(key);
-      if (!existing || (rank[f.severity] ?? 4) < (rank[existing.severity] ?? 4)) {
-        seen.set(key, f);
+      const key = normCred(f.value).slice(0, 128);
+      const existing = byExact.get(key);
+      const addPos = (host, g) => {
+        host.mergedPositions = host.mergedPositions || [];
+        if (typeof g.pos === 'number' && !host.mergedPositions.includes(g.pos)) host.mergedPositions.push(g.pos);
+        host.repeatCount = (host.repeatCount || 1) + 1;
+      };
+      if (!existing) {
+        f.mergedPositions = (typeof f.pos === 'number') ? [f.pos] : [];
+        f.repeatCount = 1;
+        byExact.set(key, f);
+      } else {
+        if (String(f.value).length > String(existing.value).length) {
+          existing.value = f.value;
+          existing.context = f.context;
+          existing.evidence = f.evidence;
+          existing.line = f.line;
+        }
+        if ((rank[f.severity] ?? 4) < (rank[existing.severity] ?? 4)) existing.severity = f.severity;
+        addPos(existing, f);
       }
     }
-    return [...seen.values()];
+    // Phase 2: prefix merge within one pattern name (display truncation:
+    // `AIza…tu` pre-decode vs full value post-decode). Distinct secrets
+    // are never prefixes of each other, so this only collapses copies.
+    const kept = [];
+    for (const f of byExact.values()) {
+      const nv = normCred(f.value);
+      let host = null;
+      for (const k of kept) {
+        if (k.name !== f.name) continue;
+        const knv = normCred(k.value);
+        if (knv.startsWith(nv) || nv.startsWith(knv)) { host = k; break; }
+      }
+      if (!host) { kept.push(f); continue; }
+      if (String(f.value).length > String(host.value).length) {
+        host.value = f.value;
+        host.context = f.context;
+        host.evidence = f.evidence;
+        host.line = f.line;
+      }
+      if ((rank[f.severity] ?? 4) < (rank[host.severity] ?? 4)) host.severity = f.severity;
+      for (const p of (f.mergedPositions || [])) {
+        if (!host.mergedPositions.includes(p)) host.mergedPositions.push(p);
+      }
+      host.repeatCount = (host.repeatCount || 1) + (f.repeatCount || 1);
+    }
+    // Phase 3: cross-name prefix merge. The truncated pre-decode copy
+    // often fires a different (usually more specific) rule than the full
+    // post-decode copy. Merge when the shorter normalized value (≥16
+    // chars, so random collisions are infeasible) is a strict prefix of
+    // the longer — that's display truncation, not two secrets.
+    const mergeInto = (host, f) => {
+      if (String(f.value).length > String(host.value).length) {
+        host.value = f.value;
+        host.context = f.context;
+        host.evidence = f.evidence;
+        host.line = f.line;
+      }
+      if ((rank[f.severity] ?? 4) < (rank[host.severity] ?? 4)) host.severity = f.severity;
+      for (const p of (f.mergedPositions || [])) {
+        if (!host.mergedPositions.includes(p)) host.mergedPositions.push(p);
+      }
+      host.repeatCount = (host.repeatCount || 1) + (f.repeatCount || 1);
+      if (f.name && f.name !== host.name) {
+        host.mergedFrom = host.mergedFrom || [host.name];
+        if (!host.mergedFrom.includes(f.name)) host.mergedFrom.push(f.name);
+      }
+    };
+    const final = [];
+    for (const f of kept) {
+      const nv = normCred(f.value);
+      let host = null;
+      for (const k of final) {
+        const knv = normCred(k.value);
+        const [shorter, longer] = nv.length <= knv.length ? [nv, knv] : [knv, nv];
+        if (shorter.length >= 16 && longer.startsWith(shorter)) { host = k; break; }
+      }
+      if (!host) { final.push(f); continue; }
+      mergeInto(host, f);
+    }
+    return final;
   })();
 
   // Phase 12
   const security = (opts.security || opts.report) ? analyseSecurity(src, opts.maxHops, { filePath: inputPath || opts.input, preferHost: opts.preferHost }) : [];
+
+  // Bearer-link pass: a `Bearer <token>` literal is already caught by the
+  // credential scanner, but the split form (`"Bearer " + VAR`, where VAR
+  // holds a detected secret) is not — yet it is the immediately replayable
+  // auth header. Buffer-local textual link (finding positions refer to
+  // different phase buffers, so no pos is trusted):
+  //  (a) each credential value ≥12 chars: find `var V = '<prefix>` in src;
+  //  (b) each JWT literal bound to a var (`var V = 'eyJ...'`), found by
+  //      direct scan (JWT findings themselves are computed later in 12o,
+  //      so they cannot be consumed here).
+  // Fire when V is referenced in a Bearer-containing statement. Plumbing
+  // without a literal secret (`'Bearer ' + getToken()`) stays silent.
+  try {
+    const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const bindings = new Map(); // varName -> full secret value
+    for (const f of credentials) {
+      const val = String(f.value || '').replace(/[….]+$/, '').replace(/\.{3,}$/, '');
+      if (val.length < 12) continue;
+      const bindRe = new RegExp(`(?:var|let|const)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*['"]${escRe(val.slice(0, 24))}`);
+      const bind = src.match(bindRe);
+      if (bind) bindings.set(bind[1], val);
+    }
+    const jwtBindRe = /(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*['"](eyJ[A-Za-z0-9_-]{10,}[A-Za-z0-9_.-]*)['"]/g;
+    let jm;
+    while ((jm = jwtBindRe.exec(src)) !== null) {
+      if (!bindings.has(jm[1])) bindings.set(jm[1], jm[2]);
+    }
+    const doneVars = new Set();
+    for (const [varName, full] of bindings) {
+      const escV = escRe(varName);
+      // NOTE: {1,} not {0,}: {0,} matches empty at every position, so the
+      // loop would only ever see empty strings and never fire.
+      const stmtRe = /[^;{}]{1,400}/g;
+      let sm, hit = null;
+      while ((sm = stmtRe.exec(src)) !== null) {
+        const st = sm[0];
+        if (!/Bearer/i.test(st)) continue;
+        if (!new RegExp(`(?<![\\w$])${escV}(?![\\w$])`).test(st)) continue;
+        hit = st.trim().slice(0, 120);
+        break;
+      }
+      if (!hit) continue;
+      doneVars.add(varName);
+      credentials.push({
+        name: 'Hardcoded Bearer Token', severity: 'high',
+        value: `Bearer ${full}`.slice(0, 120),
+        pos: src.indexOf(hit.slice(0, 40)),
+        context: hit,
+        evidence: { snippet: hit, matchedRule: 'bearer-variable-link' },
+        confidence: 0.8, confidenceReason: 'Secret variable used in Bearer auth header construction',
+        exploitability: 'likely', scope: 'unknown', primitive: `Bearer ${String(full).slice(0, 16)}…`,
+        mergedPositions: [], repeatCount: 1,
+      });
+    }
+  } catch (_) { /* best-effort: bearer linking never breaks the scan */ }
+
+
 
   if (process.env.OMEGA_PROFILE === '1') profileMark('security-regex');
 
@@ -8854,6 +9015,38 @@ async function main(externalOpts) {
     }
     secondPassStats = { ran: true, decodedStrings: p2.decodedStrings.length, merged };
     if (opts.verbose) console.log(info(`  Phase 12s: second pass — ${p2.decodedStrings.length} strings, ${merged} new findings (${Date.now() - t0}ms)`));
+    // CSRF after decode: scanCsrf ran on the raw buffer where verbs/URLs
+    // hide behind decoder calls (method: k(0x174)). Re-run on the decoded
+    // buffer and merge into csrfResult, recomputing posture from the
+    // merged set so at-risk counts stay truthful. Findings stay
+    // report-only (never gates/scores), same as the main pass.
+    try {
+      const p2csrf = scanCsrf(p2Elim.src);
+      const seenCsrf = new Set((csrfResult.findings || []).map(f => `${f.id}|${f.value}`));
+      for (const f of p2csrf.findings || []) {
+        const k = `${f.id}|${f.value}`;
+        if (seenCsrf.has(k)) continue;
+        seenCsrf.add(k);
+        csrfResult.findings.push(f);
+      }
+      const P = csrfResult.posture, Q = p2csrf.posture;
+      if (P && Q) {
+        P.cookieAuth = P.cookieAuth || Q.cookieAuth;
+        P.bearerAuth = P.bearerAuth || Q.bearerAuth;
+        const toks = new Set([...(P.tokenMechanism || []), ...(Q.tokenMechanism || [])]);
+        P.tokenMechanism = toks.size ? [...toks] : null;
+        const surf = new Map();
+        for (const s of [...(P.surfaces || []), ...(Q.surfaces || [])]) {
+          const k = `${s.method}|${s.surface}`;
+          if (!surf.has(k)) surf.set(k, s);
+          else if (s.protected && !surf.get(k).protected) surf.get(k).protected = true;
+        }
+        P.surfaces = [...surf.values()];
+        P.stateChangingRequests = P.surfaces.length;
+        P.protectedRequests = P.surfaces.filter(s => s.protected).length;
+        P.atRiskRequests = P.surfaces.length - P.protectedRequests;
+      }
+    } catch (_) { /* fail-open: decoded CSRF is best-effort */ }
   }
 
   if (process.env.OMEGA_PROFILE === '1') profileMark('decode-12s');
