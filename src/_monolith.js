@@ -967,7 +967,10 @@ const CREDENTIAL_PATTERNS = [
   { name:'Telegram Bot Token',      severity:'critical',
     re:/\b\d{8,12}:[A-Za-z0-9_\-]{30,}\b/g, fpGuard: null },
   { name:'Discord Bot Token',       severity:'critical',
-    re:/\b[A-Za-z\d]{18,30}\.[A-Za-z\d_\-]{5,8}\.[A-Za-z\d_\-]{27,}\b/g,
+    // Three-segment base64ish identifier. Segments can vary in length
+    // (Discord tokens are 24-char user_id / 6-char timestamp / 27-char
+    // hmac; some bots have longer IDs), so we keep the constraints loose.
+    re:/\b[A-Za-z\d_\-]{20,40}\.[A-Za-z\d_\-]{5,10}\.[A-Za-z\d_\-]{20,40}\b/g,
     fpGuard: null },
   { name:'Twilio API Key',          severity:'critical',
     re:/SK[0-9a-fA-F]{32}\b/g, fpGuard: null },
@@ -1642,6 +1645,8 @@ function autoDiscoverWebpackModuleMap(src) {
       startPos: candidate + bodyStart,
       endPos: candidate + bodyEnd,
       bodyLength: body.length,
+      uses: [],   // populated lazily if downstream consumer wants cross-module edges
+      size: body.length,
     });
   }
   return {
@@ -6702,6 +6707,10 @@ function renderTaintGraph(astTaint, outDir, opts) {
     const chain = Array.isArray(f.chain) ? f.chain : [];
     if (chain.length < 2) continue;
     const color = sevColor[f.severity] || 'black';
+    // Cluster each flow into a subgraph (appended after nodes/edges so
+    // subgraphs come at the end of the digraph, where Graphviz expects them).
+    const clusterLines = [];
+    clusterLines.push(`  subgraph cluster_${i} { label="${(f.id || 'flow').slice(0, 40)} [${f.severity || 'info'}]";`);
     for (let j = 0; j < chain.length; j++) {
       const step = chain[j];
       const id = `n${i}_${j}`;
@@ -6709,6 +6718,7 @@ function renderTaintGraph(astTaint, outDir, opts) {
       const fill = kindColor[step.kind] || kindColor.other;
       lines.push(`  ${id} [label="${label}\\n(${step.kind})" fillcolor="${fill}"];`);
       nodes.add(id);
+      clusterLines.push(`    ${id};`);
       if (j > 0) {
         const prevId = `n${i}_${j - 1}`;
         const eid = `${prevId}__${id}`;
@@ -6719,12 +6729,8 @@ function renderTaintGraph(astTaint, outDir, opts) {
         }
       }
     }
-    // Cluster each flow into a subgraph for readability
-    if (chain.length > 0) {
-      const first = `n${i}_0`;
-      const last  = `n${i}_${chain.length - 1}`;
-      lines.unshift(`  subgraph cluster_${i} { label="${(f.id || 'flow').slice(0, 40)} [${f.severity || 'info'}]"; ${first}; ${last}; }`);
-    }
+    clusterLines.push('  }');
+    lines.push(...clusterLines);
   }
   lines.push('}');
   const dot = lines.join('\n');
