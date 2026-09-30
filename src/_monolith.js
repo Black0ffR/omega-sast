@@ -168,6 +168,12 @@ const OMEGA_AST = (() => {
 const ast = OMEGA_AST;
 const crypto = require('crypto');
 const os = require('os');
+// mavis-patch-2026-09-30 (B.12 — credential redaction):
+// Require the redaction module. `path` is already imported at the top of
+// the file; reuse it to resolve the lib path.
+const { redactFinding, redactText, FRAGMENT_SHAPES } = require(
+  path.resolve(__dirname, '..', 'lib', 'credential-redact.js')
+);
 
 // ── Opt-in phase profiling (OMEGA_PROFILE=1) — review R5 ──────────────────
 const _profile = process.env.OMEGA_PROFILE === '1' ? [] : null;
@@ -6565,6 +6571,33 @@ function generateReports(data, outDir) {
   const ext = extendedFindings || [];
   const sev_order = { critical:0, high:1, medium:2, low:3, info:4 };
 
+  // ── mavis-patch-2026-09-30 (B.12 — credential redaction): ──
+  // Scrub credential fragments from context-style fields of every finding
+  // before the JSON / SARIF / Markdown / HTML writers consume them.
+  // Without this pass, `context`, `evidence.snippet`, `canonicalWindow`,
+  // and `description` leak half-credentials (e.g. `AKIA...` inside a
+  // context snippet). The credential `value` itself is NOT scrubbed —
+  // the dedup pipeline (B.12-dedup) depends on raw values to merge
+  // prefix copies, and downstream tests verify the fullest value is
+  // kept. Each fragment shape is conservative — requires a distinctive
+  // prefix so random alphanumeric blobs do not trigger FPs.
+  const REDACT_FIELDS = new Set(['context', 'canonicalWindow', 'description', 'evidence']);
+  const redactContextOnly = (f) => {
+    if (!f || typeof f !== 'object') return;
+    for (const k of Object.keys(f)) {
+      if (REDACT_FIELDS.has(k)) {
+        if (typeof f[k] === 'string') f[k] = redactText(f[k]);
+        else if (f[k] && typeof f[k] === 'object') redactFinding(f[k]);
+      }
+    }
+  };
+  if (Array.isArray(credentials))  credentials.forEach(redactContextOnly);
+  if (Array.isArray(security))    security.forEach(redactContextOnly);
+  if (Array.isArray(ext))          ext.forEach(redactContextOnly);
+  if (csrf && Array.isArray(csrf.findings)) csrf.findings.forEach(redactContextOnly);
+  if (astTaint && Array.isArray(astTaint.findings)) astTaint.findings.forEach(redactContextOnly);
+  if (astTaint && Array.isArray(astTaint.hops)) astTaint.hops.forEach(redactContextOnly);
+
   // ─── JSON ───────────────────────────────────────────────────────────────
   const json = JSON.stringify({
     meta, decodeStats, frameworks,
@@ -8468,6 +8501,8 @@ async function main(externalOpts) {
       if (!host) { final.push(f); continue; }
       mergeInto(host, f);
     }
+    process.stderr.write('[DEBUG-BEFORE-REDACT]:\n');
+    for (const c of final) { process.stderr.write('  ' + c.name + ' ctx=' + JSON.stringify((c.context || '').slice(0,200)) + '\n'); }
     return final;
   })();
 
