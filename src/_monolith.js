@@ -952,6 +952,25 @@ const CREDENTIAL_PATTERNS = [
     fpGuard: null },
   { name:'Google API Key (AIza)',   severity:'high',
     re:/AIza[0-9A-Za-z_-]{35}/g, fpGuard: null },
+  // ── mavis-patch-2026-09-30 (B.12 — additional credential patterns) ──
+  // Each pattern is placed AFTER the generic Hardcoded API Key patterns
+  // (lines ~855-861) so the B.12-dedup later-wins tie-break surfaces the
+  // specific name rather than the generic one.
+  { name:'GitLab Token',            severity:'critical',
+    re:/glpat-[A-Za-z0-9_\-]{20,}/g, fpGuard: null },
+  { name:'Telegram Bot Token',      severity:'critical',
+    re:/\b\d{8,12}:[A-Za-z0-9_\-]{30,}\b/g, fpGuard: null },
+  { name:'Discord Bot Token',       severity:'critical',
+    re:/\b[A-Za-z\d]{18,30}\.[A-Za-z\d_\-]{5,8}\.[A-Za-z\d_\-]{27,}\b/g,
+    fpGuard: null },
+  { name:'Twilio API Key',          severity:'critical',
+    re:/SK[0-9a-fA-F]{32}\b/g, fpGuard: null },
+  { name:'Mapbox Token',            severity:'high',
+    re:/pk\.[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}/g, fpGuard: null },
+  { name:'Supabase Service Key',    severity:'critical',
+    re:/sbp_(?:prod|dev|staging)_[A-Za-z0-9_\-]{20,}/g, fpGuard: null },
+  { name:'Vault Token',             severity:'critical',
+    re:/\bhvs\.[A-Za-z0-9_\-]{20,}\b/g, fpGuard: null },
 ];
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -8340,6 +8359,16 @@ async function main(externalOpts) {
     const normCred = (v) => String(v || '').replace(/[….]+$/, '').replace(/\.{3,}$/, '');
     // Phase 1 (legacy parity): exact normalized value, any name → one
     // winner at max severity.
+    //
+    // mavis-patch-2026-09-30 (B.12 — dedup name-precedence): on equal-severity
+    // ties, prefer the LATER matching pattern. Specific named patterns
+    // (GitLab Token, Heroku API Key, etc.) are placed AFTER the generic
+    // "Hardcoded API Key" pattern in CREDENTIAL_PATTERNS, so this rule
+    // causes the specific name to surface rather than the generic one.
+    // Without this fix, `glpat-...` strings were reported as
+    // "Hardcoded API Key" and `SK<32 hex>` Twilio keys were reported as
+    // "Stripe Key" (Stripe is the first critical-severity match in the
+    // pattern list — Twilio's pattern was missing entirely).
     const byExact = new Map();
     for (const f of raw) {
       const key = normCred(f.value).slice(0, 128);
@@ -8360,8 +8389,24 @@ async function main(externalOpts) {
           existing.evidence = f.evidence;
           existing.line = f.line;
         }
-        if ((rank[f.severity] ?? 4) < (rank[existing.severity] ?? 4)) existing.severity = f.severity;
-        addPos(existing, f);
+        const existingRank = rank[existing.severity] ?? 4;
+        const newRank = rank[f.severity] ?? 4;
+        if (newRank < existingRank) {
+          // New finding has strictly higher severity → take it as the host.
+          f.mergedPositions = existing.mergedPositions;
+          f.repeatCount = existing.repeatCount;
+          addPos(f, existing);
+          byExact.set(key, f);
+        } else if (newRank === existingRank) {
+          // Equal severity: replace with the later (more specific) pattern,
+          // carrying over the existing host's position metadata.
+          addPos(existing, f);
+          f.mergedPositions = existing.mergedPositions;
+          f.repeatCount = existing.repeatCount;
+          byExact.set(key, f);
+        } else {
+          addPos(existing, f);
+        }
       }
     }
     // Phase 2: prefix merge within one pattern name (display truncation:
