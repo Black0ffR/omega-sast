@@ -6790,8 +6790,9 @@ function generateReports(data, outDir) {
   if (Array.isArray(security))    security.forEach(redactContextOnly);
   if (Array.isArray(ext))          ext.forEach(redactContextOnly);
   if (csrf && Array.isArray(csrf.findings)) csrf.findings.forEach(redactContextOnly);
-  if (astTaint && Array.isArray(astTaint.findings)) astTaint.findings.forEach(redactContextOnly);
-  if (astTaint && Array.isArray(astTaint.hops)) astTaint.hops.forEach(redactContextOnly);
+  // NOTE: trackTaintAST returns an array (not {findings, hops}), so there
+  // are no astTaint.findings/hops branches to scrub here — the taint-graph
+  // renderer consumes the array directly.
 
   // ─── JSON ───────────────────────────────────────────────────────────────
   const json = JSON.stringify({
@@ -8767,8 +8768,6 @@ async function main(externalOpts) {
       if (!host) { final.push(f); continue; }
       mergeInto(host, f);
     }
-    process.stderr.write('[DEBUG-BEFORE-REDACT]:\n');
-    for (const c of final) { process.stderr.write('  ' + c.name + ' ctx=' + JSON.stringify((c.context || '').slice(0,200)) + '\n'); }
     return final;
   })();
 
