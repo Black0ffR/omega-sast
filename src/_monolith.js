@@ -941,8 +941,14 @@ const CREDENTIAL_PATTERNS = [
     re:/sk-ant-[A-Za-z0-9]{20,}/g, fpGuard: null },
   { name:'npm Token',               severity:'critical',
     re:/npm_[A-Za-z0-9]{36,}/g, fpGuard: null },
-  { name:'Heroku API Key',          severity:'high',
-    re:/[hH][eE][rR][oO][kK][uU].*[aA][pP][iI].*[kK][eE][yY]\s*[:=]\s*["']([A-Za-z0-9-]{20,})["']/gi,
+  { name:'Heroku API Key',          severity:'critical',
+    // mavis-patch-2026-09-30: replace the broken character-class obfuscation
+    // regex with a clean keyword-driven form that matches real-world shapes
+    // (HEROKU_API_KEY="...", Heroku-API-Key: '...', etc.) without the
+    // catastrophic backtracking risk. Bumped severity to critical so the
+    // later-wins tie-break rule (see B.12-dedup commit) keeps the more
+    // specific name when both Heroku + Hardcoded API Key patterns fire.
+    re:/\b(?:heroku[_-]?api[_-]?key)\b\s*[:=]\s*["']([A-Za-z0-9_\-]{20,})["']/gi,
     fpGuard: null },
   { name:'Google API Key (AIza)',   severity:'high',
     re:/AIza[0-9A-Za-z_-]{35}/g, fpGuard: null },
