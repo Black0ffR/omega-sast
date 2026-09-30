@@ -6559,6 +6559,84 @@ function buildDependencyGraph(src) {
 // ═══════════════════════════════════════════════════════════════════════════
 //  PHASE 15 — REPORT GENERATION
 // ═══════════════════════════════════════════════════════════════════════════
+function renderTaintGraph(astTaint, outDir, opts) {
+  opts = opts || {};
+  // No flows — write an empty placeholder so downstream tooling doesn't
+  // fail when looking for report.dot / report.svg.
+  const emptyDot = `digraph taint_graph {\n  rankdir=LR;\n  label="(no astTaintFlows)";\n}\n`;
+  const emptySvg = `<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="320" height="80"><rect width="320" height="80" fill="#f0f0f0"/><text x="160" y="40" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#666">(no astTaintFlows)</text></svg>\n`;
+
+  if (!Array.isArray(astTaint) || astTaint.length === 0) {
+    try {
+      fs.writeFileSync(path.join(outDir, 'report.dot'), emptyDot);
+      fs.writeFileSync(path.join(outDir, 'report.svg'), emptySvg);
+    } catch (_) {}
+    return;
+  }
+
+  // Build DOT. Each flow has `chain` (array of {kind,name} steps) and
+  // `severity`. We color nodes by kind (source=green, sink=red, variable
+  // =blue, sanitizer=orange) and edges by severity.
+  const sevColor = { critical:'red', high:'orange', medium:'goldenrod', low:'gray', info:'lightgray' };
+  const kindColor = { source:'#a8e6a3', sink:'#ff9a8b', variable:'#9ec5fe', sanitizer:'#ffd59e', other:'#ddd' };
+  const lines = [];
+  lines.push('digraph taint_graph {');
+  lines.push('  rankdir=LR;');
+  lines.push('  node [fontname="Helvetica" fontsize=10 shape=box style="filled,rounded"];');
+  lines.push('  edge [fontname="Helvetica" fontsize=9];');
+  const nodes = new Set();
+  const edges = new Set();
+  for (let i = 0; i < astTaint.length; i++) {
+    const f = astTaint[i];
+    const chain = Array.isArray(f.chain) ? f.chain : [];
+    if (chain.length < 2) continue;
+    const color = sevColor[f.severity] || 'black';
+    for (let j = 0; j < chain.length; j++) {
+      const step = chain[j];
+      const id = `n${i}_${j}`;
+      const label = (step.name || step.kind || `step${j}`).replace(/"/g, '\\"').slice(0, 60);
+      const fill = kindColor[step.kind] || kindColor.other;
+      lines.push(`  ${id} [label="${label}\\n(${step.kind})" fillcolor="${fill}"];`);
+      nodes.add(id);
+      if (j > 0) {
+        const prevId = `n${i}_${j - 1}`;
+        const eid = `${prevId}__${id}`;
+        const e = `${prevId} -> ${id} [color="${color}" label="${(f.id || 'flow').slice(0, 20)}"];`;
+        if (!edges.has(eid)) {
+          edges.add(eid);
+          lines.push(`  ${e}`);
+        }
+      }
+    }
+    // Cluster each flow into a subgraph for readability
+    if (chain.length > 0) {
+      const first = `n${i}_0`;
+      const last  = `n${i}_${chain.length - 1}`;
+      lines.unshift(`  subgraph cluster_${i} { label="${(f.id || 'flow').slice(0, 40)} [${f.severity || 'info'}]"; ${first}; ${last}; }`);
+    }
+  }
+  lines.push('}');
+  const dot = lines.join('\n');
+
+  // Render via `dot -Tsvg` if available, else write a placeholder.
+  let svg = null;
+  try {
+    const { execFileSync } = require('child_process');
+    svg = execFileSync('dot', ['-Tsvg'], { input: dot, encoding: 'utf8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] });
+  } catch (_) {
+    // Fallback placeholder — embed the DOT as a `<pre>` so the artifact
+    // is still useful even without Graphviz on PATH.
+    const escaped = dot.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    svg = `<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="640" height="480">\n<rect width="640" height="480" fill="#fff"/>\n<text x="20" y="30" font-family="sans-serif" font-size="14" fill="#333">Taint graph (DOT — install graphviz to render SVG)</text>\n<foreignObject x="20" y="50" width="600" height="410">\n  <pre xmlns="http://www.w3.org/1999/xhtml" style="font-family:monospace;font-size:11px;white-space:pre-wrap;background:#f7f7f7;border:1px solid #ccc;padding:8px;">${escaped}</pre>\n</foreignObject>\n</svg>\n`;
+  }
+  try {
+    fs.writeFileSync(path.join(outDir, 'report.dot'), dot);
+    fs.writeFileSync(path.join(outDir, 'report.svg'), svg);
+  } catch (e) {
+    // best-effort; never fail the scan over taint-graph artifacts
+  }
+}
+
 function generateReports(data, outDir) {
   const { analysis, credentials, security, extendedFindings, routes, frameworks,
           graph, decodeStats, meta, frameworkSymStats,
@@ -6701,6 +6779,13 @@ function generateReports(data, outDir) {
     } : null,
   }, null, 2);
   fs.writeFileSync(path.join(outDir, 'report.json'), json);
+
+  // ── mavis-patch-2026-09-30 (B.19 — taint graph DOT/SVG output): ──
+  // Emit `report.dot` (Graphviz) and `report.svg` for every astTaintFlow
+  // edge in the current bundle. Tries `dot -Tsvg` via execSync; falls back
+  // to a placeholder SVG if Graphviz isn't installed (so the artifact
+  // always exists for downstream tooling to find).
+  renderTaintGraph(astTaint || [], outDir, { data });
 
   // ─── SARIF v2.1.0 (GitHub Code Scanning compatible) ────────────────────
   const crypto = require('crypto');
