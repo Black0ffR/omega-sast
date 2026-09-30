@@ -2433,28 +2433,28 @@ function decodeObfuscatorIo(src) {
               }
             }
             if (sandboxSrc) {
-              const vm = require('vm');
-              const script = new vm.Script(sandboxSrc, { timeout: 5000 });
-              const sandboxGlobals = {
-                parseInt, parseFloat, isNaN, isFinite,
-                NaN, Infinity, undefined,
-                String, Number, Boolean, Array, Object,
-                RegExp, Function, Error, TypeError,
-                RangeError, SyntaxError, ReferenceError, EvalError, URIError,
-                Date, Map, Set, WeakMap, WeakSet, Promise, Symbol,
-                Math, JSON,
-                atob: typeof atob !== 'undefined' ? atob : (s) => Buffer.from(s, 'base64').toString('binary'),
-                btoa: typeof btoa !== 'undefined' ? btoa : (s) => Buffer.from(s, 'binary').toString('base64'),
-                escape, unescape,
-                decodeURIComponent, encodeURIComponent,
-                console: { log:()=>{}, warn:()=>{}, error:()=>{}, info:()=>{}, debug:()=>{} },
-                setTimeout: (fn) => (typeof fn === 'function' ? fn() : null),
-                setInterval: () => {},
-                clearTimeout: () => {},
-                clearInterval: () => {},
-              };
-              const rotatedJson = script.runInNewContext(sandboxGlobals, { timeout: 5000, breakOnSigint: true });
-              const rotatedArr = JSON.parse(rotatedJson);
+              // SECURITY: `sandboxSrc` is assembled from text sliced verbatim
+              // out of the bundle under analysis, so it is untrusted input.
+              // It used to be evaluated here with vm.runInNewContext against a
+              // globals object that injected the HOST `Function` constructor.
+              // vm is not a security boundary, and a host-realm Function hands
+              // the bundle a direct path to the real `process` object — RCE on
+              // the analyst's machine, with the environment (CI tokens, API
+              // keys) readable and the process mutable. See
+              // docs/SECURITY-sandbox-escape.md.
+              //
+              // Now: evaluation happens in a stripped child process (no inherited
+              // env, hard SIGTERM timeout, output cap, no host `Function`).
+              // Fails closed — a failed eval just leaves the rotation unresolved.
+              const { evalRotationSync } = require('../lib/rotation-sandbox');
+              const rotEval = evalRotationSync(sandboxSrc, { timeoutMs: 5000 });
+              if (!rotEval.ok) {
+                // Fail closed: the existing catch below rewrites the
+                // obfuscator-io-rotation finding to say the sandbox eval failed
+                // and that the static estimate is being used instead.
+                throw new Error(rotEval.error || 'rotation eval failed');
+              }
+              const rotatedArr = rotEval.value;
               if (Array.isArray(rotatedArr) && rotatedArr.length === sa.strings.length) {
                 sa.strings = rotatedArr;
                 rotatedCorrected = true;
