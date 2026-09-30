@@ -1543,6 +1543,115 @@ function autoDetectModuleNames(src, astModules) {
   return detected;
 }
 
+// mavis-patch-2026-09-30 (B.20 — fallback webpack-module discovery):
+// The webpack-5 resolver above only catches bundles using the modern
+// `webpackChunk_xxx` + arrow-function pattern. Older webpack / parcel /
+// rollup bundles use the literal form:
+//
+//   ({
+//     123: function(module, exports, __webpack_require__) {
+//       // module body
+//     },
+//     456: function(...) { ... },
+//   })
+//
+// or the named-key form:
+//
+//   var modules = {
+//     "react": function(...) { ... },
+//     "lodash": function(...) { ... },
+//   };
+//
+// `autoDiscoverWebpackModuleMap()` walks these forms and produces a
+// `webpackGraph`-shaped object so downstream consumers (Markdown
+// report, call-graph builder) work uniformly.
+function findMatchingBrace(src, openPos) {
+  // Returns the index of the matching '}' starting from openPos (which
+  // must point at the opening '{'). Handles strings, template literals,
+  // line/block comments, and regex literals.
+  if (src[openPos] !== '{') return -1;
+  let depth = 0;
+  let pos = openPos;
+  let inStr = false, strCh = '', inTmpl = false, inLineCmt = false, inBlkCmt = false, inRegex = false;
+  while (pos < src.length) {
+    const c = src[pos];
+    const c2 = src[pos+1] || '';
+    if (inLineCmt)  { if (c === '\n') inLineCmt = false; pos++; continue; }
+    if (inBlkCmt)   { if (c === '*' && c2 === '/') { inBlkCmt = false; pos += 2; continue; } pos++; continue; }
+    if (inStr)      { if (c === '\\') { pos += 2; continue; } if (c === strCh) inStr = false; pos++; continue; }
+    if (inTmpl)     { if (c === '\\') { pos += 2; continue; } if (c === '`') inTmpl = false; pos++; continue; }
+    if (inRegex)    { if (c === '\\') { pos += 2; continue; } if (c === '/' && src[pos-1] !== '\\') inRegex = false; pos++; continue; }
+    if (c === '/' && c2 === '/') { inLineCmt = true; pos += 2; continue; }
+    if (c === '/' && c2 === '*') { inBlkCmt = true; pos += 2; continue; }
+    if (c === '"' || c === '\'') { inStr = true; strCh = c; pos++; continue; }
+    if (c === '`') { inTmpl = true; pos++; continue; }
+    if (c === '{') { depth++; pos++; continue; }
+    if (c === '}') { depth--; if (depth === 0) return pos; pos++; continue; }
+    pos++;
+  }
+  return -1;
+}
+
+function autoDiscoverWebpackModuleMap(src) {
+  // Match `{  N: function(...) { ... }, ... }` or `{  N: (...) => { ... }, ... }`
+  // as a top-level literal. We look for the literal first, then walk each
+  // module entry's body against MODULE_SIGNATURE_PATTERNS.
+  const reLiteral = /\{\s*(\d{1,5})\s*:\s*function\s*\(|[A-Za-z_$][\w$]*\s*,\s*[A-Za-z_$][\w$]*\s*,\s*[A-Za-z_$][\w$]*\s*\)\s*\{|=>\s*\{/g;
+  // Find first '{' that starts a module-map literal — heuristic: must
+  // contain at least 2 `:` followed by `function` patterns within 4 KB.
+  let candidate = -1;
+  let m;
+  reLiteral.lastIndex = 0;
+  while ((m = reLiteral.exec(src)) !== null) {
+    const startPos = m.index;
+    // Walk back to find the '{' that starts the literal object.
+    let bracePos = startPos;
+    while (bracePos > 0 && src[bracePos] !== '{') bracePos--;
+    if (bracePos < 0) continue;
+    const closePos = findMatchingBrace(src, bracePos);
+    if (closePos < 0) continue;
+    const body = src.slice(bracePos, closePos + 1);
+    if (body.length > 100 * 1024) continue; // too big, skip
+    // Count how many module entries are inside
+    const moduleCount = (body.match(/\d{1,5}\s*:\s*(?:function|\()/g) || []).length;
+    if (moduleCount >= 3) {
+      candidate = bracePos;
+      break;
+    }
+  }
+  if (candidate < 0) return null;
+
+  // Now extract each entry's id + body
+  const modules = [];
+  const obj = src.slice(candidate, findMatchingBrace(src, candidate) + 1);
+  const entryRe = /(\d{1,5})\s*:\s*(?:function\s*\([^)]*\)|(?:\([^)]*\)|\b[A-Za-z_$][\w$]*)\s*=>)\s*\{/g;
+  let em;
+  while ((em = entryRe.exec(obj)) !== null) {
+    const id = em[1];
+    const bodyStart = em.index + em[0].length;
+    const bodyEnd = findMatchingBrace(obj, bodyStart - 1); // open brace was just before
+    const body = obj.slice(bodyStart, bodyEnd);
+    let name = null;
+    for (const { sig, name: n } of MODULE_SIGNATURE_PATTERNS) {
+      if (sig.test(body)) { name = n; break; }
+    }
+    modules.push({
+      id,
+      name: name || `module_${id}`,
+      packageName: name || null,
+      startPos: candidate + bodyStart,
+      endPos: candidate + bodyEnd,
+      bodyLength: body.length,
+    });
+  }
+  return {
+    bundler: 'webpack-literal',
+    modules,
+    edges: [],
+    moduleCount: modules.length,
+  };
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  CLI PARSING
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1576,6 +1685,7 @@ function parseArgs() {
     treatTsAsJs: false,    // strip TypeScript annotations before analysis
     customRulesPath: null, // path to .omega-rules.json for pluggable rules
     decodeEsoteric: false, // opt-in esoteric decode (JSFuck/AAEncode/JJEncode)
+    autoDiscoverModules: false, // mavis-patch: force fallback webpack-module discovery
     ndjson: null,
     preferHost: null,
     skipUrlRegex: null,
@@ -1614,6 +1724,7 @@ function parseArgs() {
     case '--treat-ts-as-js': o.treatTsAsJs    = true;      break;
     case '--custom-rules':   o.customRulesPath = args[++i]; break;
     case '--decode-esoteric': o.decodeEsoteric = true; break;
+    case '--auto-discover-modules': o.autoDiscoverModules = true; break;
     case '--ndjson':          o.ndjson       = args[++i]; break;
     case '--prefer-host':     o.preferHost   = args[++i]; o.firstPartyHost = o.preferHost; break;
     case '--first-party-host': o.firstPartyHost = args[++i]; o.preferHost = o.firstPartyHost; break;
@@ -6785,6 +6896,9 @@ function generateReports(data, outDir) {
   // edge in the current bundle. Tries `dot -Tsvg` via execSync; falls back
   // to a placeholder SVG if Graphviz isn't installed (so the artifact
   // always exists for downstream tooling to find).
+  // Always emitted when generateReports runs — the empty-case placeholder
+  // is cheap (~80 bytes) and downstream tooling (CI pipelines, IDE
+  // plugins) expects the files to exist alongside report.json.
   renderTaintGraph(astTaint || [], outDir, { data });
 
   // ─── SARIF v2.1.0 (GitHub Code Scanning compatible) ────────────────────
@@ -7787,16 +7901,76 @@ async function runMultiBundle(opts) {
     const bundleStat = fs.statSync(bundlePath);
     const bundleSha256 = crypto.createHash('sha256').update(bundleSrc).digest('hex');
     const deps = collectDependencies(bundleSrc);
+    // mavis-patch-2026-09-30 (B.14 — cross-bundle taint divergence):
+    // Read the per-bundle report.json so the divergence check below can
+    // inspect each bundle's security findings + astTaintFlows.
+    let bundleFindings = null;
+    try {
+      const rp = path.join(opts.out, bundleName, 'report.json');
+      if (fs.existsSync(rp)) bundleFindings = JSON.parse(fs.readFileSync(rp, 'utf8'));
+    } catch (_) { /* best-effort */ }
     bundleResults.push({
       name: bundleName,
       path: bundlePath,
       size: bundleStat.size,
       sha256: bundleSha256,
+      findings: bundleFindings,
       deps,
       summary: results[bi].summary,
     });
     if (!opts.quiet) {
       console.log(ok(`${bundleName}: ${(bundleStat.size/1024).toFixed(1)} KB, ${deps.length} deps, ${results[bi].summary ? results[bi].summary.totalFindings : '?'} findings`));
+    }
+  }
+
+  // ── mavis-patch-2026-09-30 (B.14 — cross-bundle taint divergence) ──
+  // When a finding class (e.g. `xss-innerhtml`) appears in some bundles
+  // but is absent in others, that often reveals divergent sanitisation
+  // (one bundle routes through DOMPurify, another doesn't). We emit
+  // `cross-bundle-finding-divergence` findings for each divergent class.
+  // NOTE: `conflictFindings` is hoisted to the start of the multi-bundle
+  // pipeline so the B.14 block can push into it before version-conflict
+  // detection runs.
+  const conflictFindings = [];
+  if (bundleResults.length >= 2) {
+    const findingIdPresence = new Map();
+    for (let bi = 0; bi < bundleResults.length; bi++) {
+      const f = bundleResults[bi].findings;
+      if (!f) continue;
+      for (const sf of (f.security || [])) {
+        if (!sf || !sf.id) continue;
+        if (!findingIdPresence.has(sf.id)) findingIdPresence.set(sf.id, new Set());
+        findingIdPresence.get(sf.id).add(bi);
+      }
+      for (const tf of (f.astTaintFlows || [])) {
+        if (!tf) continue;
+        const sinkId = `taint:${(tf.id || 'flow').slice(0, 40)}`;
+        if (!findingIdPresence.has(sinkId)) findingIdPresence.set(sinkId, new Set());
+        findingIdPresence.get(sinkId).add(bi);
+      }
+    }
+    const allBundleIdxs = new Set(bundleResults.map((_, i) => i));
+    const divergenceFinds = [];
+    for (const [fid, presentIdxs] of findingIdPresence.entries()) {
+      if (presentIdxs.size === 0 || presentIdxs.size === allBundleIdxs.size) continue;
+      // Skip low-signal divergent classes to reduce noise.
+      if (fid === 'crypto-stale' || fid === 'csp-headers') continue;
+      const presentNames = [...presentIdxs].sort().map(i => bundleResults[i].name);
+      const absentNames  = [...allBundleIdxs].filter(i => !presentIdxs.has(i)).sort().map(i => bundleResults[i].name);
+      divergenceFinds.push({
+        id: 'cross-bundle-finding-divergence',
+        category: 'Cross-bundle',
+        severity: 'medium',
+        value: `Finding class "${fid}" present in ${presentNames.length}/${allBundleIdxs.size} bundles, missing in ${absentNames.length}`,
+        context: `present in: [${presentNames.join(', ')}]\nabsent in: [${absentNames.join(', ')}]`,
+        description: `${fid} is reported in ${presentNames.join(', ')} but not in ${absentNames.join(', ') || '(none)'}. Bundles where it is absent may share inputs with the bundles where it fires.`,
+      });
+    }
+    if (divergenceFinds.length > 0) {
+      conflictFindings.push(...divergenceFinds);
+      if (!opts.quiet) {
+        console.log(warn(`B.14 cross-bundle divergence: ${divergenceFinds.length} finding classes diverge across bundles`));
+      }
     }
   }
 
@@ -7827,7 +8001,8 @@ async function runMultiBundle(opts) {
   }
 
   // ── Generate combined report ──────────────────────────────────────────
-  const conflictFindings = [];
+  // (conflictFindings is hoisted earlier in this function — see B.14
+  // cross-bundle taint divergence block above for the declaration.)
   for (const c of conflicts) {
     const versionStr = c.versions.map(v => `${v.version} (${v.bundles.join(', ')})`).join(' vs ');
     conflictFindings.push({
@@ -8812,6 +8987,18 @@ async function main(externalOpts) {
     webpackGraph = ast.resolveWebpack5Modules(astSrc);
     if (opts.verbose) {
       console.log(info(`  Webpack resolver: ${webpackGraph.moduleCount} modules, ${webpackGraph.edges.length} edges`));
+    }
+
+    // mavis-patch-2026-09-30 (B.20 — fallback module discovery):
+    // If the webpack-5 resolver didn't find modules (older bundler
+    // shape — literal `{ N: function(...) { ... } }` rather than
+    // arrow functions + `webpackChunk_xxx`), try the literal form.
+    if (webpackGraph.moduleCount === 0 || (opts.autoDiscoverModules && webpackGraph.moduleCount > 0)) {
+      const literal = autoDiscoverWebpackModuleMap(astSrc);
+      if (literal && literal.moduleCount > 0) {
+        webpackGraph = literal;
+        if (opts.verbose) console.log(info(`  Literal module-map auto-discovery: ${literal.moduleCount} modules`));
+      }
     }
 
     // Auto-detect module names from in-bundle signatures (Phase 0 extension)
