@@ -215,12 +215,17 @@ fetch('/api/x', { method: 'POST', headers: { 'X-CSRF-Token': t } });`;
   section('6. CLI — csrf section in report.json + report-only exit codes');
   {
     // Only a medium CSRF finding would push exit to 4 if it fed the gates;
-    // the storage-cookie low finding keeps it at 5 → proves report-only.
+    // the storage-cookie finding keeps it at 5 → proves report-only.
     const f1 = path.join(mkTmpDir(), 'csrf-at-risk.js');
     fs.writeFileSync(f1, `const t = document.cookie.match(/XSRF-TOKEN=([^;]+)/);\n` +
       `fetch('/api/account', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });\n`);
     const out1 = mkTmpDir();
-    const run1 = runOmega([f1, '--security', '--report', '--quiet', '--out', out1]);
+    // OMEGA_FAIL_ON is pinned to `low` so the assertion is about the gate, not
+    // the default threshold. The claim under test is that the medium CSRF
+    // finding does NOT feed the gate: with it counted, the exit would be 4,
+    // not the 5 that the non-CSRF finding alone produces.
+    const run1 = runOmega([f1, '--security', '--report', '--quiet', '--out', out1],
+      { env: { ...process.env, OMEGA_FAIL_ON: 'low' } });
     const rep1 = readReport(out1);
     assert('exit 5 (low findings only — csrf excluded from gates)',
       run1.status === 5, `status=${run1.status} stderr=${(run1.stderr || '').slice(0, 120)}`);

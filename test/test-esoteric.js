@@ -129,11 +129,16 @@ async function main() {
 
   section('4. CLI integration — --decode-esoteric flag');
   {
-    // Flag OFF: default behaviour unchanged (baseline: exit 3 = HIGH fingerprint).
+    // Flag OFF: default behaviour unchanged (exit 3 = a HIGH finding survives).
     // The tool always writes <name>.decoded.js (Phase 7) — flag-off must NOT
     // contain the recovered payload.
+    //
+    // OMEGA_FAIL_ON is pinned to `high` so "exit 3" means "a high finding
+    // exists" rather than anything about the default threshold, which is
+    // `critical` (under which a high-only scan correctly exits 0).
     const outOff = mkTmpDir();
-    const runOff = runOmega([path.join(SAMPLES, '02_jsfuck.js'), '--security', '--report', '--quiet', '--out', outOff]);
+    const runOff = runOmega([path.join(SAMPLES, '02_jsfuck.js'), '--security', '--report', '--quiet', '--out', outOff],
+      { env: { ...process.env, OMEGA_FAIL_ON: 'high' } });
     const repOff = readReport(outOff);
     assert('flag-off exit code 3 (HIGH fingerprint preserved)',
       runOff.status === 3, `status=${runOff.status} stderr=${(runOff.stderr || '').slice(0, 120)}`);
@@ -147,8 +152,12 @@ async function main() {
 
     // Flag ON: decodes, fingerprint finding stays, artifact + stats emitted
     const outOn = mkTmpDir();
-    const runOn = runOmega([path.join(SAMPLES, '02_jsfuck.js'), '--decode-esoteric', '--security', '--report', '--quiet', '--out', outOn]);
+    const runOn = runOmega([path.join(SAMPLES, '02_jsfuck.js'), '--decode-esoteric', '--security', '--report', '--quiet', '--out', outOn],
+      { env: { ...process.env, OMEGA_FAIL_ON: 'high' } });
     const repOn = readReport(outOn);
+    // OMEGA_FAIL_ON is pinned to `high` so this asserts "a HIGH finding exists"
+    // rather than anything about the default threshold. The default is
+    // `critical`, under which a high-only scan correctly exits 0.
     assert('flag-on exit code 3 (HIGH fingerprint retained)',
       runOn.status === 3, `status=${runOn.status} stderr=${(runOn.stderr || '').slice(0, 120)}`);
     assert('flag-on: decodeStats.esoteric === 8 (alert(1))',
@@ -161,7 +170,8 @@ async function main() {
 
     // Flag ON with aaencode (patch strategy through the CLI worker path)
     const outA = mkTmpDir();
-    const runA = runOmega([path.join(SAMPLES, '03_aaencode.js'), '--decode-esoteric', '--security', '--report', '--quiet', '--out', outA]);
+    const runA = runOmega([path.join(SAMPLES, '03_aaencode.js'), '--decode-esoteric', '--security', '--report', '--quiet', '--out', outA],
+      { env: { ...process.env, OMEGA_FAIL_ON: 'high' } });
     const repA = readReport(outA);
     assert('flag-on aaencode: exit code 3 (HIGH fingerprint retained)',
       runA.status === 3, `status=${runA.status} stderr=${(runA.stderr || '').slice(0, 120)}`);
