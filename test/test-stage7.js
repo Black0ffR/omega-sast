@@ -286,7 +286,7 @@ section('10. Async worker-thread ReDoS test');
   const redos = require(path.resolve(__dirname, '..', 'lib', 'redos-worker.js'));
 
   // Test async API
-  redos.runRegexSafe(/foo/g, 'foo bar foo baz', { timeoutMs: 5000 })
+  const redosDone = redos.runRegexSafe(/foo/g, 'foo bar foo baz', { timeoutMs: 5000 })
     .then(result => {
       assert('redos async: finds 2 matches',
         result.matches && result.matches.length === 2,
@@ -296,8 +296,20 @@ section('10. Async worker-thread ReDoS test');
       assert('redos async: finds 2 matches', false, err.message);
     });
 
-  // Wait for the async test to complete (worker threads are async)
-  setTimeout(() => {
+  // Wait for the async test to complete (worker threads are async).
+  //
+  // The summary below used to run on a bare `setTimeout(..., 1000)`, which
+  // races the worker: `runRegexSafe` spawns a worker_thread, and on a
+  // contended box its startup can exceed one second. When that happened the
+  // timer callback called process.exit() before the promise above settled,
+  // so the assertion was never registered and the suite reported 51/52 with
+  // FAILED: 0 -- a test that vanishes rather than fails.
+  //
+  // Tie the summary to the promise itself instead of guessing at a duration.
+  // The 1000ms settle delay is retained so behaviour is otherwise identical,
+  // and the inner timeoutMs still bounds the worker, so no new hang risk.
+  Promise.all([redosDone, new Promise(resolve => setTimeout(resolve, 1000))])
+    .then(() => {
     // ═══════════════════════════════════════════════════════════════════════
     section('11. Sample bundle end-to-end with all Stage 7 features');
     {
@@ -343,5 +355,5 @@ section('10. Async worker-thread ReDoS test');
       }
     }
     process.exit(failed ? 1 : 0);
-  }, 1000);
+    });
 }
