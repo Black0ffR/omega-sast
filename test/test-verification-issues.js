@@ -561,20 +561,33 @@ section('4.4 --watch mode: flag recognized, initial scan runs');
 (function () {
   const fixture = path.join(__dirname, 'fixtures', 'sample-bundle.js');
   const out = mkTmpDir();
-  // --watch would normally block forever; we run it with a short timeout
-  // and check that it produced initial output
-  const r = spawnSync(process.execPath, [OMEGA, fixture, '--security', '--watch', '--out', out], {
-    encoding: 'utf8',
-    timeout: 5000,
-    stdio: 'pipe',
-  });
-  // It will be killed by the timeout — that's expected. We just need to see
-  // that it recognized --watch and ran the initial scan.
-  const output = (r.stdout || '') + (r.stderr || '');
+  // --watch blocks forever, so spawn detached (stdio to a log file) and
+  // poll for the initial scan's report files with a bounded wait. Scan
+  // time varies by machine; the old fixed 5s kill budget failed
+  // structurally on slow boxes. Atomics.wait sleeps synchronously.
+  const log = path.join(out, 'watch.log');
+  const logFd = fs.openSync(log, 'w');
+  const child = require('child_process').spawn(process.execPath,
+    [OMEGA, fixture, '--security', '--watch', '--out', out],
+    { stdio: ['ignore', logFd, logFd] });
+  const sleepSync = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch (_) {} };
+  const deadline = Date.now() + 60000;
+  let done = false;
+  while (!done && Date.now() < deadline) {
+    sleepSync(500);
+    done = fs.existsSync(path.join(out, 'report.json'));
+  }
+  child.kill('SIGKILL');
+  sleepSync(300);
+  let output = '';
+  try { output = fs.readFileSync(log, 'utf8'); } catch (_) {}
+  try { fs.closeSync(logFd); } catch (_) {}
+  // It is killed by us after producing output — that's expected. We just
+  // need to see that it recognized --watch and ran the initial scan.
   assert('--watch is recognized (no "unknown option" error)',
     !/unknown option|invalid argument/i.test(output));
   assert('--watch runs initial scan (produces report files)',
-    fs.existsSync(path.join(out, 'report.json')) || /Complete/.test(output),
+    done || /Complete/.test(output),
     `output tail = ${output.slice(-200)}`);
 })();
 
