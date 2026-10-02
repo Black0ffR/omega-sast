@@ -1192,13 +1192,29 @@ const SECURITY_PATTERNS = [
       return /JSON\.parse|getParam|location\b|document\.(?:referrer|cookie)|window\.name|fetch\s*\(|XMLHttpRequest|req(?:uest)?\.(?:body|params|query|headers)|params\b|query\b|decodeURIComponent|atob\s*\(|postMessage\s*\(/.test(before);
     } },
   { id:'proto-jsonparse',  cat:'Prototype Pollution', sev:'medium',
-    // Negative lookahead: skip JSON.parse(JSON.stringify(x)) deep-clone pattern.
-    // Bare JSON.parse(<ident>) is also skipped unless __proto__ / constructor are
-    // near the call — single-ident parses in minified bundles are almost always
-    // benign serialization/deserialization, not prototype pollution.
-    // `prototype` alone is too common in OOP code to distinguish reliably.
+    // PRECISION FIX (was: fired on ANY non-identifier JSON.parse arg).
+    //
+    // The old guard fired on every `JSON.parse(<complex-arg>)` that wasn't a
+    // bare identifier. On minified production bundles that matched almost all
+    // framework code — React Router route parsing, sessionStorage
+    // restoration, RSC embedded data, atob()-decoded meta tags — producing 5
+    // medium FPs on a single GitHub chunk.
+    //
+    // A JSON.parse call is not a prototype-pollution sink. The question is
+    // whether the PARSED VALUE reaches a pollution primitive. So:
+    //   1. __proto__ / constructor [=.] adjacent  → real PP signal, fire.
+    //   2. Parsed value flows into a pollution sink (Object.assign onto a
+    //      prototype, _.merge/_.extend, a [__proto__] write, a recursive
+    //      merge) within a window → fire.
+    //   3. Otherwise → suppress. There is no finding to report.
+    //
+    // A post-parse shape guard (typeof/hasOwnProperty/Array.isArray) is
+    // recorded but does NOT by itself suppress — the sink check is the
+    // discriminator, because a type guard does not make a sink safe.
     re:/JSON\.parse\s*\((?!\s*JSON\.stringify\s*\()[^)]+\)/g,
-    ctx: m => {
+    ctx: (m) => {
+      // NOTE: `m` is the *snippet* the engine passes (match-100 .. match+120),
+      // so every offset below is snippet-relative, NOT absolute in src.
       const idx = m.indexOf("JSON.parse");
       if (idx === -1) return false;
       // Look within 60 chars before / 80 chars after the JSON.parse call
@@ -1208,8 +1224,66 @@ const SECURITY_PATTERNS = [
       const argMatch = m.slice(idx).match(/JSON\.parse\s*\(([^)]+)\)/);
       if (!argMatch) return false;
       const arg = argMatch[1].trim();
-      if (/^[a-zA-Z_$][\w$.]*$/.test(arg)) return false;
-      return true;
+      // "Simple" = a bare identifier or a short-rooted member path (`e.x`,
+      // `u.payload`). These are overwhelmingly minified locals in production
+      // bundles, and a parse of one is benign deserialization. A LONGER root
+      // (`req.body`, `evt.data`, `msg.payload`) is a real data source, so we
+      // keep those and let the pollution-sink check below decide.
+      // root length 1-2: `[a-zA-Z_$]` + `{\w$}{0,1}`
+      const isShortRooted = /^[a-zA-Z_$][\w$]{0,1}(?:\.[a-zA-Z_$][\w$]*)*$/.test(arg);
+      const isBareIdent   = /^[a-zA-Z_$][\w$]*$/.test(arg);
+      if (isBareIdent || isShortRooted) {
+        // Bare/single-ident parses are skipped unless __proto__/constructor
+        // is adjacent (checked above) — unchanged from the original rule.
+        return false;
+      }
+
+      // ── NEW: require downstream pollution evidence ──────────────────────
+      // Search the remainder of the snippet (everything after the call) for
+      // a pollution primitive that the parsed value actually reaches.
+      const after = m.slice(idx);
+      // Identify the name the parsed value is bound to. The binding can sit
+      // BEFORE the match (`let cfg = JSON.parse(x)`) or be an inline
+      // assignment (`cfg = JSON.parse(x)`), so search the WHOLE snippet —
+      // searching only from idx onward misses the declaration form and would
+      // otherwise capture the next unrelated identifier after the call.
+      const declM   = m.match(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*JSON\.parse\s*\(/);
+      const assignM = m.match(/(?:^|[;,{}()\]]|\breturn)\s*([A-Za-z_$][\w$]*)\s*=\s*JSON\.parse\s*\(/);
+      const boundName = (declM || assignM || [])[1] || null;
+      const nameRe = boundName ? new RegExp(`\\b${boundName.replace(/[$]/g, '\\$')}\\b`) : null;
+      const pollutionSink = new RegExp(
+        `(?:Object\\s*\\.\\s*assign\\s*\\(\\s*(?:Object\\s*\\.\\s*)?prototype|Object\\s*\\.\\s*setPrototypeOf|` +
+        `_\\s*\\.\\s*(?:merge|extend|defaultsDeep|deepMerge)\\s*\\(|\\bdeepMerge\\s*\\(|` +
+        `\\[["'\`]__proto__["'\`]\\]|__proto__\\s*\\[|\\bconstructor\\s*\\.\\s*prototype\\b|` +
+        `Reflect\\s*\\.\\s*setPrototypeOf)`,
+        'g'
+      );
+      let s;
+      while ((s = pollutionSink.exec(after)) !== null) {
+        if (!nameRe) return true;                 // unbound result, sink nearby
+        if (nameRe.test(s[0])) return true;      // the sink itself names it
+        if (nameRe.test(after.slice(Math.max(0, s.index - 120), s.index + 60))) return true;
+      }
+      // Upstream sink: the parse result is the ARGUMENT to a pollution sink —
+      // `Object.setPrototypeOf(JSON.parse(x), p)` / `_.merge({}, JSON.parse(x))`.
+      // The sink call therefore appears BEFORE the match, so the `after`
+      // window above cannot see it. Require the gap between the sink and the
+      // parse to consist ONLY of argument characters (no `;`, no statement
+      // keyword) so a coincidental earlier statement does not match.
+      const upstream = m.slice(Math.max(0, idx - 80), idx);
+      if (/[A-Za-z_$][\w$.]*\s*\(/.test(upstream)) {
+        pollutionSink.lastIndex = 0;
+        let u;
+        while ((u = pollutionSink.exec(upstream)) !== null) {
+          const gap = upstream.slice(u.index + u[0].length);
+          // ≤24 chars of pure argument syntax between sink and parse
+          if (gap.length <= 24 && /^[\s,()\[\]{}0-9'"a-zA-Z_$]*(?:;|\breturn\b|\bconst\b|\blet\b|\bvar\b)/.test(gap) === false
+              && !/^\s*$/.test(gap)) {
+            return true;
+          }
+        }
+      }
+      return false;
     } },
 
   // ── B5: PostMessage ─────────────────────────────────────────────────────
@@ -4829,6 +4903,14 @@ function analyseSecurity(src, maxHops, opts={}) {
           if (sc.severity==='info') { id='xss-innerhtml-benign'; cat='XSS'; sev='info'; exploitability='theoretical'; }
           else if (sc.reason==='partial-html-highlight-without-full-escape') { exploitability='needs-dataflow'; sev='high'; }
         }
+        if (pat.id === 'proto-jsonparse') {
+          const pjp = classifyProtoParse(src, m.index);
+          if (pjp.severity === 'high') {
+            sev = 'high';
+            exploitability = 'needs-unvalidated-input';
+            primitive = 'prototype-pollution';
+          }
+        }
         if (pat.id.startsWith('redirect-')) {
           const after = src.slice(m.index, m.index+300);
           const c = classifyLocationAssign(after);
@@ -4858,6 +4940,27 @@ function analyseSecurity(src, maxHops, opts={}) {
     const order = {critical:0, high:1, medium:2, low:3, info:4};
     return (order[a.severity]||4) - (order[b.severity]||4);
   });
+}
+
+// ── proto-jsonparse severity grading ───────────────────────────────────────
+// The proto-jsonparse rule fires at 'medium' by default (declared on the
+// pattern). But once the rule has confirmed that the parsed value actually
+// REACHES a pollution primitive, the evidence strength justifies a grade:
+//   confirmed __proto__ / constructor.prototype WRITE  → high
+//   Object.assign/merge ONTO a prototype               → high
+//   otherwise (sink nearby, unbound result)            → medium
+// Without this, a confirmed `Object.assign(Object.prototype, JSON.parse(x))`
+// is reported at the same level as a bare suspicious parse, and triage cannot
+// separate them. Mirrors the existing xss-eval / redirect- reclassification.
+function classifyProtoParse(src, matchIndex) {
+  const near = src.slice(Math.max(0, matchIndex - 120), Math.min(src.length, matchIndex + 320));
+  if (/__proto__\s*\[|\[["'\`]__proto__["'\`]|__proto__\s*[.=]|constructor\s*\.\s*prototype\s*[.=[]/.test(near))
+    return { severity: 'high', reason: 'confirmed __proto__/constructor.prototype write' };
+  if (/Object\s*\.\s*assign\s*\(\s*(?:Object\s*\.\s*)?prototype|Object\s*\.\s*setPrototypeOf\s*\(|Reflect\s*\.\s*setPrototypeOf\s*\(/.test(near))
+    return { severity: 'high', reason: 'parsed value reaches a prototype-assignment primitive' };
+  if (/_\s*\.\s*(?:merge|extend|defaultsDeep|deepMerge)\s*\(|\bdeepMerge\s*\(/.test(near))
+    return { severity: 'high', reason: 'parsed value reaches a recursive merge primitive' };
+  return { severity: 'medium', reason: 'pollution sink in proximity, binding unconfirmed' };
 }
 
 // ── innerHTML dedup by enclosing function ──────────────────────────────
@@ -8207,8 +8310,16 @@ async function decodeEsoteric(src, opts) {
   // Canonical capture machinery — executed inside a Worker or a vm context.
   // Every line is indented so extraction-based unit tests can slice it.
   const M = [
-    'var vm = (typeof __vmModule !== "undefined") ? __vmModule : require("vm");',
+    // Resolve `vm` defensively. Previously the main-process fallback injected
+    // the HOST realm's vm module as `__vmModule`, which handed attacker-
+    // controlled code a live `new vm.Script(...).runInThisContext()` — a direct
+    // path from the sandbox to the host global object and from there to the
+    // real `process`. In a worker this resolves via require(); in the bare vm
+    // fallback there is no vm, and __tryShell degrades to a no-op (returns []),
+    // which __decode already treats as "not decoded". Safe failure, not escape.
+    'var vm = (typeof __vmModule !== "undefined" && __vmModule) ? __vmModule : (typeof require === "function" ? require("vm") : null);',
     'function __tryShell(code, strategy, timeoutMs) {',
+    '  if (!vm) return [];',
     '  var sandbox = Object.create(null);',
     '  var prelude = [',
     '    "var __caps = [];",',
@@ -8273,9 +8384,38 @@ async function decodeEsoteric(src, opts) {
     sandbox.__esoSrc = code;
     sandbox.__esoStrategy = strategy;
     sandbox.__esoTimeout = ms;
-    sandbox.__vmModule = vm;
+    // ── Restricted `vm` capability ────────────────────────────────────────
+    // The prelude needs a nested `vm.runInNewContext` to perform its shadow
+    // execution (run the bundle with `eval` trapped, capture what it returns).
+    //
+    // It must NOT receive the host realm's `vm` module. That module exposes
+    // `Script`, and `new vm.Script(s).runInThisContext()` evaluates `s` in the
+    // HOST context — a complete sandbox escape. Verified against the previous
+    // implementation: the injected module let the sandbox read `process.pid`
+    // and exfiltrate `process.env`.
+    //
+    // Nor can we hand over a plain host function: anything host-realm exposed
+    // to the sandbox leaks the host `Function` constructor via `.constructor`,
+    // which is the same escape by another route.
+    //
+    // So the wrapper is *constructed inside the context*. It is therefore a
+    // context-realm function: its `.constructor` resolves to the CONTEXT's
+    // Function (which cannot see the host), while the host callback stays in a
+    // closure with no property path reachable from sandbox code. The only
+    // capability that crosses the boundary is `runInNewContext` itself.
     try {
-      const out = vm.runInNewContext(M + '\n' + '__decode(__esoSrc, __esoStrategy, __esoTimeout);', sandbox, { timeout: ms + 500 });
+      const ctx = vm.createContext(sandbox);
+      vm.runInContext(
+        'function __mkVmShim(hostfn){ return function (payload, sbx, opts) { return hostfn(payload, sbx, opts); }; }',
+        ctx);
+      const mk = vm.runInContext('__mkVmShim', ctx);
+      const shim = Object.create(null);
+      shim.runInNewContext = mk(function (payload, sbx, opts) { return vm.runInNewContext(payload, sbx, opts); });
+      sandbox.__vmModule = shim;
+      // Drop the factory so it is not left reachable as a context global.
+      vm.runInContext('delete globalThis.__mkVmShim;', ctx);
+
+      const out = vm.runInContext(M + '\n' + '__decode(__esoSrc, __esoStrategy, __esoTimeout);', ctx, { timeout: ms + 500 });
       return (typeof out === 'string' && out.length) ? out : null;
     } catch (e) {
       return null;
@@ -8869,6 +9009,10 @@ async function main(externalOpts) {
   if (opts.verbose) console.log(info('  Phase 12i: Race condition detection…'));
   const raceFindings     = (opts.security || opts.report) ? scanRaceConditions(src) : [];
 
+  // Phase 12t — Node/Electron surface (gated on runtime detection)
+  const nodeSurface      = (opts.security || opts.report) ? require('../lib/node-surface').scanNodeSurface(src) : { findings: [], node: false, electron: false, nodeSources: {} };
+  if (opts.verbose && nodeSurface.findings.length) console.log(info(`  Phase 12t: Node/Electron — ${nodeSurface.findings.length} findings (node=${nodeSurface.node} electron=${nodeSurface.electron})`));
+
   // Phase 12j — D1: Taint flow analysis
   if (opts.verbose) console.log(info('  Phase 12j: Heuristic taint-flow analysis…'));
   const taintFindings    = (opts.security || opts.report) ? scanTaintFlow(src) : [];
@@ -9333,6 +9477,7 @@ async function main(externalOpts) {
     ...dynCodeFindings, ...bizLogicFindings, ...wsFindings,
     ...cryptoFindings, ...leakageFindings, ...idorFindings,
     ...depFindings, ...raceFindings, ...taintAll,
+    ...nodeSurface.findings,
     ...web3Findings, ...configFindings, ...lazyFindings,
     ...modernCrypto, ...(networkSurface ? networkSurface.findings : []),
     ...((sourceMapInfo && sourceMapInfo.findings) || []),
