@@ -8413,7 +8413,18 @@ async function decodeEsoteric(src, opts) {
       shim.runInNewContext = mk(function (payload, sbx, opts) { return vm.runInNewContext(payload, sbx, opts); });
       sandbox.__vmModule = shim;
       // Drop the factory so it is not left reachable as a context global.
-      vm.runInContext('delete globalThis.__mkVmShim;', ctx);
+      //
+      // This must be an ASSIGNMENT, not `delete`. A top-level `function`
+      // declaration in a vm script does create a configurable global property,
+      // but the contextified global proxy still refuses the delete: it returns
+      // false and leaves `__mkVmShim` callable. Verified against this tree
+      // before the change -- `typeof __mkVmShim` was still "function" after the
+      // delete. Assignment does take effect.
+      //
+      // The residual was never an escape (it is a context-realm function and
+      // carries no host reference), but the previous comment claimed a
+      // cleanup that was not happening, next to a real security boundary.
+      vm.runInContext('globalThis.__mkVmShim = undefined;', ctx);
 
       const out = vm.runInContext(M + '\n' + '__decode(__esoSrc, __esoStrategy, __esoTimeout);', ctx, { timeout: ms + 500 });
       return (typeof out === 'string' && out.length) ? out : null;
