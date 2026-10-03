@@ -42,7 +42,7 @@
   "author": "Black0ffR",
   "license": "MIT",
   "engines": {
-    "node": ">=14.0.0"
+    "node": ">=14.14.0"
   },
   "files": [
     "lib/",
