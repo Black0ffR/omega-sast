@@ -593,8 +593,14 @@ section('4.4 --watch mode: flag recognized, initial scan runs');
 
 // ═════════════════════════════════════════════════════════════════════════
 //  ISSUE 2.4 — Source map correlation: findings get sourceLocation
-//  [KNOWN FAILING] — the genLine < 1 guard was claimed fixed in commit
-//  39bde4b but git blame shows it wasn't actually applied.
+//  RESOLVED — the guard IS applied: `src/_monolith.js` has
+//  `if (genLine < 0) continue;` and `mapSourcePosition` bails on
+//  `genLine < 0 || genLine >= decodedLines.length`. The [KNOWN FAILING]
+//  marker below was stale: the original claim (commit 39bde4b "fixed" a
+//  `< 1` guard that was never actually changed) had since been addressed,
+//  and these assertions now pass. Kept here as a worked example of the
+//  marker working as intended — it tracked a real regression until it was
+//  genuinely fixed.
 // ═════════════════════════════════════════════════════════════════════════
 section('2.4 Source map correlation: findings get sourceLocation');
 
