@@ -20,8 +20,9 @@ point at it.
 
 | # | item | blocked on | guard |
 |---|------|-----------|-------|
-| 1 | **RC4 / base64 string-array decoding is fixture-validated only.** `06_obfuscator_io_style.js` uses a *plain* string array; the `rc4Decrypt` path is exercised by a synthetic fixture but never against real output. | A production sample generated with `stringArrayEncoding: ['rc4']` from obfuscator.io. Drop it in `obfuscated-zip-test/obfuscated_js_samples/`. **This also unblocks #9 and #10** — the 0.85-confidence question cannot be answered without ground truth. | — |
-| 11 | `modern-obf-strong.js` fixture is not representative. It uses `a1` / `S` identifiers; real obfuscator.io `identifierNamesGenerator: 'mangled'` emits `_0x` + hex (compare `modern-obf.js`, which uses `_0x4f2a` and is detected correctly). This makes `llmHints.expectStringArrayIndirection` report `false` for a shape the tool is right to expect. | **The fixture is wrong, not the tool.** Do not loosen the signature to satisfy it — that would trade real-world accuracy for a synthetic case. Re-derive from genuine output (same acquisition problem as #1). | — |
+| ~~1~~ | ~~RC4 decode fixture-validated only~~ **RESOLVED 2026-10-03.** Generated 16 samples with the real `javascript-obfuscator@5.8.1` engine and scanned them: the decoder is **correct on 15/16** (plain, base64, rc4, mixed, shuffle, wrappers fn+var, CFF, compact, callsTransform, splitStrings, VM all recover the original plaintext). Corpus committed at `test/fixtures/obfuscator-io-real/`, guarded by `test/test-obfuscator-io-real-corpus.js`. | — | test-obfuscator-io-real-corpus.js |
+| 12 | **🔴 `selfDefending` + `debugProtection` silently produce WRONG strings.** The string-array rotation offset is sometimes resolved incorrectly, so the decoder emits plausible-but-incorrect values: `setRequestHeader('Content - Type')` for `'Content-Type'`, `.split`→`.load`, `.appendChild`→`.test`, `.value`→`['apply']`. Measured on 8 seeds of one config: **8/8 corrupt, 4/8 below 7/8 markers recovered.** Not garbage — wrong, which is worse for an analyst. Absent from all 15 non-anti-debug samples. | Fix needs the rotation solver to handle what the self-defending wrapper does to the offset. Interim options: decline to claim full recovery, or emit an integrity warning when anti-debug signatures are present. | test-obfuscator-io-real-corpus.js (detection only) |
+| 11 | `modern-obf-strong.js` fixture is not representative. **Correction to an earlier note in this file:** real `identifierNamesGenerator: 'mangled'` output emits **single letters** (`a`, `b`, `g`, `j`), NOT `_0x` + hex — verified against the generated `09-rc4-mangled.js`. The fixture's `S` is representative; its `a1` is not. Either way the tool handles genuine mangled output correctly (0.85 confidence, 35 strings decoded), so the fixture's `expectStringArrayIndirection: false` is a fixture artefact. | Superseded by `test/fixtures/obfuscator-io-real/09-rc4-mangled.js`. Do not loosen the signature to satisfy the old fixture. | test-obfuscator-io-real-corpus.js |
 
 ### Open — real gaps, tractable
 
@@ -30,7 +31,7 @@ point at it.
 | 2 | **No pre-inline alias→sink correlation.** Sinks hidden behind `_0x33e4(...)` call chains are only detected *after* inlining. | String-array decode does feed later phases, so post-decode findings work. This is about the pre-inline representation. |
 | 2b | **Non-constant array-mutation indexes unresolved.** `_0xarr[1] = x` folds (Step 4m); `_0xarr[i] = x` with variable `i` does not. | A mutation RHS whose decoder is defined later in the same round is handled on a subsequent fixpoint round — that part works. |
 | 8 | **Multi-layer / obfuscator.io-style esoteric shells are out of scope.** Only single-payload shells are sniffed (charset density + bootstrap motifs, min 80 non-ws chars). | `test/fuzz-esoteric.js` covers the **single-layer** path only. Extending to multi-layer means extending the fuzzer's seed corpus too. |
-| 9 | **Modern obfuscator.io fingerprint tops out at 0.6 confidence.** The 0.85 path is not reachable. | Blocked by #1 — do not relax the Phase 2c RC4 regex without a real sample to measure against. |
+| ~~9~~ | ~~0.85 confidence unreachable~~ **PARTLY RESOLVED 2026-10-03.** Against real output 0.85 **is** reachable — both `identifierNamesGenerator: 'mangled'` samples score 0.85; 0.6 is correct for `hexadecimal` names. The v7 note ("my hand-rolled strong fixture didn't match") was a fixture problem, not a ceiling. | — | test-obfuscator-io-real-corpus.js |
 | 12 | `sourcemap-external` defaults to `info` for HTTP/CDN URLs. | **Deliberate**, with `--strict-sourcemaps` as the opt-in. Not a bug. If per-environment control is ever wanted, `--sourcemap-severity <s>` is cleaner than flipping the default. |
 | 4.7 | **Statement-level unreachable code is preserved.** The pipeline prunes dead *branches* and folds opaque predicates, but a statement following a terminating statement is kept. | Must respect function hoisting and labels. |
 | 4.8 | **Minified code gets no source expansion.** Tokenize/parse works (0 findings, no crash) but the rename-table / source-expander pass is skipped for small files. | Threshold-gated on size/complexity; would need revisiting for small-but-dense inputs. |
@@ -85,6 +86,19 @@ node test/test-esoteric-sandbox-isolation.js  # 13 — nested sandbox cannot rea
 node test/fuzz-esoteric.js --iterations 500  # property fuzz, non-blocking
 npm test                                     # full suite
 ```
+
+### Obfuscator.io anti-debug signatures
+
+The anti-debug signature set was **Jscrambler-only** and matched zero real
+obfuscator.io output — `expectAntiDebugging` was `false` on samples generated
+with `selfDefending: true` and `debugProtection: true`. Two obfuscator.io
+signatures are now included: the `RegExp` built by concatenating `this[...]`
+properties and tested against another property's `toString()` (debugProtection),
+and the self-bounded counter array grown with `Math.random()` (selfDefending).
+Validated 3/3 true positives and 2/2 correct negatives on the real corpus.
+
+That is *detection*, not correctness — the same family still decodes incorrectly
+(see known-work #12).
 
 The fuzzer's self-check walks **every** global in the nested sandbox and reports
 host-only capabilities by capability-name, not object-name. It was validated

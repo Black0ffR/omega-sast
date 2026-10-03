@@ -2514,6 +2514,49 @@ function fingerprintObfuscator(src) {
     });
   }
 
+  // Signature 3b: obfuscator.io debugProtection + selfDefending.
+  //
+  // The Jscrambler pattern above matches ZERO real obfuscator.io output --
+  // verified against 16 samples from javascript-obfuscator 5.8.1, including
+  // ones generated with selfDefending:true and debugProtection:true. Those
+  // samples still carry anti-debug machinery, so expectAntiDebugging was
+  // false on code that demonstrably has it.
+  //
+  // obfuscator.io's debugProtection builds a RegExp by concatenating `this`
+  // properties and tests it against another property's toString() -- the
+  // classic "is toString() still native" probe. selfDefending additionally
+  // grows a counter array with push() inside a loop bounded by that same
+  // array's .length, seeded from Math.random().
+  {
+    const obfDebugProtectionRe =
+      /new\s+RegExp\s*\(\s*this\[['"][\w$]+['"]\]\s*\+\s*this\[['"][\w$]+['"]\]\s*\)\s*;?[\s\S]{0,240}?\[['"]test['"]\]\s*\(\s*this\[['"][\w$]+['"]\]\s*\[\s*['"]toString['"]\]\s*\(\s*\)/g;
+    while ((m = obfDebugProtectionRe.exec(src)) !== null) {
+      obfuscatorIoSigs.push({
+        signature: 'obfuscator-io-debug-protection',
+        pos: m.index,
+        evidence: m[0].slice(0, 80),
+        hint: 'anti-debug — toString() integrity probe, obfuscator.io debugProtection',
+      });
+      obfuscatorIoScore += 0.2;
+    }
+  }
+  {
+    // NB the push is wrapped in Math['round'](Math['random']()), so the
+    // pattern must allow that inner call -- without it the signature never
+    // matched any real sample.
+    const obfSelfDefendingRe =
+      /for\s*\(\s*var\s+[\w$]+\s*=\s*0x0\s*,\s*[\w$]+\s*=\s*this\[['"][\w$]+['"]\]\s*\[\s*['"]length['"]\]\s*;[\s\S]{0,220}?\[['"]push['"]\]\s*\(\s*Math\s*\[\s*['"]round['"]\s*\]\s*\(\s*Math\s*\[\s*['"]random['"]\s*\]\s*\(\s*\)\s*\)\s*\)/g;
+    while ((m = obfSelfDefendingRe.exec(src)) !== null) {
+      obfuscatorIoSigs.push({
+        signature: 'obfuscator-io-self-defending',
+        pos: m.index,
+        evidence: m[0].slice(0, 80),
+        hint: 'self-defending — tamper-detection counter loop, obfuscator.io selfDefending',
+      });
+      obfuscatorIoScore += 0.2;
+    }
+  }
+
   // Signature 4: Jscrambler self-defending / anti-tamper
   // Pattern: function NAME() { ... debug Protection ... setInterval ... }
   const selfDefendingRe = /function\s+[A-Za-z_$][\w$]*\s*\(\s*\)\s*\{\s*function\s+[A-Za-z_$][\w$]*\s*\(\s*\)\s*\{[^}]{0,400}?debug|setInterval\s*\(\s*[A-Za-z_$][\w$]*\s*,\s*0x[0-9a-fA-F]+\s*\)/g;
