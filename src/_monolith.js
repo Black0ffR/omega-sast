@@ -2452,6 +2452,22 @@ function decodeObfuscatorIo(src) {
         const decName = dm[1];
         const idxParam = dm[2];
         const keyParam = dm[3];
+        // Boundary gate (all tiers): the array/getter reference must occur
+        // before any nested named `function` declaration. The 800-char
+        // windows above can otherwise span function boundaries and match an
+        // ordinary helper (e.g. htmx's classList toggle matched via an
+        // array reference hundreds of chars later in unrelated code).
+        // Real decoder templates use `var x = function` expressions here,
+        // never named declarations, so they are unaffected.
+        {
+          const refStr = tier3Names.has(dm[1]) ? (sa.getterName + '(') : (sa.name + '[');
+          const braceIdx = dm[0].indexOf('{');
+          const refIdx = dm[0].indexOf(refStr);
+          if (braceIdx !== -1 && refIdx !== -1) {
+            const head = dm[0].slice(braceIdx, refIdx);
+            if (/function\s+[A-Za-z_$]/.test(head)) continue;
+          }
+        }
         // Use brace-matching to capture the full function body
         // (regex dm[0] may be truncated by non-greedy quantifiers,
         //  missing RC4 indicators in large decoder bodies)
@@ -6552,6 +6568,11 @@ const LIBRARY_SIGNS = [
 function tagLibraryFindings(findings, src) {
   for (const f of findings) {
     if (f.libraryInternal) continue;
+    // Source-map exposure is identical regardless of which library ships
+    // it — a published .map exposes original source either way. The
+    // library-internal demotion exists for framework-*behavior* patterns
+    // (renderers, sanitizer-wrapped bindings), not exposure findings.
+    if (f.category === 'Source Map') continue;
     const ctx = ((f.context || '') + ' ' + (f.value || '')).toLowerCase();
     for (const { re, name } of LIBRARY_SIGNS) {
       if (re.test(ctx)) {
