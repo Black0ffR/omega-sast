@@ -4853,11 +4853,18 @@ function scanCredentials(src) {
         if (seen.has(key)) return;
         seen.add(key);
         findings.push({
+          // Stable id + category so `.omega-ignore` baseline rules can match
+          // credentials. applyBaseline() matches `b.id` against `f.id` OR
+          // `f.category`, so a rule of {id:"Credential"} or
+          // {id:"cred-aws-access-key"} both work. Without these fields a
+          // credential is unsuppressable and leaks into every report.
+          id: pat.id || `cred-${pat.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}`,
+          category: 'Credential',
           name: pat.name, severity: pat.severity,
           value: value.slice(0,120),
           line: getLine(m.index),
           pos: m.index,
-          context: src.slice(Math.max(0, m.index-40), m.index+80).replace(/\n/g,' '),
+          context: src.slice(Math.max(0, m.index-40), m.index+80).replace(/\r?\n/g,' '),
         });
       },
       (reason) => {
@@ -6889,6 +6896,7 @@ function generateReports(data, outDir) {
           astTaint, modernCrypto, networkSurface, useAst,
           obfuscatorFingerprint, functionSummaries, backwardSlices,
           variableRenameTable, sourceExpander, originalSrc, sourceMapSources, csrf,
+          suppressed, decodeIntegrity,
           jsonOnly } = data;
 
   const ext = extendedFindings || [];
@@ -6905,13 +6913,41 @@ function generateReports(data, outDir) {
   // kept. Each fragment shape is conservative — requires a distinctive
   // prefix so random alphanumeric blobs do not trigger FPs.
   const REDACT_FIELDS = new Set(['context', 'canonicalWindow', 'description', 'evidence']);
+  // JWT-shaped findings additionally leak through `value` (a truncated token),
+  // `jwtPayload` (the fully decoded claim set — often PII: sub/email/name) and
+  // `primitive`. None of those are in REDACT_FIELDS, so a baseline-suppressed
+  // or simply-reported JWT finding ships a live secret in report.json.
+  const JWT_FIELDS = new Set(['value', 'jwtPayload', 'primitive']);
+  const isJwtLike = (f) => {
+    if (!f || typeof f !== 'object') return false;
+    if (f.id && /jwt/i.test(f.id)) return true;
+    if (f.category && /jwt/i.test(f.category)) return true;
+    if (typeof f.value === 'string' && /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/.test(f.value)) return true;
+    return false;
+  };
   const redactContextOnly = (f) => {
     if (!f || typeof f !== 'object') return;
+    // Evaluate isJwtLike ONCE, before any mutation. Re-testing after the loop
+    // is unreliable: redactText() may already have rewritten f.value, at which
+    // point the shape probe can no longer match and the hard redaction below
+    // is silently skipped.
+    const jwt = isJwtLike(f);
+    const fields = new Set(REDACT_FIELDS);
+    if (jwt) for (const k of JWT_FIELDS) fields.add(k);
     for (const k of Object.keys(f)) {
-      if (REDACT_FIELDS.has(k)) {
+      if (fields.has(k)) {
         if (typeof f[k] === 'string') f[k] = redactText(f[k]);
         else if (f[k] && typeof f[k] === 'object') redactFinding(f[k]);
       }
+    }
+    // Hard-redact the token itself. redactText alone leaves a structurally
+    // valid JWT whose first segment survives, which is still credential
+    // material; replace the whole value.
+    if (jwt && typeof f.value === 'string' && f.value.length) {
+      f.value = `[REDACTED:JWT_VALUE:len=${f.value.length}]`;
+    }
+    if (jwt && f.jwtPayload && typeof f.jwtPayload === 'object') {
+      f.jwtPayload = '[REDACTED]';
     }
   };
   if (Array.isArray(credentials))  credentials.forEach(redactContextOnly);
@@ -6923,7 +6959,7 @@ function generateReports(data, outDir) {
   // renderer consumes the array directly.
 
   // ─── JSON ───────────────────────────────────────────────────────────────
-  const json = JSON.stringify({
+  const report = {
     meta, decodeStats, frameworks,
     frameworkSymbolAnnotation: frameworkSymStats,
     analysis,
@@ -6934,6 +6970,14 @@ function generateReports(data, outDir) {
       decoded: f.decoded, seed: f.seed, offsetExpr: f.offsetExpr,
     })),
     credentials, security,
+    // Baseline-suppressed findings, with full provenance (suppressedBy /
+    // suppressedByKind / suppressedReason / suppressedExpires). Omitting these
+    // makes suppression invisible to downstream tooling: a reviewer cannot tell
+    // the difference between "clean" and "baselined away".
+    suppressed: suppressed || [],
+    // Non-null when decoded strings are present but anti-debug wrappers make
+    // them untrustworthy. Consumers must check this before using `analysis`.
+    decodeIntegrity: decodeIntegrity || { status: 'ok' },
     extendedFindings: ext,
     csrf: csrf || { findings: [], posture: null },
     routes,
@@ -7023,7 +7067,8 @@ function generateReports(data, outDir) {
       stats: sourceExpander.stats,
       sinkSummaries: sourceExpander.getSinkSummaries(),
     } : null,
-  }, null, 2);
+  };
+  const json = JSON.stringify(report, null, 2);
   fs.writeFileSync(path.join(outDir, 'report.json'), json);
 
   // ── mavis-patch-2026-09-30 (B.19 — taint graph DOT/SVG output): ──
@@ -7765,6 +7810,11 @@ ${ext.length ? `
 <footer>Generated by JS Decoder OMEGA v5 ${VERSION} &mdash; AST-augmented, single-file pipeline</footer>
 </body></html>`;
   if (!jsonOnly) fs.writeFileSync(path.join(outDir, 'report.html'), html);
+
+  // Return the assembled report so programmatic callers (lib/index.js
+  // `analyze()`) get the same object that was written to report.json,
+  // without re-reading it off disk.
+  return report;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -7861,7 +7911,11 @@ async function fetchOsvFindings(pkgVersions, verbose) {
 //  External source map fetcher — uses Node built-in https (zero deps).
 //  Resolves relative URLs against the bundle path.
 // ═══════════════════════════════════════════════════════════════════════════
-async function fetchExternalSourceMap(mapUrl, bundlePath) {
+async function fetchExternalSourceMap(mapUrl, bundlePath, hop) {
+  // `hop` bounds redirect chasing. Without it the recursive call below is
+  // unbounded and a redirect loop (a↔b) never terminates.
+  const depth = hop || 0;
+  if (depth > 3) return null;
   try {
     // Resolve relative URLs against the bundle file path
     const url = mapUrl.startsWith('http://') || mapUrl.startsWith('https://')
@@ -7876,12 +7930,20 @@ async function fetchExternalSourceMap(mapUrl, bundlePath) {
       const http = require('http');
       const transport = url.startsWith('https://') ? https : http;
       const req = transport.get(url, { timeout: 8000 }, (res) => {
-        if (res.statusCode !== 200) { resolve(null); return; }
-        // Follow redirects (max 3)
+        // The redirect check MUST come before the non-200 bail. The previous
+        // ordering (`if (res.statusCode !== 200) …` first) made this 3xx branch
+        // unreachable — every redirect satisfied `!== 200` first, so source
+        // maps behind a redirect were never fetched and the failure was silent.
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          resolve(fetchExternalSourceMap(res.headers.location, bundlePath));
+          res.resume();                       // drain so the socket can close
+          const next = res.headers.location;
+          const absolute = /^https?:\/\//i.test(next)
+            ? next
+            : new URL(next, url).toString();
+          resolve(fetchExternalSourceMap(absolute, bundlePath, depth + 1));
           return;
         }
+        if (res.statusCode !== 200) { res.resume(); resolve(null); return; }
         let data = '';
         res.on('data', chunk => data += chunk);
         res.on('end', () => {
@@ -8241,24 +8303,44 @@ function loadBaseline(path) {
 }
 
 function applyBaseline(findings, baseline, filename) {
-  if (!baseline || !baseline.length) return { findings, suppressed: [] };
+  if (!baseline || !baseline.length) return { findings, suppressed: [], suppressedRefs: new Set() };
   const suppressed = [];
   const kept = [];
+  // Identity of every suppressed source object. The caller needs this to
+  // mirror suppression into credentials/security/extendedFindings, which are
+  // the same objects. A content-derived key (name|value|line) is NOT safe:
+  // two distinct findings can collide on that tuple and the filter would then
+  // silently drop a finding the user never baselined.
+  const suppressedRefs = new Set();
   const now = Date.now();
   for (const f of findings) {
-    const match = baseline.some(b => {
+    const matchedEntry = baseline.find(b => {
       if (b.expires && new Date(b.expires).getTime() < now) return false;
-      if (b.id && b.id !== (f.id || f.category)) return false;
+      // A baseline `id` may match EITHER the finding's `id` OR its `category`.
+      // The previous `(f.id || f.category)` short-circuited to f.id whenever it
+      // was set, so a rule of {id:"Credential"} never matched a finding of
+      // {id:"cred-aws-access-key", category:"Credential"}.
+      if (b.id && b.id !== f.id && b.id !== f.category) return false;
       if (b.file && b.file !== filename) return false;
       return true;
     });
-    if (match) {
-      suppressed.push({ ...f, suppressedBy: b => b.id });
+    if (matchedEntry) {
+      suppressedRefs.add(f);
+      // `suppressedBy` used to be `b => b.id` — a closure over a `.some()`
+      // callback parameter that no longer exists. Any consumer reading this
+      // field got `ReferenceError: b is not defined`, not a rendered value.
+      suppressed.push({
+        ...f,
+        suppressedBy: matchedEntry.id || matchedEntry.category || null,
+        suppressedByKind: 'baseline',
+        suppressedReason: matchedEntry.reason || '',
+        suppressedExpires: matchedEntry.expires || null,
+      });
     } else {
       kept.push(f);
     }
   }
-  return { findings: kept, suppressed };
+  return { findings: kept, suppressed, suppressedRefs };
 }
 
 function generateBaseline(findings) {
@@ -8474,15 +8556,92 @@ async function decodeEsoteric(src, opts) {
   return null;
 }
 
+// ── Decode integrity assessment (AGENTS.md known-work #12, interim) ────────
+// obfuscator.io's `selfDefending` + `debugProtection` wrappers perturb the
+// string-array rotation so the offset resolves incorrectly. The decoder then
+// emits PLAUSIBLE-BUT-WRONG strings ('Content - Type' for 'Content-Type',
+// '.appendChild' → '.test') rather than garbage. Measured on 8 seeds of one
+// config: 8/8 corrupt, 4/8 below the 7/8 recovery marker.
+//
+// Wrong output is worse than no output for an analyst, so we refuse to let it
+// pass as a clean decode. This is the documented interim option pending a real
+// fix in the rotation solver: downgrade the claim and say so, in the CLI, in
+// report.json, and as a finding.
+//
+// Extracted as a pure function so it is unit-testable without having to
+// construct a bundle that drives the full multi-pass decode path.
+//
+// @param {number}  decodedCount  strings produced by the obf.io decoder
+// @param {object}  fingerprint   result of ast.fingerprintObfuscator
+// @returns {{status:string, reason?:string, decodedStrings?:number,
+//            knownCorruptionExamples?:string[], advisory?:string}}
+function assessDecodeIntegrity(decodedCount, fingerprint) {
+  if (!decodedCount) return { status: 'ok' };
+  const hints = fingerprint && fingerprint.llmHints;
+  if (!hints || !hints.expectAntiDebugging) return { status: 'ok' };
+  return {
+    status: 'untrusted',
+    reason: 'anti-debug wrappers (selfDefending/debugProtection) detected',
+    decodedStrings: decodedCount,
+    // Known-broken markers, quoted from the AGENTS.md #12 measurement.
+    knownCorruptionExamples: ['Content - Type', '.load', '.test'],
+    advisory: 'Decoded strings may be plausible but incorrect. Do not rely on them for ' +
+              'signature detection until the rotation solver handles selfDefending.',
+  };
+}
+
+// Emitted as a finding so it shows up in the normal triage surface (SARIF,
+// report.html) and not only as a console line.
+function decodeIntegrityFinding(integrity) {
+  if (!integrity || integrity.status === 'ok') return null;
+  return {
+    id: 'decode-integrity-untrusted',
+    name: 'Decode integrity untrusted (anti-debug)',
+    category: 'Decode Integrity',
+    severity: 'high',
+    value: `${integrity.decodedStrings} strings decoded under selfDefending/debugProtection`,
+    description: 'Anti-debug wrappers are present and are known to corrupt the string-array ' +
+                 'rotation offset. Decoded strings are plausible but may be incorrect; treat ' +
+                 'all recovered values as untrusted until independently corroborated.',
+    remediation: 'Re-run with the anti-debug layer stripped, or verify each recovered string ' +
+                 'against its call site before acting on it.',
+  };
+}
+
+// main() historically called process.exit() on every invalid-input path. That is
+// correct for the CLI but lethal for the programmatic API: a library that calls
+// process.exit takes the host process down with it. In programmatic mode
+// (opts.returnData) these paths throw instead, so the caller can catch.
+function abortPipeline(opts, message, { showHelp = false } = {}) {
+  if (opts && opts.returnData) throw new Error(message);
+  console.error(fail(message));
+  if (showHelp) printHelp();
+  process.exit(1);
+}
+
 async function main(externalOpts) {
   const opts = externalOpts || parseArgs();
   const t0   = Date.now();
 
+  // Programmatic callers (lib/index.js `analyze()`) need the assembled report
+  // object, which only exists once the Phase 15 report is built. Implies
+  // --report. `outDir` is still required by the report writers, so when the
+  // caller did not pick a destination we render into a throwaway temp dir and
+  // remove it before returning — the caller gets the object, not the files.
+  const wantsReportObject = !!opts.returnData;
+  let tmpOutDir = null;
+  if (wantsReportObject) {
+    opts.report = true;
+    if (!opts.out) {
+      tmpOutDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'omega-analyze-'));
+      opts.out = tmpOutDir;
+    }
+  }
+
   // ── Validate severity-floor ────────────────────────────────────────────
   const SEV_ORDER = ['critical', 'high', 'medium', 'low', 'info'];
   if (!SEV_ORDER.includes(opts.severityFloor)) {
-    console.error(fail(`Invalid --severity-floor "${opts.severityFloor}". Must be one of: ${SEV_ORDER.join(', ')}`));
-    process.exit(1);
+    abortPipeline(opts, `Invalid --severity-floor "${opts.severityFloor}". Must be one of: ${SEV_ORDER.join(', ')}`);
   }
 
   // ── Load external module map if provided ───────────────────────────────
@@ -8491,8 +8650,7 @@ async function main(externalOpts) {
   if (opts.moduleMap) {
     const mapPath = path.resolve(opts.moduleMap);
     if (!fs.existsSync(mapPath)) {
-      console.error(fail(`Module map file not found: ${mapPath}`));
-      process.exit(1);
+      abortPipeline(opts, `Module map file not found: ${mapPath}`);
     }
     try {
       const userMap = JSON.parse(fs.readFileSync(mapPath, 'utf8'));
@@ -8505,8 +8663,7 @@ async function main(externalOpts) {
       }
       console.log(ok(`Loaded ${merged} module-id mappings from ${path.basename(mapPath)}`));
     } catch (e) {
-      console.error(fail(`Failed to parse module map JSON: ${e.message}`));
-      process.exit(1);
+      abortPipeline(opts, `Failed to parse module map JSON: ${e.message}`);
     }
   }
 
@@ -8514,9 +8671,9 @@ async function main(externalOpts) {
   let ndjsonMeta = null;
   if (opts.ndjson) {
     const ndPath = path.resolve(opts.ndjson);
-    if (!fs.existsSync(ndPath)) { console.error(fail(`NDJSON file not found: ${ndPath}`)); process.exit(1); }
+    if (!fs.existsSync(ndPath)) { abortPipeline(opts, `NDJSON file not found: ${ndPath}`); }
     const exp = expandNdjson(ndPath, { preferHost: opts.preferHost||opts.firstPartyHost, skipUrlRegex: opts.skipUrlRegex });
-    if (!exp.files.length) { console.error(fail(`NDJSON contained no script content`)); process.exit(1); }
+    if (!exp.files.length) { abortPipeline(opts, `NDJSON contained no script content`); }
     ndjsonMeta = exp;
     if (!opts.input) opts.input = exp.files[0].path;
     if (!opts.quiet) console.log(ok(`NDJSON expanded ${exp.files.length} scripts → ${exp.dir} (preferHost=${opts.preferHost||'none'})`));
@@ -8529,16 +8686,15 @@ async function main(externalOpts) {
     return await runMultiBundle(opts);
   }
 
-  if (!opts.input) { console.error(fail('No input file provided (positional <file.js> or --ndjson)')); printHelp(); process.exit(1); }
+  if (!opts.input) { abortPipeline(opts, 'No input file provided (positional <file.js> or --ndjson)', { showHelp: true }); }
   const inputPath = path.resolve(opts.input);
   if (!fs.existsSync(inputPath)) {
-    console.error(fail(`File not found: ${inputPath}`)); process.exit(1);
+    abortPipeline(opts, `File not found: ${inputPath}`);
   }
   const stat = fs.statSync(inputPath);
   const sizeMB = stat.size / 1024 / 1024;
   if (sizeMB > MAX_FILE_MB) {
-    console.error(fail(`File too large (${sizeMB.toFixed(1)} MB > ${MAX_FILE_MB} MB limit)`));
-    process.exit(1);
+    abortPipeline(opts, `File too large (${sizeMB.toFixed(1)} MB > ${MAX_FILE_MB} MB limit)`);
   }
 
   const outDir = path.resolve(opts.out);
@@ -9375,6 +9531,27 @@ async function main(externalOpts) {
 
   if (process.env.OMEGA_PROFILE === '1') profileMark('fingerprint');
 
+  
+  // obfuscator.io's `selfDefending` + `debugProtection` wrappers perturb the
+  // string-array rotation so the offset resolves incorrectly. The decoder then
+  // emits PLAUSIBLE-BUT-WRONG strings ('Content - Type' for 'Content-Type',
+  // '.appendChild' → '.test') rather than garbage. Measured on 8 seeds of one
+  // config: 8/8 corrupt, 4/8 below the 7/8 recovery marker.
+  //
+  // Wrong output is worse than no output for an analyst, so we refuse to let it
+  // pass as a clean decode. This is the documented interim option pending a
+  // real fix in the rotation solver: downgrade the claim and say so, loudly,
+  // in the CLI, in report.json, and as a finding.
+  const decodeIntegrity = assessDecodeIntegrity(obfIoDecoded.length, obfuscatorFingerprint);
+  if (decodeIntegrity.status === 'untrusted') {
+    if (!opts.quiet) {
+      console.log(warn(`⚠ DECODE INTEGRITY: ${decodeIntegrity.decodedStrings} strings decoded, but anti-debug ` +
+        `wrappers are present — values may be plausible yet WRONG (see AGENTS.md #12).`));
+    }
+    const diFinding = decodeIntegrityFinding(decodeIntegrity);
+    if (diFinding) obfIoFindings.push(diFinding);
+  }
+
   // Sync llmHints with decoder evidence (Residual 4): the fingerprint was
   // computed on the pre-decode source, so string-array / CFF activity only
   // proven by the decoder passes must be reflected in the hints. Runs after
@@ -9702,6 +9879,21 @@ async function main(externalOpts) {
     if (suppressed.length && !opts.quiet) {
       console.log(info(`Baseline suppressed ${suppressed.length} findings (${opts.baseline})`));
     }
+    // Mirror suppression into the per-category source arrays so report.json
+    // and the HTML/Markdown writers reflect it. `allSec` is the SAME ARRAY
+    // OBJECT as `allScored` (`const allSec = allScored`), so it has already
+    // been updated by the assignment above — re-assigning it from
+    // `result.findings` a second time here would clear it and push nothing,
+    // silently zeroing totalFindings and the exit-code gate.
+    if (result.suppressedRefs.size) {
+      const drop = (arr) => arr.filter(f => !result.suppressedRefs.has(f));
+      const keptCreds = drop(credentials);
+      const keptSec   = drop(security);
+      const keptExt   = drop(extendedFindings);
+      credentials.length = 0;      credentials.push(...keptCreds);
+      security.length = 0;         security.push(...keptSec);
+      extendedFindings.length = 0; extendedFindings.push(...keptExt);
+    }
   }
 
   // Diff mode — filter to new findings only
@@ -9762,6 +9954,9 @@ async function main(externalOpts) {
   }
 
   // Phase 15
+  // Declared out here so the programmatic API (`returnData`) can read it after
+  // the block; it is only assigned when the report is actually built.
+  let reportData = null;
   if (opts.report) {
     if (!opts.quiet) console.log(head('REPORTS'));
     const decodeStats = {
@@ -9779,7 +9974,9 @@ async function main(externalOpts) {
       esoteric:         esotericResult ? esotericResult.chars : 0,
       secondPass:       secondPassStats || { ran: false },
     };
-    generateReports({
+    // Hoisted into a named binding so `analyze()` can hand the full report
+    // object back to programmatic callers instead of only writing it to disk.
+    reportData = {
       analysis, credentials, security, extendedFindings, routes, frameworks,
       graph, decodeStats, frameworkSymStats,
       storageAudit, authSurface, charCodeFindings, attackScore,
@@ -9787,6 +9984,7 @@ async function main(externalOpts) {
       astTaint, modernCrypto, networkSurface, useAst,
       obfuscatorFingerprint, functionSummaries, backwardSlices,
       variableRenameTable, sourceExpander,       suppressed,
+      decodeIntegrity,
       originalSrc: preEsoSrc,
       csrf: csrfResult,
       sourceMapSources: (sourceMapInfo && sourceMapInfo.sources) || [],
@@ -9798,7 +9996,8 @@ async function main(externalOpts) {
         libraryType,
       },
       jsonOnly: opts.jsonOnly,
-    }, outDir);
+    };
+    reportData.__report = generateReports(reportData, outDir);
     if (opts.jsonOnly) {
       if (!opts.quiet) console.log(ok(`JSON report: ${C.bold}${path.join(outDir,'report.json')}${C.reset}`));
     } else {
@@ -9819,7 +10018,7 @@ async function main(externalOpts) {
   if (process.env.OMEGA_PROFILE) profileDump();
 
   // Return a summary for the entry-point wrapper to use for exit-code logic.
-  return {
+  const summary = {
     elapsed: parseFloat(elapsed),
     totalFindings: allSec.length,
     criticalCount: critCount,
@@ -9828,6 +10027,10 @@ async function main(externalOpts) {
     attackScore: attackScore ? attackScore.score : 0,
     attackRisk: attackScore ? attackScore.risk : 'UNKNOWN',
   };
+  // Programmatic API surface: the same object written to report.json.
+  if (wantsReportObject) summary.report = (reportData && reportData.__report) || null;
+  if (tmpOutDir) { try { fs.rmSync(tmpOutDir, { recursive: true, force: true }); } catch (_) {} }
+  return summary;
 }
 
 // ── Entry point with CI-friendly exit codes ─────────────────────────────
@@ -9914,6 +10117,8 @@ function runCLI() {
 module.exports = {
   main,
   runCLI,
+  assessDecodeIntegrity,
+  decodeIntegrityFinding,
   parseArgs,
   printHelp,
   scanReDoS,
