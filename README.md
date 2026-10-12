@@ -350,6 +350,8 @@ npm run test:obfuscator
 
 ## Limitations
 
+- **RC4 rotation under selfDefending + debugProtection**: when the input was obfuscated with both flags, the string-array rotation offset is sometimes resolved incorrectly and the decoder emits plausible-but-wrong strings (e.g. `Content - Type` for `Content-Type`). When detected, the pipeline marks `report.decodeIntegrity.status: "untrusted"`, emits a `decode-integrity-untrusted` finding (currently high severity), and prints a console warning — do not rely on recovered strings for signature detection in that case (tracked as known-work #12).
+
 - **Intra-procedural taint**: The SSA tracker handles local variable propagation and destructuring, but cross-function flows rely on the backward slicer's hop-based traversal (max 3 hops by default).
 - **No runtime evaluation**: The constant evaluator handles a strict subset (arithmetic, atob, charCodeAt, concat). No user functions, no Proxy, no eval.
 - **Static CVE list**: The dependency scanner uses a curated snapshot (30 packages). For production use, pair with `npm audit` or OSV.dev.

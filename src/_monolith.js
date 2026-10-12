@@ -1742,6 +1742,22 @@ function parseArgs() {
   let inputArg = args[0];
   let startIdx = 1;
   if (inputArg && inputArg.startsWith('--')) { inputArg = null; startIdx = 0; }
+  // --multi may precede the comma-separated input list (--multi a.js,b.js).
+  // In that position the generic flag branch above leaves input unset and
+  // runMultiBundle later crashes on null.split. Consume the next arg here.
+  // NOTE: the flag loop below starts at startIdx and would never see the
+  // leading --multi, so set the mode explicitly (the doc's draft missed this
+  // and form 2 still failed).
+  let multiFirst = false;
+  if (args[0] === '--multi') {
+    if (args.length < 2 || args[1].startsWith('--')) {
+      console.error(fail('--multi requires a comma-separated list of input files'));
+      process.exit(1);
+    }
+    inputArg = args[1];
+    startIdx = 2;
+    multiFirst = true;
+  }
   const o = {
     input: inputArg,
     out: './omega_output',
@@ -1757,6 +1773,7 @@ function parseArgs() {
     multi: false,          // multi-bundle cross-analysis mode
     quiet: false,          // suppress non-essential output (CI-friendly)
     jsonOnly: false,       // write ONLY report.json (no HTML/MD/SARIF, no report console block)
+    redact: true,          // scrub credential fragments from report text fields (default: true)
     llmPayload: true,      // include LLM-specific payload (function summaries, backward slices, VRT, source expander)
     baseline: null,        // path to .omega-ignore baseline file
     updateBaseline: false, // write current findings as new baseline
@@ -1797,6 +1814,8 @@ function parseArgs() {
     case '--multi':         o.multi        = true;      break;
     case '--quiet':         o.quiet        = true;      break;
     case '--json-only':     o.jsonOnly     = true;      break;
+    case '--redact':        o.redact       = true;      break;
+    case '--no-redact':     o.redact       = false;     break;
     case '--no-llm-payload': o.llmPayload  = false;     break;
     case '--baseline':      o.baseline     = args[++i]; break;
     case '--update-baseline': o.updateBaseline = true;   break;
@@ -1817,6 +1836,9 @@ function parseArgs() {
         o.graph = o.report = o.ast = true; break;
     }
   }
+  // The flag loop starts after a leading `--multi <list>` pair, so it never
+  // sees the flag itself in that form — set the mode explicitly.
+  if (multiFirst) o.multi = true;
   return o;
 }
 
@@ -1840,6 +1862,7 @@ function printHelp() {
   console.log('                     Format: {"1234":"@scope/pkg", "5678":"rxjs", ...}');
   console.log('  --severity-floor <s>  Minimum severity to include in reports');
   console.log('  --json-only           Write only report.json (skip HTML/MD/SARIF) — for piping');
+  console.log('  --redact/--no-redact  Scrub credential fragments from report text (default: --redact)');
   console.log('                     One of: critical, high, medium, low, info (default)');
   console.log('  --max-hops <n>      Max backward-slice depth for inter-procedural taint (default: 5)');
   console.log('  --fetch-cves       Query OSV.dev API for live vulnerability data (uses node:https)');
@@ -1847,7 +1870,9 @@ function printHelp() {
   console.log('  --no-fetch-sourcemaps Disable source map fetching (opt-out)');
   console.log('  --strict-sourcemaps Keep CDN source-map URLs at medium severity (default: info)');
   console.log('  --quiet            Suppress non-essential output (CI-friendly)');
-  console.log('  --multi            Cross-bundle analysis mode (comma-separated inputs)');
+  console.log('  --multi            Cross-bundle analysis mode');
+  console.log('                      Usage: omega <file1.js>,<file2.js> --multi --out <dir>');
+  console.log('                             or: omega --multi <file1.js>,<file2.js> --out <dir>');
   console.log('  --no-llm-payload   Omit LLM-specific JSON sections (function summaries, backward');
   console.log('                     slices, VRT, source expander) — reduces report size ~70%');
   console.log('  --baseline <file>  Load baseline file (.omega-ignore JSON) to suppress known findings');
@@ -1866,7 +1891,9 @@ function printHelp() {
   console.log('  --first-party-root <p> Root path hint for first-party detection');
   console.log('  --skip-url-regex <re> Skip NDJSON entries matching URL regex');
   console.log('  --strict-vendor    Do not cap vendor severity (default caps critical/high→medium)');
-  console.log('  --multi            Cross-bundle analysis mode (comma-separated inputs)');
+  console.log('  --multi            Cross-bundle analysis mode');
+  console.log('                      Usage: omega <file1.js>,<file2.js> --multi --out <dir>');
+  console.log('                             or: omega --multi <file1.js>,<file2.js> --out <dir>');
   console.log('');
   console.log('  CI exit codes (configure via OMEGA_FAIL_ON env var):');
   console.log('                     0=clean, 1=error, 2=critical (default),');
@@ -6925,7 +6952,11 @@ function generateReports(data, outDir) {
     if (typeof f.value === 'string' && /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/.test(f.value)) return true;
     return false;
   };
+  // `--no-redact` disables all of the below (analyst explicitly wants raw
+  // values, e.g. to revoke a leaked secret). Default stays redacted.
+  const doRedact = data.redact !== false;
   const redactContextOnly = (f) => {
+    if (!doRedact) return;
     if (!f || typeof f !== 'object') return;
     // Evaluate isJwtLike ONCE, before any mutation. Re-testing after the loop
     // is unreliable: redactText() may already have rewritten f.value, at which
@@ -7980,6 +8011,13 @@ async function fetchExternalSourceMap(mapUrl, bundlePath, hop) {
 // ═══════════════════════════════════════════════════════════════════════════
 async function runMultiBundle(opts) {
   const t0 = Date.now();
+  // Defensive: programmatic callers bypass parseArgs, so opts.input can be
+  // null here even though the CLI parser rejects that shape. Fail with a
+  // message instead of crashing on null.split.
+  if (!opts.input) {
+    console.error(fail('--multi mode requires a comma-separated list of input files'));
+    process.exit(1);
+  }
   const inputList = opts.input.split(',').map(f => f.trim()).filter(f => f);
   if (inputList.length < 2) {
     console.error(fail('--multi mode requires at least 2 comma-separated input files'));
@@ -9996,6 +10034,7 @@ async function main(externalOpts) {
         libraryType,
       },
       jsonOnly: opts.jsonOnly,
+      redact: opts.redact !== false,
     };
     reportData.__report = generateReports(reportData, outDir);
     if (opts.jsonOnly) {
